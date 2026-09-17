@@ -40,11 +40,24 @@ pub struct Display {
     pub primary: bool,
 }
 
-/// A captured frame, plus the regions that actually changed.
+/// Platform handle to the captured pixels.
 ///
-/// `pixels` is deliberately opaque for now: the M0 pipeline hands the backend's
-/// native handle (a D3D11 texture, an `IOSurface`) straight to the encoder, and
-/// only falls back to a CPU buffer when it has to.
+/// Opaque on purpose: the whole point of this crate is that frames never make a
+/// round trip through system memory. On Windows this is the D3D11 texture the
+/// encoder consumes directly — it can recover the device the texture belongs to
+/// with `GetDevice`, so the device does not need threading through separately.
+#[cfg(windows)]
+pub type Surface = windows::Win32::Graphics::Direct3D11::ID3D11Texture2D;
+
+/// Platform handle to the captured pixels.
+///
+/// Uninhabited wherever no backend exists yet, which says precisely the right
+/// thing: [`Frame`] cannot be constructed on those platforms. macOS swaps this
+/// for an `IOSurface` when ScreenCaptureKit lands. [M4]
+#[cfg(not(windows))]
+pub type Surface = core::convert::Infallible;
+
+/// A captured frame: the pixels, plus the regions that actually changed.
 #[derive(Debug)]
 pub struct Frame {
     pub width: u16,
@@ -53,6 +66,8 @@ pub struct Frame {
     pub capture_ts_us: u64,
     /// Changed regions. Empty means "assume the whole frame changed".
     pub dirty: Vec<Rect>,
+    /// The pixels themselves, still on the GPU.
+    pub surface: Surface,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
