@@ -1,0 +1,15 @@
+# Normalise to LF in the repository regardless of the contributor's platform.
+# CI runs on Windows and macOS, and rustfmt is sensitive to line endings.
+* text=auto eol=lf
+
+# Windows-only tooling that expects CRLF.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# Binary — never touch.
+*.png binary
+*.ico binary
+*.pdf binary
+*.msi binary
+*.pkg binary

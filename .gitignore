@@ -1,5 +1,8 @@
-# Project documents — kept local, not published
-Docs/
+# Planning documents — kept local, not published.
+# Deliberately not named `docs/`: this filesystem is case-insensitive and git
+# has core.ignorecase=true, so a `Docs/` rule would also swallow the tracked
+# `docs/` folder that holds the public documentation.
+planning/
 
 # Rust
 /target/
