@@ -27,8 +27,9 @@ use windows::Win32::Graphics::Direct3D::{
 };
 use windows::Win32::Graphics::Direct3D11::{
     D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-    D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11CreateDevice, ID3D11Device,
-    ID3D11DeviceContext, ID3D11Texture2D,
+    D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC,
+    D3D11_USAGE_DEFAULT, D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Multithread,
+    ID3D11Texture2D,
 };
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_MORE_DATA,
@@ -377,6 +378,11 @@ fn enumerate_displays() -> Result<Vec<Display>> {
 /// `D3D_DRIVER_TYPE_UNKNOWN` is required — not merely preferred — when an
 /// adapter is passed explicitly, and passing one explicitly is what keeps the
 /// device on the same GPU as the output on hybrid-graphics machines.
+///
+/// This device is shared with the encoder, which is why it is created with
+/// video support (the BGRA→NV12 conversion runs on the D3D11 video processor)
+/// and multithread protection (Media Foundation drives it from its own
+/// threads while we keep using the immediate context here).
 fn create_device(adapter: &IDXGIAdapter1) -> Result<(ID3D11Device, ID3D11DeviceContext)> {
     let levels = [
         D3D_FEATURE_LEVEL_11_1,
@@ -396,7 +402,7 @@ fn create_device(adapter: &IDXGIAdapter1) -> Result<(ID3D11Device, ID3D11DeviceC
             Some(base),
             D3D_DRIVER_TYPE_UNKNOWN,
             HMODULE::default(),
-            D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+            D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
             Some(&levels),
             D3D11_SDK_VERSION,
             Some(&mut device),
@@ -406,12 +412,19 @@ fn create_device(adapter: &IDXGIAdapter1) -> Result<(ID3D11Device, ID3D11DeviceC
     }
     .map_err(|e| backend("D3D11CreateDevice", e))?;
 
-    match (device, context) {
-        (Some(device), Some(context)) => Ok((device, context)),
-        _ => Err(Error::Backend(
+    let (Some(device), Some(context)) = (device, context) else {
+        return Err(Error::Backend(
             "D3D11CreateDevice returned success without a device".to_owned(),
-        )),
-    }
+        ));
+    };
+
+    let multithread = device
+        .cast::<ID3D11Multithread>()
+        .map_err(|e| backend("ID3D11Multithread", e))?;
+    // Returns the previous setting, not a status.
+    let _ = unsafe { multithread.SetMultithreadProtected(true) };
+
+    Ok((device, context))
 }
 
 /// Start duplicating an output, translating the three failures that mean

@@ -25,3 +25,6 @@ Thumbs.db
 ehthumbs.db
 desktop.ini
 .DS_Store
+
+# Output of the encode probe
+*.h264

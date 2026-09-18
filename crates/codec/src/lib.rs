@@ -14,6 +14,7 @@
 use bytes::Bytes;
 use nearhand_core::Codec;
 
+pub mod h264;
 #[cfg(windows)]
 pub mod mediafoundation;
 #[cfg(target_os = "macos")]
@@ -80,9 +81,43 @@ pub struct DecodedFrame {
     pub capture_ts_us: u64,
 }
 
-/// Codecs this machine can encode, best first. H.264 is the baseline.
+/// Open the platform's hardware encoder.
+///
+/// Nothing is bound to a GPU yet: the encoder attaches to the device that owns
+/// the first frame's surface, so it always lands on the same adapter as capture.
+#[cfg(windows)]
+pub fn encoder(config: EncoderConfig) -> Result<Box<dyn Encoder>> {
+    mediafoundation::encoder(config)
+}
+
+/// Open the platform's hardware encoder.
+#[cfg(target_os = "macos")]
+pub fn encoder(config: EncoderConfig) -> Result<Box<dyn Encoder>> {
+    videotoolbox::encoder(config)
+}
+
+/// Open the platform's hardware encoder.
+///
+/// Linux hosts are explicitly out of v1; see the roadmap in README.md.
+#[cfg(not(any(windows, target_os = "macos")))]
+pub fn encoder(_config: EncoderConfig) -> Result<Box<dyn Encoder>> {
+    Err(Error::NoHardwareEncoder)
+}
+
+/// Codecs this machine can encode, best first.
+///
+/// Reports only what [`encoder`] can actually open, so it is safe to advertise
+/// in `Caps`. Empty means no hardware encoder: the `openh264` fallback does not
+/// exist yet.
+#[cfg(windows)]
 pub fn supported_encoders() -> Vec<Codec> {
-    vec![Codec::H264]
+    mediafoundation::hardware_encoders()
+}
+
+/// Codecs this machine can encode, best first.
+#[cfg(not(windows))]
+pub fn supported_encoders() -> Vec<Codec> {
+    Vec::new()
 }
 
 /// Codecs this machine can decode, best first.
