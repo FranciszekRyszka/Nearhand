@@ -89,6 +89,18 @@ pub trait Capturer {
     fn displays(&self) -> Result<Vec<Display>>;
 }
 
+/// Displays attached to the desktop, without starting a capture.
+#[cfg(windows)]
+pub fn displays() -> Result<Vec<Display>> {
+    dxgi::enumerate_displays()
+}
+
+/// Displays attached to the desktop, without starting a capture.
+#[cfg(not(windows))]
+pub fn displays() -> Result<Vec<Display>> {
+    Err(Error::Unsupported)
+}
+
 /// Open the platform capturer for `display`.
 #[cfg(windows)]
 pub fn open(display: u8) -> Result<Box<dyn Capturer>> {

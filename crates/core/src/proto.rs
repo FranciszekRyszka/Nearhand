@@ -9,10 +9,6 @@ use serde::{Deserialize, Serialize};
 /// Bumped on any incompatible change while we are pre-1.0.
 pub const PROTOCOL_VERSION: u16 = 0;
 
-/// Keep one datagram under this many bytes so it fits the QUIC datagram limit on
-/// any path without fragmentation. Video frames are chunked to respect it.
-pub const MAX_DATAGRAM_PAYLOAD: usize = 1200;
-
 /// Video codec negotiated between viewer and agent.
 ///
 /// H.264 is the baseline every peer must support; the rest are used only when
@@ -105,6 +101,20 @@ pub enum Input {
     },
     /// Fallback for layouts that do not map to a scancode.
     Text(String),
+}
+
+/// Application close codes, sent in QUIC's CONNECTION_CLOSE alongside a
+/// human-readable reason. The code is for programs; the reason is for people.
+pub mod close {
+    /// Session ended on purpose, by either side.
+    pub const NORMAL: u32 = 0;
+    /// The peer sent something the protocol does not allow at that point.
+    pub const PROTOCOL: u32 = 1;
+    pub const VERSION_MISMATCH: u32 = 2;
+    /// The agent already has a viewer. M0 serves one at a time.
+    pub const BUSY: u32 = 3;
+    /// Capture or encoding failed on the agent; the reason says which.
+    pub const PIPELINE_FAILED: u32 = 4;
 }
 
 #[cfg(test)]

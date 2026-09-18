@@ -332,7 +332,7 @@ fn find_output(index: u8) -> Result<(IDXGIAdapter1, IDXGIOutput, DXGI_OUTPUT_DES
     )))
 }
 
-fn enumerate_displays() -> Result<Vec<Display>> {
+pub(crate) fn enumerate_displays() -> Result<Vec<Display>> {
     let factory: IDXGIFactory1 =
         unsafe { CreateDXGIFactory1() }.map_err(|e| backend("CreateDXGIFactory1", e))?;
 

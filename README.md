@@ -29,11 +29,12 @@ One Cargo workspace:
 | `crates/capture` | lib | Screen capture — DXGI on Windows, ScreenCaptureKit on macOS |
 | `crates/codec` | lib | Encode and decode — Media Foundation, VideoToolbox, `openh264` fallback |
 | `crates/input` | lib | Input injection — `SendInput`, `CGEvent` |
+| `crates/transport` | lib | QUIC for the native binaries: endpoints, key pinning, stream framing |
 | `crates/agent` | bin | Runs on the controlled machine |
 | `crates/viewer` | bin | Native controlling app |
 | `crates/server` | bin | API, console, signaling, relay |
 
-`capture`, `codec` and `input` are separate from `agent` because the viewer needs `codec` but not `capture`, platform `cfg` code stays out of the protocol crate, and each can be benchmarked alone.
+`capture`, `codec` and `input` are separate from `agent` because the viewer needs `codec` but not `capture`, platform `cfg` code stays out of the protocol crate, and each can be benchmarked alone. `transport` is separate from `core` because it depends on `quinn` and tokio, while `core` has to compile for the browser viewer, which speaks WebTransport instead.
 
 ## Documentation
 
