@@ -4,7 +4,7 @@ A self-hosted, open-source remote desktop — an alternative to TeamViewer, AnyD
 
 There is no Nearhand-run infrastructure. Every install points at a server you run yourself.
 
-> **Status: pre-alpha.** The workspace is scaffolded and the protocol types are in place; nothing connects to anything yet. See the roadmap below.
+> **Status: pre-alpha, M0 nearly done.** On Windows, the agent streams the screen to the viewer over QUIC with hardware encode and decode end to end: **12.5 ms capture-to-present p50** at 2560×1440 on loopback, against an 80 ms target ([details](docs/performance.md)). No input, no server, no macOS yet — see the roadmap below.
 
 ## Targets
 
@@ -41,6 +41,7 @@ One Cargo workspace:
 - [docs/protocol.md](docs/protocol.md) — wire format and versioning
 - [docs/security.md](docs/security.md) — threat model
 - [docs/self-hosting.md](docs/self-hosting.md) — running your own server
+- [docs/performance.md](docs/performance.md) — latency measurements and how they were taken
 
 ## Building
 

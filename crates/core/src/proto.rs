@@ -61,6 +61,17 @@ pub enum Control {
     },
     MonitorList(Vec<Monitor>),
     Bye,
+    /// Clock probe from the viewer, answered at once with [`Control::Pong`].
+    /// Lets the viewer place the agent's capture timestamps on its own clock.
+    Ping {
+        viewer_us: u64,
+    },
+    Pong {
+        /// Echoed from the Ping, so the viewer needs no bookkeeping.
+        viewer_us: u64,
+        /// The agent's capture clock when it answered.
+        agent_us: u64,
+    },
 }
 
 /// Unreliable datagram: one encoded frame split into chunks.
@@ -165,6 +176,11 @@ mod tests {
                 primary: true,
             }]),
             Control::Bye,
+            Control::Ping { viewer_us: 17 },
+            Control::Pong {
+                viewer_us: 17,
+                agent_us: u64::MAX,
+            },
         ] {
             roundtrip(&msg);
         }

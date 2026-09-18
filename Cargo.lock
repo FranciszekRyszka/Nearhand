@@ -1758,6 +1758,7 @@ dependencies = [
  "egui",
  "egui-wgpu",
  "egui-winit",
+ "nearhand-capture",
  "nearhand-codec",
  "nearhand-core",
  "nearhand-transport",
@@ -1766,6 +1767,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "wgpu",
+ "windows",
  "winit",
 ]
 

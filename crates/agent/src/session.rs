@@ -179,8 +179,22 @@ pub async fn serve(conn: Connection, config: &SessionConfig) -> Result<()> {
                 }
             }
 
+            Some(Control::Ping { viewer_us }) => {
+                // Answered straight away: any delay here lands in the round
+                // trip and widens the viewer's uncertainty.
+                let pong = Control::Pong {
+                    viewer_us,
+                    agent_us: nearhand_capture::clock::now_us(),
+                };
+                if let Err(e) = send_message(&mut send, &pong).await {
+                    break Err(e.into());
+                }
+            }
+
             // Agent-to-viewer messages have no business arriving here.
-            Some(other @ (Control::Hello { .. } | Control::MonitorList(_))) => {
+            Some(
+                other @ (Control::Hello { .. } | Control::MonitorList(_) | Control::Pong { .. }),
+            ) => {
                 conn.close(close::PROTOCOL.into(), b"unexpected message");
                 break Err(anyhow::anyhow!("unexpected {other:?}"));
             }

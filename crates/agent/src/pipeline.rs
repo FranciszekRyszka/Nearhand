@@ -129,6 +129,12 @@ fn run(
 
     let mut interval = frame_interval(settings.max_fps);
     let mut next_slot = Instant::now();
+    // When the pending frame was acquired: the frame-rate cap counts from
+    // here, not from when encoding finished. Counting from the end of encoding
+    // made each cycle interval + encode time — at a 60 fps cap with a 7.7 ms
+    // encode that missed every third vsync (40 fps) and held each change up
+    // to 7 ms longer (p50 18.5 ms against 12.8 ms, measured).
+    let mut acquired_at = Instant::now();
     let mut pending = Some(first);
     // The last frame encoded. Its texture still holds the current desktop, so
     // a keyframe can be produced on demand even when nothing is changing.
@@ -172,18 +178,23 @@ fn run(
                 }
             }
             last = Some(frame);
-            next_slot = Instant::now() + interval;
+            next_slot = acquired_at + interval;
         }
 
         // Frame-rate cap. Nothing is lost by waiting: duplication accumulates
-        // changes, so the next acquire returns the newest desktop image.
+        // changes, so the next acquire returns the newest desktop image. With
+        // the cap at the display's refresh rate the wait ends about when the
+        // next composition arrives anyway, so it costs next to no latency.
         let now = Instant::now();
         if now < next_slot {
             std::thread::sleep(next_slot - now);
         }
 
         match capturer.next_frame(CAPTURE_WAIT) {
-            Ok(Some(frame)) => pending = Some(frame),
+            Ok(Some(frame)) => {
+                acquired_at = Instant::now();
+                pending = Some(frame);
+            }
             Ok(None) => {}
             Err(nearhand_capture::Error::SourceLost) => {
                 // The capturer has already rebuilt its duplication. The new

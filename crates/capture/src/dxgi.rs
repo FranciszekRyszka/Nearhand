@@ -236,11 +236,7 @@ impl DxgiCapturer {
     /// a difference. The viewer correlates it against its own clock through the
     /// handshake RTT — see `docs/protocol.md`.
     fn qpc_to_us(&self, ticks: i64) -> u64 {
-        if self.qpc_frequency <= 0 {
-            return 0;
-        }
-        let us = (ticks as i128 * 1_000_000) / self.qpc_frequency as i128;
-        us.clamp(0, u64::MAX as i128) as u64
+        crate::clock::ticks_to_us(ticks, self.qpc_frequency)
     }
 }
 

@@ -12,6 +12,8 @@
 
 use std::time::Duration;
 
+pub mod clock;
+
 #[cfg(windows)]
 pub mod dxgi;
 #[cfg(target_os = "macos")]

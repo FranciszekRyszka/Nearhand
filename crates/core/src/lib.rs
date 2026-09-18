@@ -8,6 +8,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod clock;
 pub mod proto;
 pub mod video;
 pub mod wire;
