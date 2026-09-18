@@ -9,8 +9,12 @@ repository.workspace = true
 nearhand-core = { version = "0.1.0", path = "../core" }
 thiserror = "2.0.20"
 
+[dev-dependencies]
+# The hardware test aims at the same monitor rectangles the agent does.
+nearhand-capture = { version = "0.1.0", path = "../capture" }
+
 [lints]
 workspace = true
 
 [target."cfg(windows)".dependencies]
-windows = { version = "0.62.2", features = ["Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging", "Win32_Foundation"] }
+windows = { version = "0.62.2", features = ["Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging", "Win32_Foundation", "Win32_UI_HiDpi"] }

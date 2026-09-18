@@ -1,7 +1,9 @@
 //! `nearhand-viewer direct`: connect straight to an agent on the LAN (M0).
 //!
 //! The network half of the viewer: handshake, video datagrams in, reassembly,
-//! keyframe recovery and clock synchronisation. Complete frames go to
+//! keyframe recovery and clock synchronisation, the user's input out on a
+//! stream of its own, the host's pointer in on another, and clipboard text
+//! both ways. Complete frames go to
 //! whoever presents them (the window's decode thread, a `--record` file, or
 //! both) and the numbers go to [`Shared`] for the overlay.
 
@@ -14,12 +16,17 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
+use nearhand_clipboard::ClipboardSync;
 use nearhand_core::clock::ClockSync;
 use nearhand_core::proto::close;
 use nearhand_core::video::{AssembledFrame, Reassembler, ReassemblyStats, decode_chunk};
-use nearhand_core::{Caps, Codec, Control, PROTOCOL_VERSION};
-use nearhand_transport::{Fingerprint, client_endpoint, connect, recv_message, send_message};
-use quinn::{Connection, ConnectionError, RecvStream};
+use nearhand_core::{
+    Caps, Clipboard, Codec, Control, Cursor, Input, PROTOCOL_VERSION, StreamKind, wire,
+};
+use nearhand_transport::{
+    Fingerprint, client_endpoint, connect, recv_message, send_all, send_message,
+};
+use quinn::{Connection, ConnectionError, RecvStream, SendStream};
 use tokio::sync::{Notify, mpsc};
 
 /// A frame still missing chunks after this long with no datagrams at all is
@@ -101,6 +108,13 @@ pub struct Options {
     pub simulate_loss: u8,
     /// Where complete frames go for decoding, if anywhere.
     pub frames: Option<std::sync::mpsc::Sender<Received>>,
+    /// Keyboard and mouse to send, if anything produces them.
+    pub input: Option<mpsc::UnboundedReceiver<Input>>,
+    /// Where the host's pointer changes go, if anywhere. Shapes are checked
+    /// before they get here.
+    pub cursor: Option<Box<dyn Fn(Cursor) + Send + Sync>>,
+    /// Keep this machine's clipboard in step with the agent's.
+    pub clipboard: bool,
     pub shared: Arc<Shared>,
 }
 
@@ -170,6 +184,22 @@ pub async fn run(options: Options) -> Result<()> {
     // dropped and corrupt the framing.
     let (control_tx, mut control_rx) = mpsc::channel(16);
     tokio::spawn(read_control(recv, control_tx));
+
+    let clipboard = if options.clipboard {
+        start_clipboard(&conn)
+    } else {
+        None
+    };
+    tokio::spawn(accept_streams(conn.clone(), options.cursor, clipboard));
+
+    if let Some(events) = options.input {
+        let conn = conn.clone();
+        tokio::spawn(async move {
+            if let Err(e) = send_input(&conn, events).await {
+                tracing::debug!(error = %e, "input stream ended");
+            }
+        });
+    }
 
     let mut recording = match &options.record {
         Some(path) => Some(BufWriter::new(
@@ -322,6 +352,150 @@ async fn read_control(mut recv: RecvStream, tx: mpsc::Sender<nearhand_transport:
             return;
         }
     }
+}
+
+/// Accept the agent's unidirectional streams for as long as the connection
+/// lasts.
+async fn accept_streams(
+    conn: Connection,
+    cursor: Option<Box<dyn Fn(Cursor) + Send + Sync>>,
+    clipboard: Option<Arc<ClipboardSync>>,
+) {
+    let cursor: Option<Arc<dyn Fn(Cursor) + Send + Sync>> = cursor.map(Arc::from);
+    while let Ok(mut recv) = conn.accept_uni().await {
+        match recv_message::<StreamKind>(&mut recv).await {
+            Ok(Some(StreamKind::Cursor)) => {
+                tokio::spawn(read_cursor(conn.clone(), recv, cursor.clone()));
+            }
+            Ok(Some(StreamKind::Clipboard)) => {
+                tokio::spawn(read_clipboard(conn.clone(), recv, clipboard.clone()));
+            }
+            Ok(None) => {}
+            // Viewer-to-agent only, or unreadable.
+            Ok(Some(StreamKind::Input)) | Err(_) => {
+                conn.close(close::PROTOCOL.into(), b"unexpected stream");
+                return;
+            }
+        }
+    }
+}
+
+/// Watch this machine's clipboard and send its changes to the agent, below
+/// every other stream in priority.
+fn start_clipboard(conn: &Connection) -> Option<Arc<ClipboardSync>> {
+    let (tx, rx) = mpsc::unbounded_channel();
+    let sync = match ClipboardSync::start(move |text| {
+        let _ = tx.send(Clipboard::Text(text));
+    }) {
+        Ok(sync) => sync,
+        Err(e) => {
+            tracing::warn!(error = %e, "clipboard sync unavailable");
+            return None;
+        }
+    };
+    let conn = conn.clone();
+    tokio::spawn(async move {
+        if let Err(e) = send_all(&conn, StreamKind::Clipboard, -1, rx).await {
+            tracing::debug!(error = %e, "clipboard stream ended");
+        }
+    });
+    Some(Arc::new(sync))
+}
+
+/// Put the agent's clipboard text on this machine's clipboard.
+async fn read_clipboard(
+    conn: Connection,
+    mut recv: RecvStream,
+    clipboard: Option<Arc<ClipboardSync>>,
+) {
+    loop {
+        match recv_message::<Clipboard>(&mut recv).await {
+            Ok(Some(Clipboard::Text(text))) if text.len() > Clipboard::MAX_TEXT => {
+                conn.close(close::PROTOCOL.into(), b"clipboard text too large");
+                return;
+            }
+            Ok(Some(Clipboard::Text(text))) => {
+                if let Some(clipboard) = &clipboard {
+                    clipboard.apply(text);
+                }
+            }
+            Ok(None) => return,
+            Err(e) => {
+                if conn.close_reason().is_none() {
+                    tracing::info!(error = %e, "malformed clipboard message");
+                    conn.close(close::PROTOCOL.into(), b"malformed clipboard message");
+                }
+                return;
+            }
+        }
+    }
+}
+
+async fn read_cursor(
+    conn: Connection,
+    mut recv: RecvStream,
+    sink: Option<Arc<dyn Fn(Cursor) + Send + Sync>>,
+) {
+    loop {
+        let change = match recv_message::<Cursor>(&mut recv).await {
+            Ok(Some(change)) => change,
+            Ok(None) => return,
+            Err(e) => {
+                if conn.close_reason().is_none() {
+                    tracing::info!(error = %e, "malformed cursor message");
+                    conn.close(close::PROTOCOL.into(), b"malformed cursor message");
+                }
+                return;
+            }
+        };
+        // The image goes straight to the OS, so it must be what it claims.
+        if let Cursor::Shape(shape) = &change
+            && !shape.is_valid()
+        {
+            conn.close(close::PROTOCOL.into(), b"invalid cursor shape");
+            return;
+        }
+        if let Some(sink) = &sink {
+            sink(change);
+        }
+    }
+}
+
+/// Stream input to the agent until the window stops producing it.
+///
+/// Whatever has queued up is written in one go, and a mouse move followed by
+/// another move is dropped: the pointer only needs to end up in the right
+/// place, and a backlog of stale positions would only make it lag.
+async fn send_input(
+    conn: &Connection,
+    mut events: mpsc::UnboundedReceiver<Input>,
+) -> nearhand_transport::Result<()> {
+    let mut send: SendStream = conn.open_uni().await?;
+    // Ahead of every other stream: a key-up stuck behind a clipboard transfer
+    // is a stuck key.
+    let _ = send.set_priority(i32::MAX);
+    send_message(&mut send, &StreamKind::Input).await?;
+
+    let mut batch = Vec::new();
+    let mut bytes = Vec::new();
+    while let Some(first) = events.recv().await {
+        batch.push(first);
+        while let Ok(next) = events.try_recv() {
+            batch.push(next);
+        }
+        bytes.clear();
+        for (i, event) in batch.iter().enumerate() {
+            let superseded = matches!(event, Input::MouseMove { .. })
+                && matches!(batch.get(i + 1), Some(Input::MouseMove { .. }));
+            if !superseded {
+                bytes.extend(wire::encode(event).map_err(nearhand_transport::Error::Protocol)?);
+            }
+        }
+        batch.clear();
+        send.write_all(&bytes).await?;
+    }
+    let _ = send.finish();
+    Ok(())
 }
 
 /// Replace an opaque "connection closed" with the agent's own reason, when it

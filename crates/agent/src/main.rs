@@ -7,6 +7,7 @@
 //! directly on the LAN so the capture-to-screen latency can be measured before
 //! any server exists. It goes away once M2 brings signaling.
 
+mod input;
 mod pipeline;
 mod session;
 
@@ -67,6 +68,7 @@ enum Command {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     init_tracing(cli.verbose);
+    dpi_aware();
 
     match cli.command {
         Command::Listen { bind, bitrate_kbps } => {
@@ -139,6 +141,24 @@ async fn listen(bind: SocketAddr, config: SessionConfig) -> Result<()> {
     endpoint.wait_idle().await;
     Ok(())
 }
+
+/// Work in physical pixels. Without this, Windows scales coordinates for a
+/// DPI-unaware process, and injected mouse positions would miss on any display
+/// not at 100%.
+#[cfg(windows)]
+fn dpi_aware() {
+    use windows::Win32::UI::HiDpi::{
+        DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
+    };
+    if let Err(e) =
+        unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) }
+    {
+        tracing::warn!(error = %e, "could not declare DPI awareness; pointer positions may be off");
+    }
+}
+
+#[cfg(not(windows))]
+fn dpi_aware() {}
 
 fn init_tracing(verbose: u8) {
     let level = match verbose {

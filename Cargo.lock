@@ -1670,20 +1670,34 @@ dependencies = [
  "bytes",
  "clap",
  "nearhand-capture",
+ "nearhand-clipboard",
  "nearhand-codec",
  "nearhand-core",
  "nearhand-input",
  "nearhand-transport",
  "quinn",
+ "serde",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "windows",
 ]
 
 [[package]]
 name = "nearhand-capture"
 version = "0.1.0"
 dependencies = [
+ "nearhand-core",
+ "thiserror 2.0.20",
+ "tracing",
+ "windows",
+]
+
+[[package]]
+name = "nearhand-clipboard"
+version = "0.1.0"
+dependencies = [
+ "nearhand-core",
  "thiserror 2.0.20",
  "tracing",
  "windows",
@@ -1716,6 +1730,7 @@ dependencies = [
 name = "nearhand-input"
 version = "0.1.0"
 dependencies = [
+ "nearhand-capture",
  "nearhand-core",
  "thiserror 2.0.20",
  "windows",
@@ -1759,6 +1774,7 @@ dependencies = [
  "egui-wgpu",
  "egui-winit",
  "nearhand-capture",
+ "nearhand-clipboard",
  "nearhand-codec",
  "nearhand-core",
  "nearhand-transport",

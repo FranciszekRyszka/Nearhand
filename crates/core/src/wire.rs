@@ -16,9 +16,10 @@ pub const HEADER_LEN: usize = 4;
 /// Largest message body we will accept.
 ///
 /// Control and input messages are tens of bytes; a monitor list is a few
-/// hundred. The cap exists so a hostile or broken peer cannot make us allocate
-/// gigabytes by sending a large length prefix.
-pub const MAX_MESSAGE_LEN: usize = 64 * 1024;
+/// hundred. The largest legitimate message is a cursor shape at its maximum
+/// size, 256×256 RGBA (256 KiB). The cap exists so a hostile or broken peer
+/// cannot make us allocate gigabytes by sending a large length prefix.
+pub const MAX_MESSAGE_LEN: usize = 320 * 1024;
 
 /// Serialise a message with its length prefix, ready to write to a stream.
 pub fn encode<T: Serialize>(message: &T) -> Result<Vec<u8>, Error> {

@@ -38,9 +38,10 @@ struct Cli {
 enum Command {
     /// M0 only: connect straight to an agent by address, no server.
     ///
-    /// Opens a window showing the remote screen with a latency overlay (F1
-    /// toggles it). `--headless` skips the window; `--record` writes the
-    /// stream to a playable file in either mode.
+    /// Opens a window showing the remote screen and sends it keyboard and
+    /// mouse, with a latency overlay (Ctrl+Shift+F1 toggles it). `--headless`
+    /// skips the window and only watches; `--record` writes the stream to a
+    /// playable file in either mode.
     Direct {
         /// Agent address, for example `192.168.1.20:4433`.
         address: SocketAddr,
@@ -94,6 +95,9 @@ fn main() -> Result<()> {
                 record,
                 simulate_loss,
                 frames: None,
+                input: None,
+                cursor: None,
+                clipboard: false,
                 shared: Arc::new(Shared::default()),
             };
             if headless {
@@ -114,8 +118,18 @@ fn main() -> Result<()> {
 fn windowed(mut options: direct::Options) -> Result<()> {
     let runtime = tokio::runtime::Runtime::new().context("starting the runtime")?;
     let shared = options.shared.clone();
+    // Created before the network starts, so pointer changes arriving from the
+    // first moment have somewhere to go.
+    let event_loop = present::event_loop()?;
+    let proxy = event_loop.create_proxy();
+    options.clipboard = true;
+    options.cursor = Some(Box::new(move |change| {
+        let _ = proxy.send_event(present::UserEvent::Cursor(change));
+    }));
     let (frames_tx, frames_rx) = std::sync::mpsc::channel();
     options.frames = Some(frames_tx);
+    let (input_tx, input_rx) = tokio::sync::mpsc::unbounded_channel();
+    options.input = Some(input_rx);
     let title = format!("Nearhand — {}", options.address);
     // The window owns the deadline, so the network side runs until told.
     let seconds = options.seconds.take();
@@ -140,14 +154,18 @@ fn windowed(mut options: direct::Options) -> Result<()> {
         std::thread::sleep(Duration::from_millis(10));
     };
 
-    let windowed = present::run(present::Options {
-        title,
-        video_size,
-        frames: frames_rx,
-        shared: shared.clone(),
-        runtime: runtime.handle().clone(),
-        seconds,
-    });
+    let windowed = present::run(
+        event_loop,
+        present::Options {
+            title,
+            video_size,
+            frames: frames_rx,
+            shared: shared.clone(),
+            input: input_tx,
+            runtime: runtime.handle().clone(),
+            seconds,
+        },
+    );
 
     // Window closed: say goodbye, then let the decode thread drain.
     shared.stop.notify_one();

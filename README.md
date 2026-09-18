@@ -4,7 +4,7 @@ A self-hosted, open-source remote desktop — an alternative to TeamViewer, AnyD
 
 There is no Nearhand-run infrastructure. Every install points at a server you run yourself.
 
-> **Status: pre-alpha, M0 nearly done.** On Windows, the agent streams the screen to the viewer over QUIC with hardware encode and decode end to end: **12.5 ms capture-to-present p50** at 2560×1440 on loopback, against an 80 ms target ([details](docs/performance.md)). No input, no server, no macOS yet — see the roadmap below.
+> **Status: pre-alpha, M1 started.** On Windows, the agent streams the screen to the viewer over QUIC with hardware encode and decode end to end: **12.5 ms capture-to-present p50** at 2560×1440 on loopback, against an 80 ms target ([details](docs/performance.md)). The viewer now controls the host's keyboard and mouse, and shows the host's pointer as its own, and clipboard text syncs both ways. No server, no macOS yet — see the roadmap below.
 
 ## Targets
 
@@ -29,6 +29,7 @@ One Cargo workspace:
 | `crates/capture` | lib | Screen capture — DXGI on Windows, ScreenCaptureKit on macOS |
 | `crates/codec` | lib | Encode and decode — Media Foundation, VideoToolbox, `openh264` fallback |
 | `crates/input` | lib | Input injection — `SendInput`, `CGEvent` |
+| `crates/clipboard` | lib | Clipboard text sync — Win32 clipboard, `NSPasteboard` |
 | `crates/transport` | lib | QUIC for the native binaries: endpoints, key pinning, stream framing |
 | `crates/agent` | bin | Runs on the controlled machine |
 | `crates/viewer` | bin | Native controlling app |

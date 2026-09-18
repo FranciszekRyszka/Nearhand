@@ -87,5 +87,5 @@ nearhand-agent listen --bind 127.0.0.1:4433
 nearhand-viewer direct 127.0.0.1:4433 --fingerprint <printed> --seconds 10
 ```
 
-The viewer prints a latency summary every two seconds, and the overlay (F1)
-shows the same figures live.
+The viewer prints a latency summary every two seconds, and the overlay
+(Ctrl+Shift+F1) shows the same figures live.

@@ -19,7 +19,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use nearhand_core::{ALPN, wire};
+use nearhand_core::{ALPN, StreamKind, wire};
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use quinn::{
     ClientConfig, Connection, Endpoint, IdleTimeout, RecvStream, SendStream, ServerConfig,
@@ -202,6 +202,33 @@ pub async fn connect(
 pub async fn send_message<T: Serialize>(send: &mut SendStream, message: &T) -> Result<()> {
     let bytes = wire::encode(message)?;
     send.write_all(&bytes).await?;
+    Ok(())
+}
+
+/// Send every message from `messages` on a unidirectional stream tagged
+/// `kind`, until the channel closes. The stream is opened with the first
+/// message, so a channel that never carries anything costs nothing.
+///
+/// `priority` orders this stream against the connection's others; higher
+/// goes first.
+pub async fn send_all<T: Serialize>(
+    conn: &Connection,
+    kind: StreamKind,
+    priority: i32,
+    mut messages: tokio::sync::mpsc::UnboundedReceiver<T>,
+) -> Result<()> {
+    let Some(first) = messages.recv().await else {
+        return Ok(());
+    };
+    let mut send = conn.open_uni().await?;
+    // Fails only if the stream is already gone, which the write reports.
+    let _ = send.set_priority(priority);
+    send_message(&mut send, &kind).await?;
+    send_message(&mut send, &first).await?;
+    while let Some(message) = messages.recv().await {
+        send_message(&mut send, &message).await?;
+    }
+    let _ = send.finish();
     Ok(())
 }
 

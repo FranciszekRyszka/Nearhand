@@ -3,7 +3,7 @@
 //! The capturer and encoder are COM objects bound to the thread that made them,
 //! and every call on them blocks, so they get an OS thread of their own rather
 //! than a place on the async runtime. The thread talks to the session through
-//! two channels: commands in, encoded frames out.
+//! channels: commands in, encoded frames and pointer changes out.
 
 use std::sync::mpsc::{self, TryRecvError};
 use std::thread::JoinHandle;
@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow};
 use nearhand_capture::{Capturer, Frame};
 use nearhand_codec::{EncodedFrame, Encoder, EncoderConfig};
-use nearhand_core::Codec;
+use nearhand_core::{Codec, Cursor};
 use tokio::sync::{mpsc as async_mpsc, oneshot};
 
 /// How long one capture wait lasts. Bounds how late a command is noticed while
@@ -55,14 +55,20 @@ pub struct Started {
 impl Pipeline {
     /// Start capturing and encoding. Resolves once the first frame has been
     /// captured and the encoder is up, so setup failures surface here.
-    pub async fn start(settings: Settings) -> Result<Started> {
+    ///
+    /// Pointer changes go to `cursor`, which outlives the pipeline: the
+    /// session keeps one cursor stream across monitor switches.
+    pub async fn start(
+        settings: Settings,
+        cursor: async_mpsc::UnboundedSender<Cursor>,
+    ) -> Result<Started> {
         let (commands, command_rx) = mpsc::channel();
         let (frame_tx, frames) = async_mpsc::channel(FRAME_QUEUE);
         let (ready_tx, ready_rx) = oneshot::channel();
 
         let thread = std::thread::Builder::new()
             .name("nearhand-pipeline".to_owned())
-            .spawn(move || run(settings, command_rx, frame_tx, ready_tx))
+            .spawn(move || run(settings, command_rx, frame_tx, cursor, ready_tx))
             .context("spawning the pipeline thread")?;
 
         let (width, height) = match ready_rx.await {
@@ -106,6 +112,7 @@ fn run(
     settings: Settings,
     commands: mpsc::Receiver<Command>,
     frames: async_mpsc::Sender<EncodedFrame>,
+    cursor: async_mpsc::UnboundedSender<Cursor>,
     ready: oneshot::Sender<std::result::Result<(u16, u16), String>>,
 ) {
     let Parts {
@@ -120,6 +127,14 @@ fn run(
         }
     };
     let _ = ready.send(Ok((first.width, first.height)));
+    // Pointer changes are rare and small, so they go out unthrottled; a
+    // closed channel just means the session is winding down.
+    let forward_pointer = |capturer: &mut Box<dyn Capturer>| {
+        for change in capturer.take_pointer() {
+            let _ = cursor.send(change);
+        }
+    };
+    forward_pointer(&mut capturer);
     tracing::info!(
         monitor = settings.monitor,
         width = first.width,
@@ -190,7 +205,9 @@ fn run(
             std::thread::sleep(next_slot - now);
         }
 
-        match capturer.next_frame(CAPTURE_WAIT) {
+        let captured = capturer.next_frame(CAPTURE_WAIT);
+        forward_pointer(&mut capturer);
+        match captured {
             Ok(Some(frame)) => {
                 acquired_at = Instant::now();
                 pending = Some(frame);

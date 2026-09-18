@@ -89,29 +89,114 @@ pub struct VideoChunk {
     pub data: Bytes,
 }
 
+/// First message on every unidirectional stream, whichever side opens it:
+/// what the stream carries. Lets clipboard and, later, file transfer get their
+/// own streams without the receiver guessing from the order they arrive in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StreamKind {
+    /// Viewer to agent: [`Input`] messages, until the stream finishes.
+    Input,
+    /// Agent to viewer: [`Cursor`] messages, until the stream finishes.
+    Cursor,
+    /// Either way, one stream per direction: [`Clipboard`] messages.
+    Clipboard,
+}
+
+/// The sender's clipboard changed. Sent only on a change, never on connect,
+/// so starting a session does not overwrite what the other side has copied.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Clipboard {
+    /// Plain text, at most [`Clipboard::MAX_TEXT`] bytes of UTF-8, with `\n`
+    /// line endings whatever the platform.
+    Text(String),
+}
+
+impl Clipboard {
+    /// Larger copies are not sent. Clipboard sync is for snippets; files
+    /// arrive with file transfer (v1.1).
+    pub const MAX_TEXT: usize = 256 * 1024;
+}
+
+/// The host's mouse pointer, so the viewer can show it as its own.
+///
+/// The viewer uses the shape as the local pointer over its window rather
+/// than drawing it into the video: the pointer then moves with the local
+/// mouse, with no round trip in between.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Cursor {
+    /// The pointer changed shape. Sent whenever it does, and first when video
+    /// starts.
+    Shape(CursorShape),
+    /// Whether the host shows a pointer on the watched monitor. Hidden while
+    /// an application hides it (video players, games) or while it is on
+    /// another monitor.
+    Visible(bool),
+}
+
+/// A pointer image: straight (not premultiplied) RGBA, rows top to bottom.
+///
+/// Pixels that invert the screen beneath them — the classic text I-beam —
+/// have no RGBA equivalent; the agent draws them black with a white outline,
+/// so they stay visible on any background.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CursorShape {
+    pub width: u16,
+    pub height: u16,
+    /// The pixel that points, from the top-left corner.
+    pub hot_x: u16,
+    pub hot_y: u16,
+    pub rgba: Vec<u8>,
+}
+
+impl CursorShape {
+    /// Largest side accepted. Windows' largest accessibility pointer is 256
+    /// pixels; anything bigger is a broken or hostile peer.
+    pub const MAX_SIDE: u16 = 256;
+
+    /// Whether the fields agree with each other. A viewer must check this
+    /// before handing the image to the OS.
+    pub fn is_valid(&self) -> bool {
+        self.width > 0
+            && self.height > 0
+            && self.width <= Self::MAX_SIDE
+            && self.height <= Self::MAX_SIDE
+            && self.hot_x < self.width
+            && self.hot_y < self.height
+            && self.rgba.len() == usize::from(self.width) * usize::from(self.height) * 4
+    }
+}
+
 /// Reliable input stream, highest priority: a lost key-up is a stuck key.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Input {
-    /// Normalised to 0..=65535 so the viewer never needs the host resolution.
-    MouseMove {
-        x: u16,
-        y: u16,
-    },
-    MouseButton {
-        button: u8,
-        down: bool,
-    },
-    Wheel {
-        dx: i16,
-        dy: i16,
-    },
-    /// Physical key; the host applies its own layout.
-    Key {
-        scancode: u16,
-        down: bool,
-    },
-    /// Fallback for layouts that do not map to a scancode.
+    /// Position on the watched monitor, normalised to 0..=65535 on each axis
+    /// (65535 is the last pixel), so the viewer never needs the host
+    /// resolution.
+    MouseMove { x: u16, y: u16 },
+    /// `button` is one of [`mouse`]'s constants.
+    MouseButton { button: u8, down: bool },
+    /// In units of [`WHEEL_NOTCH`] per detent. Positive `dy` scrolls away
+    /// from the user (up), positive `dx` to the right.
+    Wheel { dx: i16, dy: i16 },
+    /// Physical key as a USB HID usage on the keyboard page (0x07), whatever
+    /// the viewer's platform. The host maps it to its own scancodes and
+    /// applies its own layout. Sent again while held, for auto-repeat.
+    Key { scancode: u16, down: bool },
+    /// Fallback for keys that have no HID usage.
     Text(String),
+}
+
+/// One wheel detent, in [`Input::Wheel`] units. Matches Windows' `WHEEL_DELTA`,
+/// so a high-resolution wheel can send fractions of a notch.
+pub const WHEEL_NOTCH: i16 = 120;
+
+/// Button numbers for [`Input::MouseButton`].
+pub mod mouse {
+    pub const LEFT: u8 = 0;
+    pub const RIGHT: u8 = 1;
+    pub const MIDDLE: u8 = 2;
+    pub const BACK: u8 = 3;
+    pub const FORWARD: u8 = 4;
 }
 
 /// Application close codes, sent in QUIC's CONNECTION_CLOSE alongside a
@@ -203,6 +288,51 @@ mod tests {
         ] {
             roundtrip(&msg);
         }
+    }
+
+    #[test]
+    fn cursor_roundtrips() {
+        for msg in [
+            Cursor::Visible(false),
+            Cursor::Shape(CursorShape {
+                width: 2,
+                height: 1,
+                hot_x: 1,
+                hot_y: 0,
+                rgba: vec![0, 0, 0, 255, 255, 255, 255, 0],
+            }),
+        ] {
+            roundtrip(&msg);
+        }
+        roundtrip(&StreamKind::Cursor);
+    }
+
+    #[test]
+    fn clipboard_roundtrips_and_fits_a_message() {
+        roundtrip(&Clipboard::Text("zażółć\ngęślą".to_owned()));
+        roundtrip(&StreamKind::Clipboard);
+        let largest = Clipboard::Text("x".repeat(Clipboard::MAX_TEXT));
+        assert!(crate::wire::encode(&largest).is_ok());
+    }
+
+    #[test]
+    fn cursor_shapes_are_checked() {
+        let shape = |width: u16, height: u16, hot_x: u16, len: usize| CursorShape {
+            width,
+            height,
+            hot_x,
+            hot_y: 0,
+            rgba: vec![0; len],
+        };
+        assert!(shape(32, 32, 0, 32 * 32 * 4).is_valid());
+        assert!(shape(256, 256, 255, 256 * 256 * 4).is_valid());
+        assert!(!shape(32, 32, 0, 32 * 32 * 4 - 1).is_valid(), "short image");
+        assert!(
+            !shape(32, 32, 32, 32 * 32 * 4).is_valid(),
+            "hotspot outside"
+        );
+        assert!(!shape(0, 32, 0, 0).is_valid(), "empty");
+        assert!(!shape(257, 1, 0, 257 * 4).is_valid(), "too large");
     }
 
     #[test]

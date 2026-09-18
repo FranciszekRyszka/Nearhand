@@ -8,9 +8,10 @@
 //! * the **decode fence** (D3D11 → D3D12): signalled once a frame's conversion
 //!   into its slot is queued; the render queue waits on it before sampling.
 //! * the **render fence** (D3D12 → D3D11): signalled after the frame has been
-//!   drawn; the decode side waits on it before overwriting that slot again.
+//!   drawn; the decode side checks it before overwriting that slot again, and
+//!   skips showing a frame rather than wait for it.
 //!
-//! Both waits happen on the GPU, so neither thread ever blocks on the other.
+//! Neither thread ever blocks on the other.
 //!
 //! One subtlety about resource state: a texture shared with D3D11 must be in
 //! `COMMON` whenever D3D11 touches it. It is wrapped for `wgpu` as already in

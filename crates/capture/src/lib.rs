@@ -13,6 +13,7 @@
 use std::time::Duration;
 
 pub mod clock;
+pub mod pointer;
 
 #[cfg(windows)]
 pub mod dxgi;
@@ -86,6 +87,13 @@ pub trait Capturer {
     /// `Ok(None)` means nothing changed — do not encode, do not send. That is
     /// what keeps the agent at roughly 0% CPU on a static desktop.
     fn next_frame(&mut self, timeout: Duration) -> Result<Option<Frame>>;
+
+    /// Pointer changes seen by [`Capturer::next_frame`] since the last call,
+    /// oldest first — including changes that came without a new frame.
+    /// Duplicates are filtered: visibility is reported only when it flips.
+    fn take_pointer(&mut self) -> Vec<nearhand_core::Cursor> {
+        Vec::new()
+    }
 
     /// Displays this capturer can switch between.
     fn displays(&self) -> Result<Vec<Display>>;

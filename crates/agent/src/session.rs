@@ -12,23 +12,41 @@
 //!   RequestKeyframe / SetQuality / StartVideo (another monitor) / Bye
 //! ```
 //!
+//! Keyboard and mouse arrive on a unidirectional stream of their own, opened
+//! by the viewer whenever it likes and tagged [`StreamKind::Input`]. The
+//! pointer's shape and visibility go the other way, on one tagged
+//! [`StreamKind::Cursor`] that lasts the whole session. Clipboard text goes
+//! both ways, on a [`StreamKind::Clipboard`] stream in each direction.
+//!
 //! A protocol violation closes the connection with a code from
 //! [`nearhand_core::proto::close`] and a reason the viewer can show.
 
+use std::sync::Arc;
+
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
+use nearhand_clipboard::ClipboardSync;
 use nearhand_core::proto::close;
 use nearhand_core::video::{encode_chunk, packetize};
-use nearhand_core::{Caps, Control, Monitor, PROTOCOL_VERSION};
-use nearhand_transport::{recv_message, send_message};
-use quinn::Connection;
+use nearhand_core::{
+    Caps, Clipboard, Control, Cursor, Input, Monitor, PROTOCOL_VERSION, StreamKind,
+};
+use nearhand_transport::{recv_message, send_all, send_message};
+use quinn::{Connection, RecvStream};
+use serde::Serialize;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
+use crate::input::Injection;
 use crate::pipeline::{Pipeline, Settings};
 
 /// Highest frame rate a viewer may ask for.
 const MAX_FPS: u8 = 120;
+
+/// Stream priorities, highest first. Clipboard text can be large and must
+/// never hold up the pointer.
+const CURSOR_PRIORITY: i32 = 0;
+const CLIPBOARD_PRIORITY: i32 = -1;
 
 pub struct SessionConfig {
     pub bitrate_kbps: u32,
@@ -116,6 +134,45 @@ pub async fn serve(conn: Connection, config: &SessionConfig) -> Result<()> {
     .await?;
     send_message(&mut send, &Control::MonitorList(monitors.clone())).await?;
 
+    // Until the viewer picks a monitor, input lands on the primary one.
+    let input = match monitors
+        .iter()
+        .find(|m| m.primary)
+        .or(monitors.first())
+        .map(|m| Injection::start(target(m)))
+    {
+        Some(Ok(input)) => Some(input),
+        Some(Err(e)) => {
+            tracing::warn!(error = %format!("{e:#}"), "input unavailable; the viewer can only watch");
+            None
+        }
+        None => None,
+    };
+    let (clipboard_tx, clipboard_rx) = mpsc::unbounded_channel();
+    let clipboard = match ClipboardSync::start(move |text| {
+        let _ = clipboard_tx.send(Clipboard::Text(text));
+    }) {
+        Ok(sync) => Some(Arc::new(sync)),
+        Err(e) => {
+            tracing::warn!(error = %e, "clipboard sync unavailable");
+            None
+        }
+    };
+    let streams = tokio::spawn(accept_streams(conn.clone(), input.clone(), clipboard));
+    let (cursor, cursor_rx) = mpsc::unbounded_channel();
+    let cursor_stream = tokio::spawn(send_stream(
+        conn.clone(),
+        StreamKind::Cursor,
+        CURSOR_PRIORITY,
+        cursor_rx,
+    ));
+    let clipboard_stream = tokio::spawn(send_stream(
+        conn.clone(),
+        StreamKind::Clipboard,
+        CLIPBOARD_PRIORITY,
+        clipboard_rx,
+    ));
+
     let mut video: Option<Video> = None;
     // Frame ids run on across streams: switching monitors must not reset them,
     // or the viewer would take the new stream for late chunks of the old one.
@@ -153,8 +210,15 @@ pub async fn serve(conn: Connection, config: &SessionConfig) -> Result<()> {
                     max_fps: max_fps.clamp(1, MAX_FPS),
                     bitrate_kbps: config.bitrate_kbps,
                 };
-                match start_video(&conn, settings, next_frame_id).await {
-                    Ok(started) => video = Some(started),
+                match start_video(&conn, settings, next_frame_id, cursor.clone()).await {
+                    Ok(started) => {
+                        video = Some(started);
+                        if let (Some(input), Some(m)) =
+                            (&input, monitors.iter().find(|m| m.id == monitor))
+                        {
+                            input.retarget(target(m));
+                        }
+                    }
                     Err(e) => {
                         let reason = format!("{e:#}");
                         conn.close(close::PIPELINE_FAILED.into(), reason.as_bytes());
@@ -204,8 +268,118 @@ pub async fn serve(conn: Connection, config: &SessionConfig) -> Result<()> {
     if let Some(running) = video.take() {
         running.stop().await;
     }
+    streams.abort();
+    cursor_stream.abort();
+    clipboard_stream.abort();
     conn.close(close::NORMAL.into(), b"bye");
     outcome
+}
+
+fn target(monitor: &Monitor) -> nearhand_input::Target {
+    nearhand_input::Target {
+        width: monitor.width,
+        height: monitor.height,
+        x: monitor.x,
+        y: monitor.y,
+    }
+}
+
+/// Send one kind of message to the viewer for as long as the session lasts.
+async fn send_stream<T: Serialize>(
+    conn: Connection,
+    kind: StreamKind,
+    priority: i32,
+    messages: mpsc::UnboundedReceiver<T>,
+) {
+    if let Err(e) = send_all(&conn, kind, priority, messages).await {
+        tracing::debug!(error = %e, ?kind, "stream ended");
+    }
+}
+
+/// Accept the viewer's unidirectional streams for as long as the connection
+/// lasts, each handled by a task of its own.
+async fn accept_streams(
+    conn: Connection,
+    input: Option<Injection>,
+    clipboard: Option<Arc<ClipboardSync>>,
+) {
+    while let Ok(mut recv) = conn.accept_uni().await {
+        match recv_message::<StreamKind>(&mut recv).await {
+            Ok(Some(StreamKind::Input)) => {
+                tracing::debug!("input stream opened");
+                tokio::spawn(read_input(conn.clone(), recv, input.clone()));
+            }
+            Ok(Some(StreamKind::Clipboard)) => {
+                tokio::spawn(read_clipboard(conn.clone(), recv, clipboard.clone()));
+            }
+            // Agent-to-viewer only.
+            Ok(Some(StreamKind::Cursor)) => {
+                conn.close(close::PROTOCOL.into(), b"unexpected stream");
+                return;
+            }
+            // Opened and finished without a word: nothing to do.
+            Ok(None) => {}
+            Err(e) => {
+                tracing::info!(error = %e, "unreadable stream header");
+                conn.close(close::PROTOCOL.into(), b"unknown stream");
+                return;
+            }
+        }
+    }
+}
+
+/// Apply input events in the order they arrive. Without an injector, as on a
+/// platform that has none yet, they are read and dropped.
+async fn read_input(conn: Connection, mut recv: RecvStream, input: Option<Injection>) {
+    loop {
+        match recv_message::<Input>(&mut recv).await {
+            Ok(Some(event)) => {
+                tracing::trace!(?event, "input");
+                if let Some(input) = &input {
+                    input.inject(event);
+                }
+            }
+            Ok(None) => return,
+            Err(e) => {
+                // A lost connection is the session's business; a malformed
+                // message is a protocol violation.
+                if conn.close_reason().is_none() {
+                    tracing::info!(error = %e, "malformed input");
+                    conn.close(close::PROTOCOL.into(), b"malformed input");
+                }
+                return;
+            }
+        }
+    }
+}
+
+/// Put the viewer's clipboard text on this machine's clipboard.
+async fn read_clipboard(
+    conn: Connection,
+    mut recv: RecvStream,
+    clipboard: Option<Arc<ClipboardSync>>,
+) {
+    loop {
+        match recv_message::<Clipboard>(&mut recv).await {
+            Ok(Some(Clipboard::Text(text))) if text.len() > Clipboard::MAX_TEXT => {
+                conn.close(close::PROTOCOL.into(), b"clipboard text too large");
+                return;
+            }
+            Ok(Some(Clipboard::Text(text))) => {
+                if let Some(clipboard) = &clipboard {
+                    clipboard.apply(text);
+                }
+            }
+            Ok(None) => return,
+            Err(e) => {
+                if conn.close_reason().is_none() {
+                    tracing::info!(error = %e, "malformed clipboard message");
+                    conn.close(close::PROTOCOL.into(), b"malformed clipboard message");
+                }
+                return;
+            }
+        }
+    }
 }
 
 /// Whether the viewer closed the connection on purpose, rather than it being
@@ -219,8 +393,13 @@ fn closed_normally(conn: &Connection) -> bool {
     )
 }
 
-async fn start_video(conn: &Connection, settings: Settings, first_frame_id: u32) -> Result<Video> {
-    let started = Pipeline::start(settings).await?;
+async fn start_video(
+    conn: &Connection,
+    settings: Settings,
+    first_frame_id: u32,
+    cursor: mpsc::UnboundedSender<Cursor>,
+) -> Result<Video> {
+    let started = Pipeline::start(settings, cursor).await?;
     tracing::info!(
         monitor = settings.monitor,
         width = started.width,

@@ -9,11 +9,15 @@
 #![forbid(unsafe_code)]
 
 pub mod clock;
+pub mod held;
 pub mod proto;
 pub mod video;
 pub mod wire;
 
-pub use proto::{Caps, Codec, Control, Input, Monitor, PROTOCOL_VERSION, VideoChunk};
+pub use proto::{
+    Caps, Clipboard, Codec, Control, Cursor, CursorShape, Input, Monitor, PROTOCOL_VERSION,
+    StreamKind, VideoChunk, WHEEL_NOTCH,
+};
 
 /// Application-layer protocol name negotiated in the TLS handshake. Carries the
 /// protocol version, so a mismatched peer fails at the handshake with a clear

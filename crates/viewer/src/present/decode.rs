@@ -3,6 +3,13 @@
 //! Every frame is decoded, because each P-frame is the next one's reference.
 //! But when several are waiting, only the newest is converted and shown —
 //! drawing a frame that is already superseded would just add latency.
+//!
+//! Nor is a frame converted while the renderer still holds the slot it would
+//! go into. Queueing the conversion behind a GPU wait for the renderer looks
+//! equivalent but is not: it stalls the whole D3D11 queue, the decoder with
+//! it, so a slow renderer made decoding crawl while frames piled up in
+//! memory — and once the window closed, the release never came and this
+//! thread hung for good.
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -64,6 +71,8 @@ fn run(
     // Fence value of the frame most recently written into each slot.
     let mut slot_values = [0u64; SLOTS];
     let mut next_value = 1u64;
+    // Decoded frames not shown since the last one that was.
+    let mut unshown = 0u32;
 
     // Blocks until the network side hangs up.
     while let Ok(first) = frames.recv() {
@@ -100,10 +109,17 @@ fn run(
         };
 
         let value = next_value;
-        next_value += 1;
         let slot = (value as usize - 1) % SLOTS;
+        // The renderer is behind. The frame is decoded, which is all the next
+        // one needs; showing it would mean waiting, and a newer one is coming.
+        if unsafe { side.render_fence.GetCompletedValue() } < slot_values[slot] {
+            unshown += skipped + 1;
+            continue;
+        }
+        next_value += 1;
         unsafe {
-            // Do not overwrite a slot the renderer may still be sampling.
+            // Already satisfied, per the check above; kept so the GPU can
+            // never overwrite a slot being sampled, whatever the CPU saw.
             side.context
                 .Wait(&side.render_fence, slot_values[slot])
                 .context("waiting for the renderer")?;
@@ -130,7 +146,7 @@ fn run(
             capture_ts_us: decoded.capture_ts_us,
             received_us,
             decoded_us: nearhand_capture::clock::now_us(),
-            skipped,
+            skipped: skipped + std::mem::take(&mut unshown),
         };
         if proxy.send_event(UserEvent::Frame(ready)).is_err() {
             return Ok(()); // The window is gone.

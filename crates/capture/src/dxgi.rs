@@ -17,6 +17,9 @@
 //!   own texture and release immediately, rather than holding the frame while
 //!   the encoder works. The copy is GPU-to-GPU — around 0.2 ms at 1080p — and it
 //!   keeps DXGI from starving on a slow encode.
+//! * The pointer is not part of the desktop image. DXGI reports its shape and
+//!   visibility beside each frame, and on frames of their own when only the
+//!   pointer changed; [`Capturer::take_pointer`] passes them on.
 
 use std::time::Duration;
 
@@ -34,13 +37,17 @@ use windows::Win32::Graphics::Direct3D11::{
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_MORE_DATA,
     DXGI_ERROR_NOT_CURRENTLY_AVAILABLE, DXGI_ERROR_NOT_FOUND, DXGI_ERROR_UNSUPPORTED,
-    DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO, DXGI_OUTPUT_DESC, IDXGIAdapter,
-    IDXGIAdapter1, IDXGIFactory1, IDXGIOutput, IDXGIOutput1, IDXGIOutputDuplication, IDXGIResource,
+    DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO, DXGI_OUTDUPL_POINTER_SHAPE_INFO,
+    DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR, DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR,
+    DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME, DXGI_OUTPUT_DESC, IDXGIAdapter, IDXGIAdapter1,
+    IDXGIFactory1, IDXGIOutput, IDXGIOutput1, IDXGIOutputDuplication, IDXGIResource,
 };
 use windows::Win32::System::Performance::QueryPerformanceFrequency;
 use windows::core::Interface;
 
+use super::pointer::{self, Format};
 use super::{Capturer, Display, Error, Frame, Rect, Result};
+use nearhand_core::Cursor;
 
 /// `AcquireNextFrame` treats `0xFFFFFFFF` as "wait forever". A caller asking for
 /// an absurd timeout means a long wait, never an unbreakable one.
@@ -63,6 +70,10 @@ pub struct DxgiCapturer {
     /// Reused so a steady stream of frames does not allocate.
     dirty_scratch: Vec<RECT>,
     qpc_frequency: i64,
+    /// Pointer changes not yet taken, and the visibility last reported.
+    pointer: Vec<Cursor>,
+    pointer_visible: Option<bool>,
+    shape_scratch: Vec<u8>,
 }
 
 impl DxgiCapturer {
@@ -90,6 +101,9 @@ impl DxgiCapturer {
             texture_desc: D3D11_TEXTURE2D_DESC::default(),
             dirty_scratch: Vec::new(),
             qpc_frequency,
+            pointer: Vec::new(),
+            pointer_visible: None,
+            shape_scratch: Vec::new(),
         })
     }
 
@@ -100,6 +114,8 @@ impl DxgiCapturer {
     fn recover(&mut self) -> Result<()> {
         self.duplication = duplicate(&self.output, &self.device)?;
         self.texture = None;
+        // The new duplication reports the pointer afresh; pass it all on.
+        self.pointer_visible = None;
         Ok(())
     }
 
@@ -145,6 +161,66 @@ impl DxgiCapturer {
             dirty,
             surface: target,
         }))
+    }
+
+    /// Record what changed about the pointer. Must run before `ReleaseFrame`,
+    /// after which the shape is gone.
+    fn note_pointer(&mut self, info: &DXGI_OUTDUPL_FRAME_INFO) {
+        if info.PointerShapeBufferSize > 0 {
+            match self.pointer_shape(info.PointerShapeBufferSize) {
+                Ok(Some(shape)) => self.pointer.push(Cursor::Shape(shape)),
+                Ok(None) => tracing::debug!("pointer shape too large or malformed; skipped"),
+                Err(e) => tracing::debug!(error = %e, "could not read the pointer shape"),
+            }
+        }
+        // Zero means the position and visibility were not updated.
+        if info.LastMouseUpdateTime != 0 {
+            let visible = info.PointerPosition.Visible.as_bool();
+            if self.pointer_visible != Some(visible) {
+                self.pointer_visible = Some(visible);
+                self.pointer.push(Cursor::Visible(visible));
+            }
+        }
+    }
+
+    fn pointer_shape(&mut self, size: u32) -> Result<Option<nearhand_core::CursorShape>> {
+        self.shape_scratch.resize(size as usize, 0);
+        let mut required = 0u32;
+        let mut info = DXGI_OUTDUPL_POINTER_SHAPE_INFO::default();
+        unsafe {
+            self.duplication.GetFramePointerShape(
+                size,
+                self.shape_scratch.as_mut_ptr().cast(),
+                &mut required,
+                &mut info,
+            )
+        }
+        .map_err(|e| backend("GetFramePointerShape", e))?;
+
+        let (format, height) = match info.Type as i32 {
+            t if t == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME.0 => {
+                // Both masks are stacked in one image of twice the height.
+                (Format::Monochrome, info.Height / 2)
+            }
+            t if t == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR.0 => (Format::Color, info.Height),
+            t if t == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR.0 => {
+                (Format::MaskedColor, info.Height)
+            }
+            other => {
+                return Err(Error::Backend(format!(
+                    "unknown pointer shape type {other}"
+                )));
+            }
+        };
+        let data = &self.shape_scratch[..(required as usize).min(self.shape_scratch.len())];
+        Ok(pointer::to_rgba(
+            format,
+            info.Width,
+            height,
+            info.Pitch,
+            (info.HotSpot.x, info.HotSpot.y),
+            data,
+        ))
     }
 
     /// Our copy of the desktop image, created on first use and whenever the
@@ -263,6 +339,7 @@ impl Capturer for DxgiCapturer {
             };
         }
 
+        self.note_pointer(&info);
         let frame = self.take_frame(&info, resource);
 
         // Must happen before the next acquire, on success and failure alike.
@@ -277,6 +354,10 @@ impl Capturer for DxgiCapturer {
 
     fn displays(&self) -> Result<Vec<Display>> {
         enumerate_displays()
+    }
+
+    fn take_pointer(&mut self) -> Vec<Cursor> {
+        std::mem::take(&mut self.pointer)
     }
 }
 
@@ -557,5 +638,69 @@ mod tests {
             Ok(None) => {}
             Err(e) => panic!("capture failed: {e}"),
         }
+    }
+
+    /// The pointer is on exactly one display; that one must report a shape
+    /// and visibility.
+    ///
+    /// DXGI reports the pointer only when it moves or changes, and nothing at
+    /// all while the window under it hides it. Run this with the pointer over
+    /// something that shows one (the taskbar) and moving.
+    #[test]
+    #[ignore = "requires an interactive desktop session"]
+    fn reports_the_pointer() {
+        let displays = enumerate_displays().expect("enumerate displays");
+        let mut reports = Vec::new();
+        for display in &displays {
+            let mut capturer = DxgiCapturer::new(display.id).expect("open display");
+            for _ in 0..10 {
+                capturer
+                    .next_frame(Duration::from_millis(200))
+                    .expect("capture");
+            }
+            reports.push((display.id, capturer.take_pointer()));
+        }
+        eprintln!(
+            "{:#?}",
+            reports
+                .iter()
+                .map(|(id, events)| (
+                    id,
+                    events
+                        .iter()
+                        .map(|e| match e {
+                            Cursor::Shape(s) => format!(
+                                "shape {}x{} hot {},{} valid {}",
+                                s.width,
+                                s.height,
+                                s.hot_x,
+                                s.hot_y,
+                                s.is_valid()
+                            ),
+                            Cursor::Visible(v) => format!("visible {v}"),
+                        })
+                        .collect::<Vec<_>>()
+                ))
+                .collect::<Vec<_>>()
+        );
+        let shown = reports
+            .iter()
+            .filter(|(_, events)| events.contains(&Cursor::Visible(true)))
+            .count();
+        assert_eq!(shown, 1, "the pointer is visible on exactly one display");
+        assert!(
+            reports
+                .iter()
+                .all(|(_, events)| events.iter().all(|e| match e {
+                    Cursor::Shape(s) => s.is_valid(),
+                    Cursor::Visible(_) => true,
+                }))
+        );
+        assert!(
+            reports
+                .iter()
+                .any(|(_, events)| events.iter().any(|e| matches!(e, Cursor::Shape(_)))),
+            "no display reported a pointer shape"
+        );
     }
 }

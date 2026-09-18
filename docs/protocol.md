@@ -42,10 +42,13 @@ viewer                         agent
   StartVideo               ──▶
                            ◀══  video datagrams …
   RequestKeyframe / SetQuality / StartVideo (another monitor) / Bye
+
+  (own stream) Input …     ──▶
+                           ◀──  Cursor …  (own stream)
 ```
 
 Messages on streams carry a 4-byte little-endian length prefix, then the
-postcard body; bodies over 64 KiB are refused before anything is allocated
+postcard body; bodies over 320 KiB are refused before anything is allocated
 (`core::wire`).
 
 Either side can end the session. The one that sends `Bye` waits briefly for the
@@ -99,17 +102,74 @@ long-term references so a loss costs part of a frame rather than a keyframe.
 
 ## Input
 
-Coordinates are normalised to `0..=65535`, so the viewer never needs to know the
-host resolution and nothing breaks on a resolution change mid-session.
+The viewer opens a unidirectional stream whenever it likes, at the highest
+priority of its streams, and writes `StreamKind::Input` as the first message.
+Every later message on it is an `Input`, framed like the control stream. Every
+unidirectional stream starts with a `StreamKind`, so clipboard and file
+transfer can get streams of their own later. The agent closes the connection
+with a protocol error if a stream starts with anything else, or if an input
+message cannot be decoded.
 
-Keys are physical scancodes; the host applies its own layout. `Input::Text` is
-the fallback for what does not map — dead keys, AltGr combinations, and the
-Polish characters that motivated the fallback in the first place.
+Coordinates are normalised to `0..=65535` on the watched monitor, where 65535
+is the last pixel. The viewer never needs to know the host resolution, and
+nothing breaks on a resolution change mid-session. Input goes to the monitor
+the viewer last asked for in `StartVideo`, and to the primary monitor before
+that.
+
+Keys are physical positions: USB HID usages from the keyboard page (0x07),
+whatever the viewer's platform. The host maps them to its own scancodes and
+applies its own layout. A held key is sent down again for each auto-repeat.
+`Input::Text` is the fallback for keys that have no usage.
+
+| Message | Units |
+| --- | --- |
+| `MouseButton` | 0 left, 1 right, 2 middle, 3 back, 4 forward (`proto::mouse`) |
+| `Wheel` | 120 per detent (`WHEEL_NOTCH`); positive `dy` scrolls up, positive `dx` right |
+
+Neither side trusts the other to release what it pressed. The viewer sends
+key-ups for everything it holds when its window loses focus. The agent
+releases everything still held when the session ends, however it ends.
+
+## Clipboard
+
+Each side opens one unidirectional stream tagged `StreamKind::Clipboard`, the
+first time its clipboard changes during the session, at the lowest priority
+of its streams. Every message on it is a `Clipboard::Text`.
+
+* Only changes are sent, never the contents at connect, so starting a session
+  does not overwrite what the other side has copied.
+* Text travels with `\n` line endings; each side converts to its own.
+* At most 256 KiB of UTF-8 (`Clipboard::MAX_TEXT`). A larger copy stays local,
+  and receiving one is a protocol error.
+* Each side remembers the last text that crossed in either direction and
+  never sends that text back, so a paste does not echo.
+
+Each side notices a change by polling its clipboard's change counter four
+times a second, for the length of the session only.
+
+## Cursor
+
+The agent opens a unidirectional stream tagged `StreamKind::Cursor` at the
+start of the session and keeps it across monitor switches. It carries the
+host pointer's shape whenever it changes, and whether the pointer is visible on
+the watched monitor.
+
+The viewer uses the shape as its own pointer over the window instead of
+drawing it into the picture. The pointer then follows the local mouse with no
+round trip. It is shown at its own size, not scaled with the video.
+
+Shapes are straight RGBA, at most 256 pixels a side, with the hotspot inside
+the image. The viewer checks this before handing the image to the OS, and
+closes the connection with a protocol error if it is not so. Windows pointer
+pixels that invert the screen beneath them, like the text I-beam, cannot be
+expressed in RGBA. They arrive black, outlined in white, so they stay visible
+on any background.
+
+DXGI reports the pointer only when it moves or changes. Until the host's
+pointer first moves, the viewer shows its own default arrow.
 
 ## To document before 1.0
 
 - [ ] Handshake sequence diagram, including the server-issued session ticket
 - [ ] Capability negotiation rules when codec sets do not intersect
-- [ ] Clipboard message shapes
-- [ ] Cursor shape encoding
 - [ ] Error and close codes

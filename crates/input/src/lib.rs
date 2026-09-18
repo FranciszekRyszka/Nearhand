@@ -9,6 +9,7 @@
 //! (dead keys, AltGr combinations).
 
 use nearhand_core::Input;
+pub use nearhand_core::held::Held;
 
 #[cfg(target_os = "macos")]
 pub mod cgevent;
@@ -36,7 +37,8 @@ pub struct Target {
     pub y: i16,
 }
 
-pub trait Injector {
+/// `Send` because the agent drives it from a thread of its own.
+pub trait Injector: Send {
     /// Apply one input event to the host.
     fn inject(&mut self, event: &Input) -> Result<()>;
 
@@ -71,9 +73,12 @@ pub fn open(_target: Target) -> Result<Box<dyn Injector>> {
     Err(Error::Unsupported)
 }
 
-/// Map a normalised 0..=65535 coordinate onto a target display.
+/// Map a normalised 0..=65535 coordinate onto the pixels `0..extent` of a
+/// display: 0 is the first pixel, 65535 the last.
 pub fn denormalise(value: u16, extent: u16) -> i32 {
-    (value as u32 * extent.max(1) as u32 / u16::MAX as u32) as i32
+    let last = u32::from(extent.max(1)) - 1;
+    // Rounded, so both ends land exactly and nothing in between is biased.
+    ((u32::from(value) * last + u32::from(u16::MAX) / 2) / u32::from(u16::MAX)) as i32
 }
 
 #[cfg(test)]
@@ -83,12 +88,13 @@ mod tests {
     #[test]
     fn denormalise_spans_the_display() {
         assert_eq!(denormalise(0, 1920), 0);
-        assert_eq!(denormalise(u16::MAX, 1920), 1920);
+        assert_eq!(denormalise(u16::MAX, 1920), 1919);
         assert_eq!(denormalise(u16::MAX / 2, 1920), 959);
     }
 
     #[test]
     fn denormalise_survives_a_zero_extent() {
-        assert_eq!(denormalise(u16::MAX, 0), 1);
+        assert_eq!(denormalise(u16::MAX, 0), 0);
+        assert_eq!(denormalise(u16::MAX, 1), 0);
     }
 }

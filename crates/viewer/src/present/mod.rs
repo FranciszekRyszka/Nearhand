@@ -7,13 +7,18 @@
 //! * this thread runs the window and draws with `wgpu` on D3D12.
 //!
 //! A frame crosses from the decode thread to here as a [`decode::FrameReady`]
-//! event; the pixels never move — see [`interop`].
+//! event; the pixels never move — see [`interop`]. Keyboard and mouse go the
+//! other way, through [`input`] to the network task.
+//!
+//! Every key goes to the agent except one local shortcut: Ctrl+Shift+F1
+//! toggles the latency overlay.
 //!
 //! Frames are drawn as soon as they arrive rather than on a vsync tick, and
 //! the swap chain is asked for mailbox or immediate presentation with a
 //! maximum frame latency of one: every frame of queueing is latency.
 
 mod decode;
+mod input;
 mod interop;
 mod overlay;
 mod render;
@@ -24,15 +29,18 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
+use nearhand_core::{Cursor, CursorShape, Input};
+use tokio::sync::mpsc::UnboundedSender;
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalSize};
 use winit::event::{ElementState, KeyEvent, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
-use winit::keyboard::{Key, NamedKey};
-use winit::window::{Window, WindowId};
+use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
+use winit::window::{CustomCursor, Window, WindowId};
 
 use crate::direct::{Received, Shared};
 use decode::FrameReady;
+use input::Forwarder;
 use interop::RenderSide;
 use overlay::Latency;
 use render::VideoRenderer;
@@ -45,6 +53,8 @@ const REPORT_EVERY: Duration = Duration::from_secs(2);
 pub enum UserEvent {
     Frame(FrameReady),
     Failed(String),
+    /// The host's pointer changed; shapes are already checked.
+    Cursor(Cursor),
 }
 
 pub struct Options {
@@ -52,23 +62,34 @@ pub struct Options {
     pub video_size: (u32, u32),
     pub frames: Receiver<Received>,
     pub shared: Arc<Shared>,
+    /// Where the user's keyboard and mouse go.
+    pub input: UnboundedSender<Input>,
     pub runtime: tokio::runtime::Handle,
     /// Close the window after this long; for scripted measurements.
     pub seconds: Option<u64>,
 }
 
+/// The event loop the window will run on. Separate from [`run`] so its proxy
+/// can be handed out before the window exists.
+pub fn event_loop() -> Result<EventLoop<UserEvent>> {
+    EventLoop::<UserEvent>::with_user_event()
+        .build()
+        .context("creating the event loop")
+}
+
 /// Open the window and run until it is closed. Returns the decode thread, to
 /// be joined once the network side has hung up.
-pub fn run(options: Options) -> Result<Option<JoinHandle<()>>> {
-    let event_loop = EventLoop::<UserEvent>::with_user_event()
-        .build()
-        .context("creating the event loop")?;
+pub fn run(event_loop: EventLoop<UserEvent>, options: Options) -> Result<Option<JoinHandle<()>>> {
     let proxy = event_loop.create_proxy();
     let deadline = options
         .seconds
         .map(|s| Instant::now() + Duration::from_secs(s));
 
     let mut app = App {
+        input: Forwarder::new(options.input.clone()),
+        cursor: None,
+        cursor_visible: true,
+        modifiers: ModifiersState::empty(),
         options: Some(options),
         proxy,
         gpu: None,
@@ -121,6 +142,12 @@ struct App {
     /// The frame currently on screen, for redraws.
     shown: Option<FrameReady>,
     latency: Latency,
+    input: Forwarder,
+    modifiers: ModifiersState,
+    /// The host's pointer, shown as ours over the window. Kept so it can be
+    /// applied once the window exists if it arrives first.
+    cursor: Option<CustomCursor>,
+    cursor_visible: bool,
     overlay_visible: bool,
     last_report: Instant,
     last_draw: Instant,
@@ -268,7 +295,7 @@ impl App {
         let raw_input = gpu.egui_state.take_egui_input(&gpu.window);
         let overlay_visible = self.overlay_visible;
         let video_size = gpu.video_size;
-        let output = gpu.egui_ctx.run_ui(raw_input, |ui| {
+        let mut output = gpu.egui_ctx.run_ui(raw_input, |ui| {
             if overlay_visible {
                 overlay::show(ui.ctx(), video_size, &summary, &net);
             }
@@ -278,10 +305,12 @@ impl App {
         let jobs = gpu
             .egui_ctx
             .tessellate(output.shapes, output.pixels_per_point);
-        for (id, deltas) in &output.textures_delta.set {
+        // Drained, not just read: egui asserts in debug builds that every
+        // delta was applied.
+        for (id, deltas) in output.textures_delta.set.drain() {
             for delta in deltas {
                 gpu.egui_renderer
-                    .update_texture(&gpu.device, &gpu.queue, *id, delta);
+                    .update_texture(&gpu.device, &gpu.queue, id, &delta);
             }
         }
         let screen = egui_wgpu::ScreenDescriptor {
@@ -329,8 +358,8 @@ impl App {
         if let Some(frame) = fresh {
             gpu.interop.frame_done(frame.fence_value)?;
         }
-        for id in &output.textures_delta.free {
-            gpu.egui_renderer.free_texture(id);
+        for id in output.textures_delta.free.drain() {
+            gpu.egui_renderer.free_texture(&id);
         }
 
         gpu.queue.present(target);
@@ -367,6 +396,16 @@ impl App {
         self.report().map(|r| format!("--- final 2 s ---\n{r}"))
     }
 
+    fn apply_cursor(&self) {
+        let Some(gpu) = &self.gpu else {
+            return;
+        };
+        if let Some(cursor) = &self.cursor {
+            gpu.window.set_cursor(cursor.clone());
+        }
+        gpu.window.set_cursor_visible(self.cursor_visible);
+    }
+
     fn fail(&mut self, event_loop: &ActiveEventLoop, error: anyhow::Error) {
         self.error = Some(format!("{error:#}"));
         event_loop.exit();
@@ -375,11 +414,11 @@ impl App {
 
 impl ApplicationHandler<UserEvent> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.gpu.is_none()
-            && self.options.is_some()
-            && let Err(e) = self.init(event_loop)
-        {
-            self.fail(event_loop, e);
+        if self.gpu.is_none() && self.options.is_some() {
+            match self.init(event_loop) {
+                Ok(()) => self.apply_cursor(),
+                Err(e) => self.fail(event_loop, e),
+            }
         }
     }
 
@@ -401,21 +440,38 @@ impl ApplicationHandler<UserEvent> for App {
                     gpu.window.request_redraw();
                 }
             }
+            WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
+            WindowEvent::Focused(focused) => self.input.focus(focused),
             WindowEvent::KeyboardInput {
                 event:
                     KeyEvent {
-                        logical_key: Key::Named(NamedKey::F1),
+                        physical_key: PhysicalKey::Code(KeyCode::F1),
                         state: ElementState::Pressed,
                         repeat: false,
                         ..
                     },
                 ..
-            } => {
+            } if self.modifiers == ModifiersState::CONTROL | ModifiersState::SHIFT => {
                 self.overlay_visible = !self.overlay_visible;
                 if let Some(gpu) = &self.gpu {
                     gpu.window.request_redraw();
                 }
             }
+            // Synthetic events are winit's bookkeeping for keys pressed
+            // while the window was not focused; the agent never saw those.
+            WindowEvent::KeyboardInput {
+                event,
+                is_synthetic: false,
+                ..
+            } => self.input.key(&event),
+            WindowEvent::CursorMoved { position, .. } => {
+                if let Some(gpu) = &self.gpu {
+                    let window = (gpu.config.width, gpu.config.height);
+                    self.input.cursor(position, window, gpu.video_size);
+                }
+            }
+            WindowEvent::MouseInput { state, button, .. } => self.input.button(button, state),
+            WindowEvent::MouseWheel { delta, .. } => self.input.wheel(delta),
             WindowEvent::RedrawRequested => {
                 if let Err(e) = self.draw(None) {
                     self.fail(event_loop, e);
@@ -435,6 +491,19 @@ impl ApplicationHandler<UserEvent> for App {
             // once it is drawn releases every slot before it too.
             UserEvent::Frame(frame) => self.latest = Some(frame),
             UserEvent::Failed(error) => self.fail(event_loop, anyhow!(error)),
+            UserEvent::Cursor(Cursor::Shape(shape)) => {
+                tracing::debug!(width = shape.width, height = shape.height, "pointer shape");
+                match custom_cursor(event_loop, shape) {
+                    Ok(cursor) => self.cursor = Some(cursor),
+                    Err(e) => tracing::debug!(error = %e, "pointer shape refused"),
+                }
+                self.apply_cursor();
+            }
+            UserEvent::Cursor(Cursor::Visible(visible)) => {
+                tracing::debug!(visible, "pointer visibility");
+                self.cursor_visible = visible;
+                self.apply_cursor();
+            }
         }
     }
 
@@ -465,4 +534,16 @@ impl ApplicationHandler<UserEvent> for App {
         }
         event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + IDLE_REFRESH));
     }
+}
+
+/// The host's pointer image as an OS cursor for this window.
+fn custom_cursor(event_loop: &ActiveEventLoop, shape: CursorShape) -> Result<CustomCursor> {
+    let source = CustomCursor::from_rgba(
+        shape.rgba,
+        shape.width,
+        shape.height,
+        shape.hot_x,
+        shape.hot_y,
+    )?;
+    Ok(event_loop.create_custom_cursor(source))
 }
