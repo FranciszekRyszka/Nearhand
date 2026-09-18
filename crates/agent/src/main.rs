@@ -134,7 +134,7 @@ async fn listen(bind: SocketAddr, config: SessionConfig) -> Result<()> {
     );
 
     tokio::select! {
-        () = accept_viewers(endpoint.clone(), Arc::new(config)) => {}
+        () = accept_viewers(endpoint.clone(), Arc::new(config), one_viewer()) => {}
         _ = tokio::signal::ctrl_c() => println!("stopping"),
     }
     endpoint.close(close::NORMAL.into(), b"agent stopping");
@@ -143,11 +143,15 @@ async fn listen(bind: SocketAddr, config: SessionConfig) -> Result<()> {
 }
 
 /// Serve viewers connecting to `endpoint`, one at a time, until it closes.
-async fn accept_viewers(endpoint: Endpoint, config: Arc<SessionConfig>) {
-    // One viewer at a time: two would fight over the display duplication and
-    // the hardware encoder.
-    let slot = Arc::new(Semaphore::new(1));
+/// The slot a viewer holds for its session. One at a time: two would fight
+/// over the display duplication and the hardware encoder.
+fn one_viewer() -> Arc<Semaphore> {
+    Arc::new(Semaphore::new(1))
+}
 
+/// Serve viewers arriving at `endpoint`, each once it holds `slot`. Endpoints
+/// sharing a slot share the limit.
+async fn accept_viewers(endpoint: Endpoint, config: Arc<SessionConfig>, slot: Arc<Semaphore>) {
     while let Some(incoming) = endpoint.accept().await {
         let config = config.clone();
         let slot = slot.clone();
@@ -166,7 +170,8 @@ async fn accept_viewers(endpoint: Endpoint, config: Arc<SessionConfig>) {
                 return;
             };
 
-            tracing::info!(%remote, "viewer connected");
+            let path = nearhand_transport::rendezvous::path_of(remote);
+            tracing::info!(%remote, %path, "viewer connected");
             match session::serve(conn, &config).await {
                 Ok(()) => tracing::info!(%remote, "viewer left"),
                 Err(e) => tracing::info!(%remote, error = %format!("{e:#}"), "session ended"),

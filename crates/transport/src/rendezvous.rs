@@ -19,8 +19,16 @@
 //! A NAT that picks a new port for each destination (a "symmetric" one, common
 //! on mobile networks and in offices) makes the port the server saw useless to
 //! anyone else. Which pairs of NATs a direct connection gets through is a
-//! table in `docs/protocol.md`, and a test in the server crate. Where there is
-//! no direct path, the relay carries the session instead.
+//! table in `docs/protocol.md`, and a test in the server crate.
+//!
+//! ## The relay
+//!
+//! Alongside the direct attempts the viewer connects through the server's
+//! relay ([`crate::relay`]), which gets through anything that lets the two
+//! reach the server. A direct connection is preferred — it is faster, and
+//! costs the server nothing — so the relayed one is taken only if no direct
+//! one is made within [`DIRECT_GRACE`], or every direct attempt has failed.
+//! Either way the session is end-to-end encrypted to the agent's pinned key.
 
 use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::time::Duration;
@@ -30,9 +38,10 @@ use nearhand_core::proto::close;
 use nearhand_core::rendezvous::{DeviceId, FromServer, ToServer};
 use quinn::{Connection, Endpoint};
 
+use crate::relay::{self, is_relayed, relayed_address};
 use crate::{
-    Error, Fingerprint, Identity, Result, SERVER_NAME, client_config, connect, connect_server,
-    recv_message, send_message,
+    Error, Fingerprint, Identity, Link, Result, SERVER_NAME, client_config, connect,
+    connect_server, peer_server_config, recv_message, send_message,
 };
 
 /// How long the connection attempts that open the way are kept up: QUIC
@@ -45,22 +54,31 @@ const RECONNECT_FIRST: Duration = Duration::from_secs(1);
 const RECONNECT_MAX: Duration = Duration::from_secs(30);
 /// How long each of a device's addresses gets to answer a viewer.
 pub const PEER_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a direct connection gets to beat a relayed one that is ready.
+/// A direct handshake takes a round trip or two once the viewer knows where
+/// to go, so a second is ample, and is also the most connecting should take
+/// when there is no direct path.
+pub const DIRECT_GRACE: Duration = Duration::from_secs(1);
 
 /// Keep this agent registered with the server, reconnecting whenever the
 /// connection is lost, and open the way to every viewer the server
 /// introduces. Never returns; drop it to stop.
 ///
 /// `endpoint` must be the one that accepts viewers: its socket is the one the
-/// server sees, and so the one viewers are sent to.
+/// server sees, and so the one viewers are sent to. Viewers who come through
+/// the relay arrive on another endpoint, one per server connection, which is
+/// handed to `relayed` to accept them from; it closes when that connection
+/// is lost.
 pub async fn stay_registered(
     endpoint: &Endpoint,
     server: SocketAddr,
     server_fingerprint: Fingerprint,
     identity: &Identity,
+    relayed: impl Fn(Endpoint),
 ) {
     let mut wait = RECONNECT_FIRST;
     loop {
-        match register(endpoint, server, server_fingerprint, identity).await {
+        match register(endpoint, server, server_fingerprint, identity, &relayed).await {
             // Registered for a while and then lost: reconnect promptly.
             Ok(()) => {
                 tracing::info!("server connection ended; reconnecting");
@@ -78,14 +96,29 @@ async fn register(
     server: SocketAddr,
     server_fingerprint: Fingerprint,
     identity: &Identity,
+    relayed: &impl Fn(Endpoint),
 ) -> Result<()> {
     let conn = connect_server(endpoint, server, server_fingerprint, Some(identity)).await?;
+    let relay = relay::endpoint(conn.clone(), true, Some(peer_server_config(identity)?))?;
+    let result = serve_registration(endpoint, &conn, relay.clone(), relayed).await;
+    relay.close(close::NORMAL.into(), b"server connection lost");
+    result
+}
+
+async fn serve_registration(
+    endpoint: &Endpoint,
+    conn: &Connection,
+    relay: Endpoint,
+    relayed: &impl Fn(Endpoint),
+) -> Result<()> {
+    let server = conn.remote_address();
     let (mut send, mut recv) = conn.open_bi().await?;
     let addresses = own_addresses(endpoint, server);
     send_message(&mut send, &ToServer::Register { addresses }).await?;
     match recv_message::<FromServer>(&mut recv).await? {
         Some(FromServer::Registered { id, observed }) => {
             tracing::info!(%id, %observed, "registered with the server");
+            relayed(relay);
         }
         Some(FromServer::Refused(refusal)) => return Err(Error::Refused(refusal)),
         other => return Err(Error::Unexpected(format!("{other:?}"))),
@@ -109,7 +142,9 @@ async fn register(
 }
 
 /// Ask the server to introduce this viewer to device `id`, then connect to it
-/// directly, pinned to the key the server reports for it.
+/// — directly if that works, through the server's relay if not — pinned to
+/// the key the server reports for it. [`path_of`] the connection's remote
+/// address says which way it went.
 ///
 /// Everything goes out from `endpoint`'s one socket: the address the server
 /// sees is the one the agent opens its way to.
@@ -118,31 +153,118 @@ pub async fn find(
     server: SocketAddr,
     server_fingerprint: Fingerprint,
     id: DeviceId,
+    route: Route,
 ) -> Result<Connection> {
     let introducer = connect_server(endpoint, server, server_fingerprint, None).await?;
     let (mut send, mut recv) = introducer.open_bi().await?;
     let addresses = own_addresses(endpoint, server);
     send_message(&mut send, &ToServer::Connect { id, addresses }).await?;
     let answer = recv_message::<FromServer>(&mut recv).await;
-    introducer.close(close::NORMAL.into(), b"introduced");
-
     let (fingerprint, addresses) = match answer? {
         Some(FromServer::Peer {
             fingerprint,
             addresses,
         }) => (Fingerprint::from_bytes(fingerprint), addresses),
-        Some(FromServer::Refused(refusal)) => return Err(Error::Refused(refusal)),
-        other => return Err(Error::Unexpected(format!("{other:?}"))),
+        Some(FromServer::Refused(refusal)) => {
+            introducer.close(close::NORMAL.into(), b"refused");
+            return Err(Error::Refused(refusal));
+        }
+        other => {
+            introducer.close(close::NORMAL.into(), b"unexpected");
+            return Err(Error::Unexpected(format!("{other:?}")));
+        }
     };
     // Not a security check — ten digits are easily matched on purpose — but
     // it catches a server that mixes up its devices.
     if fingerprint.device_id() != id {
+        introducer.close(close::NORMAL.into(), b"wrong key");
         return Err(Error::Unexpected(
             "the server answered with another device's key".into(),
         ));
     }
     tracing::info!(?addresses, "introduced; connecting");
-    race(endpoint, &addresses, fingerprint).await
+
+    // The introduction's connection is the relay's tunnel, so it stays open
+    // for as long as a relayed session might need it.
+    let tunnel = relay::endpoint(introducer.clone(), false, None)?;
+    let direct = async {
+        match route {
+            Route::Best => race(endpoint, &addresses, fingerprint).await,
+            Route::RelayOnly => Err(Error::Unreachable("direct not tried".into())),
+        }
+    };
+    let through_relay = async {
+        tokio::time::timeout(
+            PEER_CONNECT_TIMEOUT,
+            connect(&tunnel, relayed_address(0), fingerprint),
+        )
+        .await
+        .unwrap_or_else(|_| Err(Error::Unreachable("no answer through the relay".into())))
+    };
+    match prefer_direct(direct, through_relay, DIRECT_GRACE).await {
+        Ok(conn) if is_relayed(conn.remote_address()) => {
+            // Done with the tunnel once the session is: after its last
+            // packets have left, close what carries them.
+            let session = conn.clone();
+            tokio::spawn(async move {
+                session.closed().await;
+                tunnel.wait_idle().await;
+                introducer.close(close::NORMAL.into(), b"session over");
+            });
+            Ok(conn)
+        }
+        result => {
+            introducer.close(close::NORMAL.into(), b"introduced");
+            result
+        }
+    }
+}
+
+/// The direct connection if it is made within `grace` of the relayed one
+/// being ready (or at all, while the relay is not), else the relayed one.
+async fn prefer_direct(
+    direct: impl Future<Output = Result<Connection>>,
+    relayed: impl Future<Output = Result<Connection>>,
+    grace: Duration,
+) -> Result<Connection> {
+    tokio::pin!(direct, relayed);
+    let deadline = tokio::time::sleep(Duration::MAX);
+    tokio::pin!(deadline);
+    let mut direct_failed = None;
+    let mut relay_failed = None;
+    let mut ready: Option<Connection> = None;
+    loop {
+        tokio::select! {
+            result = &mut direct, if direct_failed.is_none() => match result {
+                Ok(conn) => {
+                    if let Some(relayed) = ready {
+                        relayed.close(close::NORMAL.into(), b"direct connection made");
+                    }
+                    return Ok(conn);
+                }
+                Err(e) => match ready {
+                    Some(relayed) => return Ok(relayed),
+                    None => direct_failed = Some(e),
+                },
+            },
+            result = &mut relayed, if ready.is_none() && relay_failed.is_none() => match result {
+                Ok(conn) if direct_failed.is_some() => return Ok(conn),
+                Ok(conn) => {
+                    ready = Some(conn);
+                    deadline
+                        .as_mut()
+                        .reset(tokio::time::Instant::now() + grace);
+                }
+                Err(e) => relay_failed = Some(e),
+            },
+            () = &mut deadline, if ready.is_some() => {
+                return ready.ok_or_else(|| Error::Unreachable("relay vanished".into()));
+            }
+        }
+        if let (Some(direct), Some(relay)) = (&direct_failed, &relay_failed) {
+            return Err(Error::Unreachable(format!("{direct}; relay: {relay}")));
+        }
+    }
 }
 
 /// Try every address at once and keep the first connection made.
@@ -175,7 +297,10 @@ async fn race(
             Err(e) => failures.push(e.to_string()),
         }
     }
-    Err(Error::Unreachable(failures.join("; ")))
+    Err(Error::Unreachable(format!(
+        "direct: {}",
+        failures.join("; ")
+    )))
 }
 
 /// Open this endpoint's way to `target` through the local firewall and NAT,
@@ -185,7 +310,7 @@ async fn race(
 /// what matters is that it left. The attempt is kept alive for `hold`, so QUIC
 /// resends it in the meantime.
 async fn punch(endpoint: &Endpoint, target: SocketAddr, hold: Duration) {
-    let Ok(config) = client_config(Fingerprint::from_bytes([0; 32]), ALPN, None) else {
+    let Ok(config) = client_config(Fingerprint::from_bytes([0; 32]), ALPN, None, Link::Peer) else {
         return;
     };
     let Ok(connecting) = endpoint.connect_with(config, target, SERVER_NAME) else {
@@ -223,9 +348,50 @@ fn local_ip_toward(remote: SocketAddr) -> Option<IpAddr> {
     socket.local_addr().ok().map(|a| a.ip())
 }
 
+/// Which ways [`find`] may try.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Route {
+    /// Direct if possible, else relayed.
+    #[default]
+    Best,
+    /// Relayed only: for testing the relay, and measuring what it costs.
+    RelayOnly,
+}
+
+/// Which way a connection to `remote` went.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Path {
+    /// Direct, within a private network.
+    Local,
+    /// Direct, across the internet.
+    Internet,
+    /// Through the server's relay.
+    Relayed,
+}
+
+impl std::fmt::Display for Path {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Path::Local => "on the local network",
+            Path::Internet => "across the internet",
+            Path::Relayed => "through the server's relay",
+        })
+    }
+}
+
+pub fn path_of(remote: SocketAddr) -> Path {
+    if is_relayed(remote) {
+        Path::Relayed
+    } else if is_local(remote) {
+        Path::Local
+    } else {
+        Path::Internet
+    }
+}
+
 /// Whether `address` belongs to a private network: a connection to it did
 /// not cross the internet.
-pub fn is_local(address: SocketAddr) -> bool {
+fn is_local(address: SocketAddr) -> bool {
     match address.ip().to_canonical() {
         IpAddr::V4(ip) => ip.is_private() || ip.is_loopback() || ip.is_link_local(),
         IpAddr::V6(ip) => ip.is_loopback() || ip.is_unique_local() || ip.is_unicast_link_local(),

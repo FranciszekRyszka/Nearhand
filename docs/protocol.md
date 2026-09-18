@@ -81,7 +81,43 @@ its own NAT to the agent's answer. Whether that works depends on the two NATs:
 
 Each row is a test, run against the real server, agent and viewer code over
 a simulated network (`crates/server/src/netsim.rs`). Where there is no direct
-path, the relay carries the session (next in M2).
+path, the relay carries the session.
+
+### The relay
+
+The relay needs no port or connection of its own. The viewer's connection to
+the server stays open after the introduction, and the server forwards QUIC
+datagrams between it and the agent's registration connection:
+
+```text
+viewer ══ QUIC to the server ══ server ══ QUIC to the server ══ agent
+          datagram: packet                datagram: session (u64, big-endian), packet
+       └──────────────── QUIC, viewer to agent, pinned to the agent's key ────────────────┘
+```
+
+* Each datagram carries one whole packet of the viewer-to-agent connection,
+  which runs inside exactly as it would directly: same handshake, same pinned
+  key, same streams and datagrams. The server forwards ciphertext.
+* On the agent's side, one connection carries every relayed viewer, so its
+  datagrams start with the session number. The server adds it towards the
+  agent and strips it towards the viewer. To QUIC, a relayed peer's address
+  is in `100::/64`, a range reserved for discarding traffic, with the session
+  number in the low 64 bits.
+* A relayed packet is at least 1200 bytes, QUIC's minimum, so connections to
+  the server start at a 1280-byte packet size to fit it with their own framing.
+  The connection inside keeps to 1200 bytes, and its datagrams — video — are
+  sized to fit.
+* The viewer tries the direct addresses and the relay at once. A direct
+  connection wins if it is made within a second of the relayed one being
+  ready; otherwise, or once every direct attempt has failed, the relayed one
+  is used. Connecting takes about a second at most when there is no direct
+  path. When direct wins, the viewer closes its server connection, and the
+  relay with it.
+* The server forwards only between the two connections it paired, and only
+  after the agent has answered `Ready`.
+
+The relay costs one extra hop and a second layer of encryption. On loopback it
+added about 0.2 ms to the round trip, with the frame rate unchanged.
 
 ## Session
 

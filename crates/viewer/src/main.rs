@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use nearhand_core::rendezvous::DeviceId;
-use nearhand_transport::Fingerprint;
+use nearhand_transport::{Fingerprint, rendezvous};
 
 use crate::direct::Shared;
 
@@ -54,6 +54,10 @@ enum Command {
         /// and it is not given here.
         #[arg(long)]
         password: Option<String>,
+        /// Go through the server's relay even where a direct connection
+        /// would work: for testing the relay and measuring what it costs.
+        #[arg(long)]
+        relay_only: bool,
         #[command(flatten)]
         watch: Watch,
     },
@@ -104,12 +108,19 @@ fn main() -> Result<()> {
             server,
             server_fingerprint,
             password,
+            relay_only,
             watch,
         }) => {
+            let route = if relay_only {
+                rendezvous::Route::RelayOnly
+            } else {
+                rendezvous::Route::Best
+            };
             let target = direct::Target::Server {
                 server,
                 server_fingerprint,
                 id,
+                route,
             };
             watch_target(target, password, watch)
         }

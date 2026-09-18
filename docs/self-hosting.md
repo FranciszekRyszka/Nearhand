@@ -18,11 +18,14 @@ nearhand-viewer connect "123 456 7890" --server 203.0.113.10:443 \
     --server-fingerprint <fingerprint> --password <password>
 ```
 
-The connection between viewer and agent is direct, never through the server:
-on the same network, or across the internet through the NATs of most home
-connections ([which ones](protocol.md#through-nats)). Mobile networks and
-offices often use NATs no direct connection gets through; the relay, which
-carries a session in that case, is the next step.
+Viewer and agent connect directly where they can: on the same network, or
+across the internet through the NATs of most home connections ([which
+ones](protocol.md#through-nats)). Where they cannot — often on mobile networks
+and in offices — the server relays the session, still end-to-end encrypted
+between the two. The viewer says which way it went. A relayed session's video
+passes through the server, so the server's bandwidth matters then: a few
+Mbit/s per session, both ways combined. `--relay-only` on the viewer forces the
+relay, to test it.
 
 There is no Nearhand-run infrastructure — no project ID server, no project
 relay. Every install points at a server you run.

@@ -41,9 +41,15 @@ pub async fn run(options: Options) -> Result<()> {
         bitrate_kbps: options.bitrate_kbps,
         password: Some(password),
     });
+    let slot = crate::one_viewer();
+    // Viewers through the relay arrive on an endpoint of their own, one per
+    // server connection; they share the one slot with direct viewers.
+    let relayed = |relay: quinn::Endpoint| {
+        tokio::spawn(crate::accept_viewers(relay, config.clone(), slot.clone()));
+    };
     tokio::select! {
-        () = crate::accept_viewers(endpoint.clone(), config) => {}
-        () = stay_registered(&endpoint, options.server, options.server_fingerprint, &identity) => {}
+        () = crate::accept_viewers(endpoint.clone(), config.clone(), slot.clone()) => {}
+        () = stay_registered(&endpoint, options.server, options.server_fingerprint, &identity, relayed) => {}
         _ = tokio::signal::ctrl_c() => println!("stopping"),
     }
     endpoint.close(close::NORMAL.into(), b"agent stopping");

@@ -2,6 +2,14 @@
 //! and the server puts them in touch. See `nearhand_core::rendezvous` for the
 //! message flow.
 //!
+//! Introduced, the viewer's connection stays open as the relay's tunnel: the
+//! server forwards datagrams between it and the agent's connection, tagging
+//! them with the session on the agent's side (`nearhand_transport::relay`).
+//! The session inside is end-to-end encrypted to the agent's key, so the
+//! server passes on packets it cannot read. Only the two connections it paired
+//! can use a tunnel, and only once the agent has said it is ready: the relay
+//! is no open proxy.
+//!
 //! The registry is in memory. A device's ID comes from its key, so nothing
 //! about it needs to outlive the process: an agent that reconnects after a
 //! restart registers under the same ID again. Accounts, groups and grants —
@@ -15,6 +23,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use nearhand_core::rendezvous::{DeviceId, FromServer, Refusal, ToServer};
+use nearhand_transport::relay::{tag, untag};
 use nearhand_transport::{Fingerprint, peer_fingerprint, recv_message, send_message};
 use quinn::{Connection, Endpoint, SendStream};
 use tokio::sync::{mpsc, oneshot};
@@ -30,6 +39,14 @@ const MAX_ADDRESSES: usize = 8;
 /// Connection attempts a viewer's address may make per window.
 const ATTEMPTS: usize = 10;
 const ATTEMPT_WINDOW: Duration = Duration::from_secs(60);
+
+type Relays = Arc<Mutex<HashMap<u64, Relay>>>;
+
+struct Relay {
+    viewer: Connection,
+    /// Bytes relayed to the viewer.
+    to_viewer: Arc<AtomicU64>,
+}
 
 #[derive(Default)]
 pub struct Registry {
@@ -49,6 +66,8 @@ struct Agent {
     to_agent: mpsc::UnboundedSender<FromServer>,
     /// Viewers waiting for this agent to answer, by session.
     waiting: Arc<Mutex<HashMap<u64, oneshot::Sender<bool>>>>,
+    /// Viewers' connections, by session, for relaying the agent's datagrams.
+    relays: Relays,
     /// Which registration this is, so a stale connection going away does not
     /// remove the one that replaced it.
     registration: u64,
@@ -116,6 +135,7 @@ async fn register(
     let observed = conn.remote_address();
     let (to_agent, mut from_server) = mpsc::unbounded_channel();
     let waiting = Arc::new(Mutex::new(HashMap::new()));
+    let relays = Relays::default();
     let registration = registry.next.fetch_add(1, Ordering::Relaxed);
     let agent = Agent {
         fingerprint,
@@ -123,6 +143,7 @@ async fn register(
         conn: conn.clone(),
         to_agent,
         waiting: waiting.clone(),
+        relays: relays.clone(),
         registration,
     };
     let taken = {
@@ -142,6 +163,26 @@ async fn register(
     }
     tracing::info!(%id, %observed, "agent registered");
     send_message(&mut send, &FromServer::Registered { id, observed }).await?;
+
+    // The agent's relayed packets, each to its session's viewer. Ends when
+    // the agent's connection does.
+    let from_agent = conn.clone();
+    tokio::spawn(async move {
+        while let Ok(datagram) = from_agent.read_datagram().await {
+            let Some((session, packet)) = untag(&datagram) else {
+                continue;
+            };
+            let relay = lock(&relays)
+                .get(&session)
+                .map(|r| (r.viewer.clone(), r.to_viewer.clone()));
+            if let Some((viewer, count)) = relay {
+                count.fetch_add(packet.len() as u64, Ordering::Relaxed);
+                // A full queue drops the oldest datagrams; the connection
+                // inside recovers, as from any loss.
+                let _ = viewer.send_datagram(packet);
+            }
+        }
+    });
 
     // Messages for the agent go out on a task of their own, so a slow agent
     // never holds up the viewers being introduced to it.
@@ -208,11 +249,41 @@ async fn introduce(
     tracing::info!(%id, viewer = %observed, "introduced");
     let peer = FromServer::Peer {
         fingerprint: *agent.fingerprint.as_bytes(),
-        addresses: candidates(agent.reported, agent.conn.remote_address()),
+        addresses: candidates(agent.reported.clone(), agent.conn.remote_address()),
     };
     send_message(send, &peer).await?;
-    goodbye(conn, send).await;
+    let _ = send.finish();
+    relay(conn, &agent, session).await;
     Ok(())
+}
+
+/// Forward the viewer's datagrams to the agent, and the agent's for this
+/// session back, until the viewer closes its connection: at once when it
+/// connected directly, at the end of the session when it did not.
+async fn relay(viewer: &Connection, agent: &Agent, session: u64) {
+    let to_viewer = Arc::new(AtomicU64::new(0));
+    lock(&agent.relays).insert(
+        session,
+        Relay {
+            viewer: viewer.clone(),
+            to_viewer: to_viewer.clone(),
+        },
+    );
+    let mut to_agent = 0u64;
+    while let Ok(datagram) = viewer.read_datagram().await {
+        to_agent += datagram.len() as u64;
+        let _ = agent.conn.send_datagram(tag(session, &datagram));
+    }
+    lock(&agent.relays).remove(&session);
+    let to_viewer = to_viewer.load(Ordering::Relaxed);
+    if to_agent + to_viewer > 0 {
+        tracing::info!(
+            session,
+            to_agent_kb = to_agent / 1024,
+            to_viewer_kb = to_viewer / 1024,
+            "relayed session ended"
+        );
+    }
 }
 
 async fn refuse(conn: &Connection, send: &mut SendStream, refusal: Refusal) -> Result<()> {
@@ -333,8 +404,10 @@ mod tests {
     // --- Whole introductions, across simulated NATs -------------------------
 
     use crate::netsim::{NatKind, Net, private, public};
-    use nearhand_transport::rendezvous::{find, stay_registered};
-    use nearhand_transport::{Error, Identity, peer_server_config, rendezvous_server_config};
+    use nearhand_transport::rendezvous::{
+        DIRECT_GRACE, Path, Route, find, path_of, stay_registered,
+    };
+    use nearhand_transport::{Identity, peer_server_config, relay, rendezvous_server_config};
     use quinn::{EndpointConfig, ServerConfig, TokioRuntime};
 
     #[derive(Debug, Clone, Copy)]
@@ -377,19 +450,42 @@ mod tests {
     const AGENT: u8 = 1;
     const VIEWER: u8 = 2;
 
-    /// A server on the internet, an agent at `agent`, and a viewer at
-    /// `viewer` trying to reach it: where the viewer's connection landed.
-    /// `punch: false` has the agent skip opening its way.
-    async fn introduce_across(
-        agent: Place,
-        viewer: Place,
-        punch: bool,
-    ) -> nearhand_transport::Result<SocketAddr> {
-        let world = World::new(agent, punch).await;
-        world.reach(viewer).await
+    /// Accept viewers on `endpoint`, echoing whatever each sends on its first
+    /// stream: enough to show a session's data gets through both ways.
+    fn echo(endpoint: Endpoint) {
+        tokio::spawn(async move {
+            while let Some(incoming) = endpoint.accept().await {
+                tokio::spawn(async move {
+                    let Ok(conn) = incoming.await else { return };
+                    if let Ok((mut send, mut recv)) = conn.accept_bi().await
+                        && let Ok(data) = recv.read_to_end(64 * 1024).await
+                    {
+                        let _ = send.write_all(&data).await;
+                        let _ = send.finish();
+                    }
+                    conn.closed().await;
+                });
+            }
+        });
     }
 
-    /// A server, and an agent registered with it.
+    /// Where a viewer's connection went, how long connecting took, and the
+    /// connection itself.
+    struct Reached {
+        remote: SocketAddr,
+        took: Duration,
+        conn: Connection,
+    }
+
+    impl Reached {
+        /// The agent's IP for a direct connection; `None` when relayed.
+        fn direct_to(&self) -> Option<IpAddr> {
+            (path_of(self.remote) != Path::Relayed).then_some(self.remote.ip())
+        }
+    }
+
+    /// A server on the internet and an agent registered with it.
+    /// `punch: false` has the agent skip opening its way to viewers.
     struct World {
         net: Arc<Net>,
         server_addr: SocketAddr,
@@ -422,19 +518,10 @@ mod tests {
                 agent_behind,
                 Some(peer_server_config(&agent_identity).expect("config")),
             );
-            let accepting = agent.clone();
-            tokio::spawn(async move {
-                while let Some(incoming) = accepting.accept().await {
-                    tokio::spawn(async move {
-                        if let Ok(conn) = incoming.await {
-                            conn.closed().await;
-                        }
-                    });
-                }
-            });
+            echo(agent.clone());
             if punch {
                 tokio::spawn(async move {
-                    stay_registered(&agent, server_addr, server_fp, &agent_identity).await
+                    stay_registered(&agent, server_addr, server_fp, &agent_identity, echo).await
                 });
             } else {
                 tokio::spawn(register_without_punching(
@@ -461,20 +548,47 @@ mod tests {
             }
         }
 
-        async fn reach(&self, viewer: Place) -> nearhand_transport::Result<SocketAddr> {
+        async fn reach(&self, viewer: Place) -> nearhand_transport::Result<Reached> {
             let (viewer_addr, viewer_behind) = place(&self.net, viewer, VIEWER);
             let viewer = endpoint(&self.net, viewer_addr, viewer_behind, None);
-            let conn = find(&viewer, self.server_addr, self.server_fp, self.id).await?;
-            Ok(conn.remote_address())
+            let start = std::time::Instant::now();
+            let conn = find(
+                &viewer,
+                self.server_addr,
+                self.server_fp,
+                self.id,
+                Route::Best,
+            )
+            .await?;
+            let took = start.elapsed();
+
+            // More than one packet's worth, so relayed data is split and
+            // reassembled like any other.
+            let message: Vec<u8> = (0..5000u32).map(|i| i as u8).collect();
+            let (mut send, mut recv) = conn.open_bi().await.expect("stream");
+            send.write_all(&message).await.expect("write");
+            send.finish().expect("finish");
+            let echoed = recv.read_to_end(64 * 1024).await.expect("echo");
+            assert_eq!(echoed, message, "the session's data gets through");
+            Ok(Reached {
+                remote: conn.remote_address(),
+                took,
+                conn,
+            })
         }
 
         /// Where the server sees the agent now.
         fn agent_seen_at(&self) -> SocketAddr {
             lock(&self.registry.agents)[&self.id].conn.remote_address()
         }
+
+        fn relayed_sessions(&self) -> usize {
+            lock(&lock(&self.registry.agents)[&self.id].relays).len()
+        }
     }
 
     /// An agent that says it is ready without sending anything to the viewer.
+    /// It still takes relayed viewers.
     async fn register_without_punching(
         endpoint: Endpoint,
         server: SocketAddr,
@@ -484,6 +598,11 @@ mod tests {
         let conn =
             nearhand_transport::connect_server(&endpoint, server, server_fp, Some(&identity))
                 .await?;
+        echo(relay::endpoint(
+            conn.clone(),
+            true,
+            Some(peer_server_config(&identity)?),
+        )?);
         let (mut send, mut recv) = conn.open_bi().await?;
         send_message(&mut send, &ToServer::Register { addresses: vec![] }).await?;
         while let Some(message) = recv_message::<FromServer>(&mut recv).await? {
@@ -494,58 +613,59 @@ mod tests {
         Ok(())
     }
 
-    /// The table in docs/protocol.md ("Through NATs"), row by row.
+    /// The table in docs/protocol.md ("Through NATs"), row by row: a direct
+    /// connection wherever there is a path for one, and the relay, within
+    /// about a second, wherever there is not.
     #[tokio::test]
-    async fn which_nats_a_direct_connection_gets_through() {
+    async fn direct_where_the_nats_allow_and_relayed_where_not() {
         use NatKind::*;
         use Place::*;
-        let agent_public = public(AGENT, 0).ip();
-        let agent_private = private(AGENT, 2, 0).ip();
+        let agent_public = Some(public(AGENT, 0).ip());
+        let agent_private = Some(private(AGENT, 2, 0).ip());
+        let relayed = None;
         let cases = [
-            (Internet, Internet, Some(public(AGENT, 0).ip())),
-            (Behind(PortRestricted), Internet, Some(agent_public)),
-            (
-                Behind(PortRestricted),
-                Behind(PortRestricted),
-                Some(agent_public),
-            ),
-            (
-                Behind(FullCone),
-                Behind(AddressRestricted),
-                Some(agent_public),
-            ),
-            (Behind(PortRestricted), Behind(Symmetric), None),
-            (
-                Behind(AddressRestricted),
-                Behind(Symmetric),
-                Some(agent_public),
-            ),
-            (Behind(FullCone), Behind(Symmetric), Some(agent_public)),
-            (Behind(Symmetric), Internet, None),
-            (Behind(Symmetric), Behind(PortRestricted), None),
+            (Internet, Internet, agent_public),
+            (Behind(PortRestricted), Internet, agent_public),
+            (Behind(PortRestricted), Behind(PortRestricted), agent_public),
+            (Behind(FullCone), Behind(AddressRestricted), agent_public),
+            (Behind(PortRestricted), Behind(Symmetric), relayed),
+            (Behind(AddressRestricted), Behind(Symmetric), agent_public),
+            (Behind(FullCone), Behind(Symmetric), agent_public),
+            (Behind(Symmetric), Internet, relayed),
+            (Behind(Symmetric), Behind(PortRestricted), relayed),
+            (Behind(Symmetric), Behind(Symmetric), relayed),
             // Same network, and the NAT does not hairpin: the local address.
-            (Behind(PortRestricted), BesideAgent, Some(agent_private)),
-            (Behind(Symmetric), BesideAgent, Some(agent_private)),
+            (Behind(PortRestricted), BesideAgent, agent_private),
+            (Behind(Symmetric), BesideAgent, agent_private),
         ];
         let mut runs = tokio::task::JoinSet::new();
         for (i, (agent, viewer, expected)) in cases.into_iter().enumerate() {
             runs.spawn(async move {
-                let result = introduce_across(agent, viewer, true).await;
+                let world = World::new(agent, true).await;
+                let result = world.reach(viewer).await;
                 (i, agent, viewer, expected, result)
             });
         }
         let mut wrong = Vec::new();
         while let Some(run) = runs.join_next().await {
             let (i, agent, viewer, expected, result) = run.expect("case");
-            let landed = match &result {
-                Ok(address) => Some(address.ip()),
-                Err(Error::Unreachable(_)) => None,
-                Err(e) => panic!("case {i}: failed before connecting: {e}"),
+            let case = format!("case {i}: agent {agent:?}, viewer {viewer:?}");
+            let reached = match result {
+                Ok(reached) => reached,
+                Err(e) => {
+                    wrong.push(format!("{case}: not reached: {e}"));
+                    continue;
+                }
             };
-            if landed != expected {
+            if reached.direct_to() != expected {
                 wrong.push(format!(
-                    "case {i}: agent {agent:?}, viewer {viewer:?}: expected {expected:?}, got {result:?}"
+                    "{case}: expected {expected:?}, went {} to {}",
+                    path_of(reached.remote),
+                    reached.remote
                 ));
+            }
+            if reached.took > DIRECT_GRACE + Duration::from_millis(1500) {
+                wrong.push(format!("{case}: took {:?}", reached.took));
             }
         }
         assert!(wrong.is_empty(), "{}", wrong.join("\n"));
@@ -571,14 +691,49 @@ mod tests {
         })
         .await
         .expect("the server sees the agent move");
-        let landed = world.reach(Place::Internet).await.expect("reached");
-        assert_eq!(landed, after);
+        let reached = world.reach(Place::Internet).await.expect("reached");
+        assert_eq!(reached.remote, after, "directly, at the new port");
+    }
+
+    /// Shows the punch is what opens the agent's NAT: without it, the same
+    /// pair that connects directly above has to be relayed.
+    #[tokio::test]
+    async fn without_the_agents_punch_its_nat_keeps_the_viewer_out() {
+        let world = World::new(Place::Behind(NatKind::PortRestricted), false).await;
+        let reached = world.reach(Place::Internet).await.expect("reached");
+        assert_eq!(path_of(reached.remote), Path::Relayed);
     }
 
     #[tokio::test]
-    async fn without_the_agents_punch_its_nat_keeps_the_viewer_out() {
-        let agent = Place::Behind(NatKind::PortRestricted);
-        let result = introduce_across(agent, Place::Internet, false).await;
-        assert!(matches!(result, Err(Error::Unreachable(_))), "{result:?}");
+    async fn the_relay_is_released_when_the_session_ends() {
+        let world = World::new(Place::Behind(NatKind::Symmetric), true).await;
+        let reached = world.reach(Place::Internet).await.expect("reached");
+        assert_eq!(path_of(reached.remote), Path::Relayed);
+        assert_eq!(world.relayed_sessions(), 1);
+
+        reached.conn.close(0u32.into(), b"done");
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while world.relayed_sessions() > 0 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the server lets the session go");
+    }
+
+    /// A viewer that connects directly closes its introduction, and with it
+    /// the tunnel it did not need.
+    #[tokio::test]
+    async fn a_direct_session_leaves_no_relay_behind() {
+        let world = World::new(Place::Behind(NatKind::PortRestricted), true).await;
+        let reached = world.reach(Place::Internet).await.expect("reached");
+        assert_ne!(path_of(reached.remote), Path::Relayed);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while world.relayed_sessions() > 0 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("no relay held open");
     }
 }

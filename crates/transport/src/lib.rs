@@ -21,6 +21,7 @@
 //! * The server learns an agent's key from the client certificate the agent
 //!   presents, and derives its ID from it.
 
+pub mod relay;
 pub mod rendezvous;
 
 use std::fmt;
@@ -233,7 +234,7 @@ pub fn peer_server_config(identity: &Identity) -> Result<ServerConfig> {
     let tls = rustls::ServerConfig::builder_with_provider(provider())
         .with_protocol_versions(&[&rustls::version::TLS13])?
         .with_no_client_auth();
-    serving(identity, tls, ALPN)
+    serving(identity, tls, ALPN, Link::Peer)
 }
 
 /// What [`rendezvous_endpoint`] serves, for an endpoint made some other way.
@@ -242,13 +243,14 @@ pub fn rendezvous_server_config(identity: &Identity) -> Result<ServerConfig> {
     let tls = rustls::ServerConfig::builder_with_provider(provider.clone())
         .with_protocol_versions(&[&rustls::version::TLS13])?
         .with_client_cert_verifier(Arc::new(AnyClientKey { provider }));
-    serving(identity, tls, SERVER_ALPN)
+    serving(identity, tls, SERVER_ALPN, Link::Server)
 }
 
 fn serving(
     identity: &Identity,
     tls: rustls::ConfigBuilder<rustls::ServerConfig, rustls::server::WantsServerCert>,
     alpn: &[u8],
+    link: Link,
 ) -> Result<ServerConfig> {
     let mut tls = tls.with_single_cert(
         vec![identity.cert.clone()],
@@ -258,7 +260,7 @@ fn serving(
 
     let crypto = QuicServerConfig::try_from(tls).map_err(|e| Error::Config(e.to_string()))?;
     let mut config = ServerConfig::with_crypto(Arc::new(crypto));
-    config.transport_config(Arc::new(transport_config()?));
+    config.transport_config(Arc::new(transport_config(link)?));
     Ok(config)
 }
 
@@ -279,7 +281,7 @@ pub async fn connect(
     remote: SocketAddr,
     fingerprint: Fingerprint,
 ) -> Result<Connection> {
-    let config = client_config(fingerprint, ALPN, None)?;
+    let config = client_config(fingerprint, ALPN, None, Link::Peer)?;
     Ok(endpoint.connect_with(config, remote, SERVER_NAME)?.await?)
 }
 
@@ -292,7 +294,7 @@ pub async fn connect_server(
     fingerprint: Fingerprint,
     identity: Option<&Identity>,
 ) -> Result<Connection> {
-    let config = client_config(fingerprint, SERVER_ALPN, identity)?;
+    let config = client_config(fingerprint, SERVER_ALPN, identity, Link::Server)?;
     Ok(endpoint.connect_with(config, remote, SERVER_NAME)?.await?)
 }
 
@@ -309,6 +311,7 @@ fn client_config(
     fingerprint: Fingerprint,
     alpn: &[u8],
     identity: Option<&Identity>,
+    link: Link,
 ) -> Result<ClientConfig> {
     let provider = provider();
     let tls = rustls::ClientConfig::builder_with_provider(provider.clone())
@@ -329,7 +332,7 @@ fn client_config(
 
     let crypto = QuicClientConfig::try_from(tls).map_err(|e| Error::Config(e.to_string()))?;
     let mut config = ClientConfig::new(Arc::new(crypto));
-    config.transport_config(Arc::new(transport_config()?));
+    config.transport_config(Arc::new(transport_config(link)?));
     Ok(config)
 }
 
@@ -385,8 +388,35 @@ fn provider() -> Arc<CryptoProvider> {
     Arc::new(rustls::crypto::ring::default_provider())
 }
 
-fn transport_config() -> Result<TransportConfig> {
+/// Which kind of connection a configuration is for.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Link {
+    /// Viewer to agent, directly or relayed.
+    Peer,
+    /// To or from the server, carrying relayed packets as datagrams.
+    Server,
+}
+
+/// Packet size for connections to the server, from their first packet. A
+/// relayed packet is a whole QUIC packet of the connection inside — at least
+/// 1200 bytes, QUIC's minimum — plus a session number, carried in a datagram
+/// with ~40 bytes of this connection's own framing around it. At QUIC's
+/// default of 1200 it would not fit until path MTU discovery had raised the
+/// size; 1280 is IPv6's minimum MTU, which practically every path carries.
+const SERVER_LINK_MTU: u16 = 1280;
+
+/// How much relayed traffic may queue on a connection to the server. The
+/// connection inside does its own congestion control and loss recovery, so
+/// a deep queue here would only add delay it cannot see: at 20 Mbit/s this is
+/// 100 ms.
+const RELAY_BUFFER: usize = 256 * 1024;
+
+fn transport_config(link: Link) -> Result<TransportConfig> {
     let mut config = TransportConfig::default();
+    let buffer = match link {
+        Link::Peer => DATAGRAM_BUFFER,
+        Link::Server => RELAY_BUFFER,
+    };
     config
         // Keeps NAT bindings alive and notices a vanished peer promptly.
         .keep_alive_interval(Some(Duration::from_secs(5)))
@@ -394,8 +424,11 @@ fn transport_config() -> Result<TransportConfig> {
             IdleTimeout::try_from(Duration::from_secs(15))
                 .map_err(|e| Error::Config(e.to_string()))?,
         ))
-        .datagram_send_buffer_size(DATAGRAM_BUFFER)
+        .datagram_send_buffer_size(buffer)
         .datagram_receive_buffer_size(Some(DATAGRAM_BUFFER));
+    if link == Link::Server {
+        config.initial_mtu(SERVER_LINK_MTU);
+    }
     // BBR rather than quinn's default Cubic. Cubic reads every lost packet as
     // congestion, so random loss alone caps it: on a 40 ms path with 5% loss
     // it could not send more than about 1.5 Mbit/s, and video fell to 6.5 fps.

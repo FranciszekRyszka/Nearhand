@@ -108,6 +108,7 @@ pub enum Target {
         server: SocketAddr,
         server_fingerprint: Fingerprint,
         id: DeviceId,
+        route: rendezvous::Route,
     },
 }
 
@@ -162,19 +163,16 @@ pub async fn run(options: Options) -> Result<()> {
             server,
             server_fingerprint,
             id,
+            route,
         } => {
             let endpoint = client_endpoint(*server)?;
-            let conn = rendezvous::find(&endpoint, *server, *server_fingerprint, *id)
+            let conn = rendezvous::find(&endpoint, *server, *server_fingerprint, *id, *route)
                 .await
                 .with_context(|| format!("reaching {id} through {server}"))?;
             (endpoint, conn)
         }
     };
-    let path = if rendezvous::is_local(conn.remote_address()) {
-        "on the local network"
-    } else {
-        "across the internet"
-    };
+    let path = rendezvous::path_of(conn.remote_address());
     println!(
         "connected to {} at {}, {path} (rtt {:?})",
         options.target,

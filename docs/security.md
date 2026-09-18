@@ -1,8 +1,8 @@
 # Security
 
-> **Status: partly implemented.** Device keys, pinning and the portable
-> agent's one-time password exist; enrollment, grants, the per-device access
-> password, the relay, signed releases and the session indicator do not yet.
+> **Status: partly implemented.** Device keys, pinning, the portable agent's
+> one-time password and the relay exist; enrollment, grants, the per-device
+> access password, signed releases and the session indicator do not yet.
 > Track the gap against the roadmap in the README.
 
 Nearhand hands one machine full control of another. The threat model is built in
@@ -45,6 +45,13 @@ checks it.
 - The **relay** forwards only for sessions holding a server-issued ticket, so it
   cannot be turned into an open proxy. It only ever sees ciphertext — the
   QUIC/TLS handshake is between viewer and agent.
+  - *Implemented:* the relay runs inside the server. It forwards only between
+    a viewer's connection and the agent it was introduced to, once that agent
+    has said it is ready. The pairing is the ticket; a relay on a separate
+    host, which cannot see the pairing, will need a signed one.
+  - *Not yet:* limits on how much one session may relay. Only an agent that
+    accepted the session can receive its traffic, but a server open to
+    everyone carries whatever that pair sends.
 
 ## Exposure
 
