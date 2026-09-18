@@ -1,6 +1,7 @@
 //! Portable quick-support mode: no install, no enrollment. The agent registers
 //! with a server under the ID its key gives it, shows that ID and a one-time
-//! password, and lets in a viewer who has both.
+//! password, and lets in a viewer who has both — and, when its window is
+//! showing, whom the person at this machine allows.
 //!
 //! It never listens on a port. It keeps one connection to the server; when a
 //! viewer asks for it, the agent opens its way through its firewall and NAT
@@ -10,12 +11,15 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use nearhand_core::proto::close;
-use nearhand_transport::rendezvous::stay_registered;
+use nearhand_transport::rendezvous::{Registration, stay_registered};
 use nearhand_transport::{Fingerprint, Identity, server_endpoint};
+use quinn::Endpoint;
 
+use crate::host::{Host, Server};
 use crate::password::Password;
 use crate::session::SessionConfig;
 
@@ -24,37 +28,82 @@ pub struct Options {
     pub server_fingerprint: Fingerprint,
     pub key: PathBuf,
     pub bitrate_kbps: u32,
+    /// Show the quick-support window, whose user allows each session; else
+    /// print to the terminal, and let the password alone decide.
+    pub window: bool,
 }
 
-pub async fn run(options: Options) -> Result<()> {
+/// Run until the window is closed, or, without one, until Ctrl+C.
+pub fn run(options: Options) -> Result<()> {
     let identity = Identity::load_or_create(&options.key)
         .with_context(|| format!("loading the device key from {}", options.key.display()))?;
-    let bind = unspecified_like(options.server);
-    let endpoint = server_endpoint(bind, &identity).context("opening the socket")?;
     let password = Arc::new(Password::new());
+    let host = Host::new(options.window);
 
-    // Printed rather than logged: the person at this machine reads these out.
-    println!("ID:       {}", identity.device_id());
-    println!("password: {}", password.current());
-
+    let runtime = tokio::runtime::Runtime::new().context("starting the runtime")?;
+    let endpoint = {
+        let _inside = runtime.enter();
+        server_endpoint(unspecified_like(options.server), &identity)
+            .context("opening the socket")?
+    };
     let config = Arc::new(SessionConfig {
         bitrate_kbps: options.bitrate_kbps,
-        password: Some(password),
+        password: Some(password.clone()),
+        host: Some(host.clone()),
     });
-    let slot = crate::one_viewer();
-    // Viewers through the relay arrive on an endpoint of their own, one per
-    // server connection; they share the one slot with direct viewers.
-    let relayed = |relay: quinn::Endpoint| {
-        tokio::spawn(crate::accept_viewers(relay, config.clone(), slot.clone()));
-    };
-    tokio::select! {
-        () = crate::accept_viewers(endpoint.clone(), config.clone(), slot.clone()) => {}
-        () = stay_registered(&endpoint, options.server, options.server_fingerprint, &identity, relayed) => {}
-        _ = tokio::signal::ctrl_c() => println!("stopping"),
+    let id = identity.device_id();
+    runtime.spawn(serve(
+        endpoint.clone(),
+        options.server,
+        options.server_fingerprint,
+        identity,
+        config,
+        host.clone(),
+    ));
+
+    if options.window {
+        crate::window::run(id, password, host)?;
+    } else {
+        // Printed rather than logged: the person at this machine reads these
+        // out.
+        println!("ID:       {id}");
+        println!("password: {}", password.current());
+        runtime.block_on(async {
+            let _ = tokio::signal::ctrl_c().await;
+        });
+        println!("stopping");
     }
-    endpoint.close(close::NORMAL.into(), b"agent stopping");
-    endpoint.wait_idle().await;
+
+    runtime.block_on(async {
+        endpoint.close(close::NORMAL.into(), b"agent stopping");
+        // Long enough to tell a viewer goodbye, not to hang on a lost one.
+        let _ = tokio::time::timeout(Duration::from_secs(2), endpoint.wait_idle()).await;
+    });
     Ok(())
+}
+
+async fn serve(
+    endpoint: Endpoint,
+    server: SocketAddr,
+    server_fingerprint: Fingerprint,
+    identity: Identity,
+    config: Arc<SessionConfig>,
+    host: Arc<Host>,
+) {
+    let slot = crate::one_viewer();
+    let events = |event| match event {
+        // Viewers through the relay arrive on an endpoint of their own, one
+        // per server connection; they share the one slot with direct viewers.
+        Registration::Registered { relay } => {
+            host.set_server(Server::Online);
+            tokio::spawn(crate::accept_viewers(relay, config.clone(), slot.clone()));
+        }
+        Registration::Lost { error, .. } => host.set_server(Server::Unreachable { error }),
+    };
+    tokio::join!(
+        crate::accept_viewers(endpoint.clone(), config.clone(), slot.clone()),
+        stay_registered(&endpoint, server, server_fingerprint, &identity, events),
+    );
 }
 
 fn unspecified_like(addr: SocketAddr) -> SocketAddr {

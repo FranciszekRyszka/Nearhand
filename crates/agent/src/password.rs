@@ -65,6 +65,15 @@ impl Password {
         Check::Replaced(state.current.clone())
     }
 
+    /// Replace the password, at the host's request: whoever had the old one
+    /// can no longer use it.
+    pub fn renew(&self) -> String {
+        let mut state = self.lock();
+        state.failures = 0;
+        state.current = draw(&self.random);
+        state.current.clone()
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(|p| p.into_inner())
     }
@@ -122,6 +131,18 @@ mod tests {
         };
         assert_eq!(new, password.current());
         assert!(matches!(password.check(&old), Check::Rejected) || new == old);
+    }
+
+    #[test]
+    fn a_renewed_password_replaces_the_old_one() {
+        let password = Password::new();
+        let old = password.current();
+        let new = password.renew();
+        assert_eq!(new, password.current());
+        if new != old {
+            assert!(matches!(password.check(&old), Check::Rejected));
+        }
+        assert!(matches!(password.check(&new), Check::Accepted));
     }
 
     #[test]

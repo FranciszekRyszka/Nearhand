@@ -405,7 +405,7 @@ mod tests {
 
     use crate::netsim::{NatKind, Net, private, public};
     use nearhand_transport::rendezvous::{
-        DIRECT_GRACE, Path, Route, find, path_of, stay_registered,
+        DIRECT_GRACE, Path, Registration, Route, find, path_of, stay_registered,
     };
     use nearhand_transport::{Identity, peer_server_config, relay, rendezvous_server_config};
     use quinn::{EndpointConfig, ServerConfig, TokioRuntime};
@@ -521,7 +521,12 @@ mod tests {
             echo(agent.clone());
             if punch {
                 tokio::spawn(async move {
-                    stay_registered(&agent, server_addr, server_fp, &agent_identity, echo).await
+                    let events = |event| {
+                        if let Registration::Registered { relay } = event {
+                            echo(relay);
+                        }
+                    };
+                    stay_registered(&agent, server_addr, server_fp, &agent_identity, events).await
                 });
             } else {
                 tokio::spawn(register_without_punching(

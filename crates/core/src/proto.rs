@@ -7,7 +7,7 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
 /// Bumped on any incompatible change while we are pre-1.0.
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 3;
 
 /// Video codec negotiated between viewer and agent.
 ///
@@ -69,6 +69,10 @@ pub enum Control {
     Authenticate {
         password: String,
     },
+    /// Agent to viewer, after a right password: the person at the host has
+    /// been asked to allow the session. `MonitorList` follows if they do; a
+    /// close with [`close::DECLINED`] if they refuse or do not answer.
+    AwaitingApproval,
     Bye,
     /// Clock probe from the viewer, answered at once with [`Control::Pong`].
     /// Lets the viewer place the agent's capture timestamps on its own clock.
@@ -230,6 +234,10 @@ pub mod close {
     pub const PIPELINE_FAILED: u32 = 4;
     /// Wrong password. After a few, the agent picks a new one.
     pub const AUTH_FAILED: u32 = 5;
+    /// The person at the host refused the session, or did not answer.
+    pub const DECLINED: u32 = 6;
+    /// The person at the host ended the session.
+    pub const ENDED_BY_HOST: u32 = 7;
 }
 
 #[cfg(test)]
@@ -284,6 +292,7 @@ mod tests {
             Control::Authenticate {
                 password: "482913".to_owned(),
             },
+            Control::AwaitingApproval,
             Control::Ping { viewer_us: 17 },
             Control::Pong {
                 viewer_us: 17,

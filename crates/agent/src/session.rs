@@ -21,6 +21,8 @@
 //! A protocol violation closes the connection with a code from
 //! [`nearhand_core::proto::close`] and a reason the viewer can show.
 
+use crate::host::{Host, InSession};
+use nearhand_transport::rendezvous::{Path, path_of};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -67,6 +69,9 @@ pub struct SessionConfig {
     pub bitrate_kbps: u32,
     /// Viewers must give this before anything else, when set.
     pub password: Option<Arc<Password>>,
+    /// The person at this machine, who allows each session and sees it for
+    /// as long as it lasts, when there is one to ask.
+    pub host: Option<Arc<Host>>,
 }
 
 /// What one video stream sent, for the log.
@@ -157,6 +162,11 @@ pub async fn serve(conn: Connection, config: &SessionConfig) -> Result<()> {
     if let Some(password) = &config.password {
         authenticate(&conn, &mut send, &mut recv, password).await?;
     }
+    // Shown to the person at this machine from here until the session ends.
+    let _shown = match &config.host {
+        Some(host) => Some(approve(&conn, &mut send, host).await?),
+        None => None,
+    };
     send_message(&mut send, &Control::MonitorList(monitors.clone())).await?;
 
     // Until the viewer picks a monitor, input lands on the primary one.
@@ -321,6 +331,7 @@ pub async fn serve(conn: Connection, config: &SessionConfig) -> Result<()> {
                 | Control::MonitorList(_)
                 | Control::Pong { .. }
                 | Control::AuthRequired
+                | Control::AwaitingApproval
                 | Control::Authenticate { .. }),
             ) => {
                 conn.close(close::PROTOCOL.into(), b"unexpected message");
@@ -367,6 +378,44 @@ async fn authenticate(
             println!("too many wrong passwords; the password is now {new}");
             bail!("wrong password, replaced");
         }
+    }
+}
+
+/// Ask the person at this machine to allow the session, telling the viewer
+/// it is waiting; once allowed, show the session to them.
+async fn approve(
+    conn: &Connection,
+    send: &mut quinn::SendStream,
+    host: &Arc<Host>,
+) -> Result<InSession> {
+    let viewer = describe(conn.remote_address());
+    if host.asks() {
+        send_message(send, &Control::AwaitingApproval).await?;
+    }
+    let closed = conn.clone();
+    if !host
+        .ask(&viewer, async move {
+            closed.closed().await;
+        })
+        .await
+    {
+        conn.close(close::DECLINED.into(), b"the person at the device declined");
+        bail!("declined by the person at this machine");
+    }
+    let ending = conn.clone();
+    Ok(host.session_started(&viewer, move || {
+        ending.close(
+            close::ENDED_BY_HOST.into(),
+            b"ended by the person at the device",
+        );
+    }))
+}
+
+/// How the person at this machine is told who is connecting.
+fn describe(remote: std::net::SocketAddr) -> String {
+    match path_of(remote) {
+        Path::Relayed => "a viewer, through the server's relay".to_owned(),
+        path => format!("a viewer at {}, {path}", remote.ip().to_canonical()),
     }
 }
 

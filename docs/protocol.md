@@ -121,7 +121,7 @@ added about 0.2 ms to the round trip, with the frame rate unchanged.
 
 ## Session
 
-The TLS handshake negotiates ALPN `nearhand/2`, so a peer on a different
+The TLS handshake negotiates ALPN `nearhand/3`, so a peer on a different
 protocol version fails there rather than mid-stream. The viewer then opens one
 bidirectional stream for control and speaks first:
 
@@ -131,6 +131,7 @@ viewer                         agent
                            ◀──  Hello { version, caps }
                            ◀──  AuthRequired           (portable agents only)
   Authenticate { password } ──▶
+                           ◀──  AwaitingApproval       (when someone at the host decides)
                            ◀──  MonitorList
   StartVideo               ──▶
                            ◀══  video datagrams …
@@ -157,6 +158,8 @@ itself. Close codes (`core::proto::close`) travel with a readable reason:
 | 3 | Agent busy with another viewer |
 | 4 | Capture or encoding failed; the reason says which |
 | 5 | Wrong password |
+| 6 | The person at the host declined, or did not answer |
+| 7 | The person at the host ended the session |
 
 Every certificate is self-signed over an Ed25519 key. The viewer pins the
 agent's certificate by its SHA-256 fingerprint, which the server reports (or,

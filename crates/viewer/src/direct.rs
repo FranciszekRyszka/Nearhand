@@ -212,6 +212,10 @@ pub async fn run(options: Options) -> Result<()> {
         send_message(&mut send, &Control::Authenticate { password }).await?;
         next = recv_message::<Control>(&mut recv).await;
     }
+    if let Ok(Some(Control::AwaitingApproval)) = next {
+        println!("waiting for the person at the device to allow the session…");
+        next = recv_message::<Control>(&mut recv).await;
+    }
     match next.map_err(|e| explain(&conn, e.into()))? {
         Some(Control::MonitorList(monitors)) => {
             let Some(m) = monitors.iter().find(|m| m.id == options.monitor) else {

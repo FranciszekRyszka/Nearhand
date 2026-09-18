@@ -10,7 +10,8 @@
 # On the server — prints the fingerprint agents and viewers pin:
 nearhand-server serve --bind 0.0.0.0:443 --key /var/lib/nearhand/server.key
 
-# On the machine to be helped — prints an ID and a password:
+# On the machine to be helped — opens a window with an ID and a password,
+# and asks there before letting anyone in (--console: no window, no asking):
 nearhand-agent portable --server 203.0.113.10:443 --server-fingerprint <fingerprint>
 
 # On the helper's machine:

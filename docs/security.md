@@ -1,8 +1,9 @@
 # Security
 
-> **Status: partly implemented.** Device keys, pinning, the portable agent's
-> one-time password and the relay exist; enrollment, grants, the per-device
-> access password, signed releases and the session indicator do not yet.
+> **Status: partly implemented.** Device keys, pinning, the relay, and the
+> portable agent's one-time password, accept prompt and session indicator
+> exist; enrollment, grants, the per-device access password and signed
+> releases do not yet.
 > Track the gap against the roadmap in the README.
 
 Nearhand hands one machine full control of another. The threat model is built in
@@ -39,9 +40,13 @@ checks it.
     checks them and the server never sees them. Each wrong guess costs a
     whole connection, and three wrong guesses replace the password. The
     server also limits each viewer address to 10 introductions a minute.
-  - *Not yet:* the accept prompt, which comes with the portable agent's
-    window. Until then the password stays valid while the agent runs. A
-    viewer who has had it can come back without asking again.
+  - *Implemented:* with its window showing, the portable agent asks the
+    person at the host to allow each viewer who gave the right password.
+    No answer within 30 seconds counts as no, and so does the viewer
+    leaving. "New" replaces the password at any time.
+  - Run with `--console` there is no window, and no one to ask: the password
+    alone lets a viewer in, for as long as the agent runs. That mode is for
+    testing and for people at a terminal. It announces each session there.
 - The **relay** forwards only for sessions holding a server-issued ticket, so it
   cannot be turned into an open proxy. It only ever sees ciphertext — the
   QUIC/TLS handshake is between viewer and agent.
@@ -61,6 +66,11 @@ checks it.
 - The host **always shows a visible indicator** during a session. There is no
   hidden mode, ever. Beyond being the right default, it is also what keeps
   antivirus vendors from classifying the agent as a trojan.
+  - *Implemented, for the portable agent:* for as long as a session lasts,
+    its window says the computer is being controlled, by whom, and for how
+    long, with a button to end it. The window stays on top and comes back
+    if minimised; closing it stops the agent. The service (M3) will need its
+    own indicator.
 
 ## Supply chain
 

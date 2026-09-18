@@ -7,12 +7,15 @@
 //! directly on the LAN, with no server, so the pipeline can be measured on its
 //! own.
 
+mod elevation;
+mod host;
 mod input;
 mod password;
 mod pipeline;
 mod portable;
 mod rate;
 mod session;
+mod window;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -69,6 +72,11 @@ enum Command {
         /// The most video bitrate to use.
         #[arg(long, default_value_t = 10_000)]
         bitrate_kbps: u32,
+        /// No window: print the ID and password here instead. Then no one
+        /// is asked to allow a session — the password alone lets a viewer in
+        /// — and sessions are announced here.
+        #[arg(long)]
+        console: bool,
     },
     /// M0 only: accept a viewer directly on the LAN, no server.
     ///
@@ -96,6 +104,7 @@ fn main() -> Result<()> {
             let config = SessionConfig {
                 bitrate_kbps,
                 password: None,
+                host: None,
             };
             runtime.block_on(listen(bind, config))
         }
@@ -104,15 +113,14 @@ fn main() -> Result<()> {
             server_fingerprint,
             key,
             bitrate_kbps,
-        } => {
-            let runtime = tokio::runtime::Runtime::new().context("starting the runtime")?;
-            runtime.block_on(portable::run(portable::Options {
-                server,
-                server_fingerprint,
-                key,
-                bitrate_kbps,
-            }))
-        }
+            console,
+        } => portable::run(portable::Options {
+            server,
+            server_fingerprint,
+            key,
+            bitrate_kbps,
+            window: !console,
+        }),
         Command::Install { .. } | Command::Uninstall | Command::Run => {
             anyhow::bail!("not implemented: scheduled for M2/M3, see the roadmap in README.md")
         }
@@ -204,5 +212,23 @@ fn init_tracing(verbose: u8) {
         1 => tracing::Level::DEBUG,
         _ => tracing::Level::TRACE,
     };
-    tracing_subscriber::fmt().with_max_level(level).init();
+    // The quick-support window's graphics stack describes every adapter it
+    // finds at info level; only its warnings matter unless asked for more.
+    let quiet = if verbose == 0 {
+        tracing::Level::WARN
+    } else {
+        level
+    };
+    let filter = tracing_subscriber::filter::Targets::new()
+        .with_default(level)
+        .with_target("wgpu_core", quiet)
+        .with_target("wgpu_hal", quiet)
+        .with_target("egui_wgpu", quiet)
+        .with_target("naga", quiet);
+    use tracing_subscriber::layer::SubscriberExt as _;
+    use tracing_subscriber::util::SubscriberInitExt as _;
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::fmt::layer())
+        .with(filter)
+        .init();
 }

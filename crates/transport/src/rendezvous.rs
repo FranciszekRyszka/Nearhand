@@ -65,30 +65,49 @@ pub const DIRECT_GRACE: Duration = Duration::from_secs(1);
 /// introduces. Never returns; drop it to stop.
 ///
 /// `endpoint` must be the one that accepts viewers: its socket is the one the
-/// server sees, and so the one viewers are sent to. Viewers who come through
-/// the relay arrive on another endpoint, one per server connection, which is
-/// handed to `relayed` to accept them from; it closes when that connection
-/// is lost.
+/// server sees, and so the one viewers are sent to. `events` hears how the
+/// registration is going — including, each time it is made, the endpoint
+/// viewers who come through the relay arrive on, to accept them from. That
+/// endpoint closes when its server connection is lost.
 pub async fn stay_registered(
     endpoint: &Endpoint,
     server: SocketAddr,
     server_fingerprint: Fingerprint,
     identity: &Identity,
-    relayed: impl Fn(Endpoint),
+    events: impl Fn(Registration),
 ) {
     let mut wait = RECONNECT_FIRST;
     loop {
-        match register(endpoint, server, server_fingerprint, identity, &relayed).await {
+        match register(endpoint, server, server_fingerprint, identity, &events).await {
             // Registered for a while and then lost: reconnect promptly.
             Ok(()) => {
                 tracing::info!("server connection ended; reconnecting");
                 wait = RECONNECT_FIRST;
+                events(Registration::Lost {
+                    error: "the connection to the server ended".into(),
+                    retry_in: wait,
+                });
             }
-            Err(e) => tracing::warn!(error = %e, retry_in = ?wait, "server unreachable"),
+            Err(e) => {
+                tracing::warn!(error = %e, retry_in = ?wait, "server unreachable");
+                events(Registration::Lost {
+                    error: e.to_string(),
+                    retry_in: wait,
+                });
+            }
         }
         tokio::time::sleep(wait).await;
         wait = (wait * 2).min(RECONNECT_MAX);
     }
+}
+
+/// How an agent's registration with its server is going.
+pub enum Registration {
+    /// Registered: viewers can find this device. Relayed ones arrive on
+    /// `relay`.
+    Registered { relay: Endpoint },
+    /// Not registered, and trying again in `retry_in`.
+    Lost { error: String, retry_in: Duration },
 }
 
 async fn register(
@@ -96,11 +115,11 @@ async fn register(
     server: SocketAddr,
     server_fingerprint: Fingerprint,
     identity: &Identity,
-    relayed: &impl Fn(Endpoint),
+    events: &impl Fn(Registration),
 ) -> Result<()> {
     let conn = connect_server(endpoint, server, server_fingerprint, Some(identity)).await?;
     let relay = relay::endpoint(conn.clone(), true, Some(peer_server_config(identity)?))?;
-    let result = serve_registration(endpoint, &conn, relay.clone(), relayed).await;
+    let result = serve_registration(endpoint, &conn, relay.clone(), events).await;
     relay.close(close::NORMAL.into(), b"server connection lost");
     result
 }
@@ -109,7 +128,7 @@ async fn serve_registration(
     endpoint: &Endpoint,
     conn: &Connection,
     relay: Endpoint,
-    relayed: &impl Fn(Endpoint),
+    events: &impl Fn(Registration),
 ) -> Result<()> {
     let server = conn.remote_address();
     let (mut send, mut recv) = conn.open_bi().await?;
@@ -118,7 +137,7 @@ async fn serve_registration(
     match recv_message::<FromServer>(&mut recv).await? {
         Some(FromServer::Registered { id, observed }) => {
             tracing::info!(%id, %observed, "registered with the server");
-            relayed(relay);
+            events(Registration::Registered { relay });
         }
         Some(FromServer::Refused(refusal)) => return Err(Error::Refused(refusal)),
         other => return Err(Error::Unexpected(format!("{other:?}"))),
