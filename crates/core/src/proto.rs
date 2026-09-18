@@ -1,4 +1,4 @@
-//! Wire protocol, version 0. See `docs/protocol.md` for the prose version.
+//! Wire protocol, version 1. See `docs/protocol.md` for the prose version.
 //!
 //! Every connection opens with [`Control::Hello`] so the format can still change
 //! freely before 1.0. Encoding is `postcard`.
@@ -7,7 +7,7 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
 /// Bumped on any incompatible change while we are pre-1.0.
-pub const PROTOCOL_VERSION: u16 = 0;
+pub const PROTOCOL_VERSION: u16 = 1;
 
 /// Video codec negotiated between viewer and agent.
 ///
@@ -72,12 +72,20 @@ pub enum Control {
         /// The agent's capture clock when it answered.
         agent_us: u64,
     },
+    /// Viewer to agent: send these chunks of a frame again. An empty list
+    /// means every chunk — nothing of the frame arrived. Frames the agent no
+    /// longer holds are ignored; the viewer gives up on them in time.
+    Nack {
+        frame_id: u32,
+        chunks: Vec<u16>,
+    },
 }
 
 /// Unreliable datagram: one encoded frame split into chunks.
 ///
-/// A late frame is useless, so loss is answered with [`Control::RequestKeyframe`]
-/// rather than retransmission.
+/// Lost chunks are asked for again with [`Control::Nack`] while a repair can
+/// still arrive in time; a frame beyond repair costs a
+/// [`Control::RequestKeyframe`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VideoChunk {
     pub frame_id: u32,
@@ -265,6 +273,10 @@ mod tests {
             Control::Pong {
                 viewer_us: 17,
                 agent_us: u64::MAX,
+            },
+            Control::Nack {
+                frame_id: 9,
+                chunks: vec![0, 3, 199],
             },
         ] {
             roundtrip(&msg);

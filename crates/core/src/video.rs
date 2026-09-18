@@ -1,19 +1,25 @@
 //! Video over unreliable datagrams: splitting encoded frames into chunks, and
 //! putting them back together on the other side.
 //!
-//! The rules follow from "a late frame is useless":
+//! The rules:
 //!
-//! * Nothing is retransmitted. A frame missing a chunk is abandoned as soon as
-//!   a newer frame completes — or when the caller decides it has waited long
-//!   enough — never held for a repair.
-//! * H.264 P-frames depend on the frame before them, so after any loss the
-//!   decoder's reference chain is broken. From then on every frame is dropped
-//!   until a keyframe arrives, and the reassembler asks for one.
+//! * Frames reach the decoder strictly in order, because each H.264 P-frame
+//!   is decoded against the one before it.
+//! * A lost chunk is repaired, not waited out: the reassembler works out
+//!   which chunks are missing ([`Reassembler::nacks`]), the viewer asks the
+//!   agent to send them again, and newer frames are held until the repair
+//!   lands. At 1440p a keyframe is some 200 datagrams; without repair a 2%
+//!   loss rate let one arrive whole about 2% of the time.
+//! * A frame that stops making progress is given up on
+//!   ([`Reassembler::expire`]). The reference chain is then broken, so every
+//!   frame is dropped until a keyframe arrives, and the reassembler asks for
+//!   one. A complete keyframe that is already waiting is jumped to at once.
 //! * Late chunks, duplicates and malformed chunks are counted and ignored.
 //!
-//! None of this needs a clock, which keeps it usable from the browser viewer.
-//! Timing decisions (how long to wait, how often to re-ask for a keyframe) are
-//! the caller's.
+//! None of this reads a clock, which keeps it usable from the browser viewer:
+//! callers pass the time in, and choose the timings from the round trip.
+
+use std::collections::VecDeque;
 
 use bytes::{Bytes, BytesMut};
 
@@ -30,9 +36,12 @@ pub const CHUNK_OVERHEAD: usize = 32;
 /// is broken, and chunking would produce absurd numbers of tiny packets.
 pub const MIN_DATAGRAM: usize = CHUNK_OVERHEAD + 256;
 
-/// How many incomplete frames are tracked at once. Chunks for more than this
-/// many frames in flight means the older ones are not going to complete.
-const MAX_PARTIAL: usize = 4;
+/// How many frames are held at once. More than this in flight means the
+/// oldest is not going to be repaired in time to matter.
+const MAX_PENDING: usize = 64;
+
+/// How many wholly missing frames one call to [`Reassembler::nacks`] asks for.
+const MAX_GAP_NACKS: u32 = 32;
 
 /// Split an encoded frame into chunks that each serialise to at most
 /// `max_datagram` bytes.
@@ -87,38 +96,84 @@ pub struct AssembledFrame {
     pub data: Bytes,
 }
 
+/// Chunks to ask the agent to send again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Missing {
+    pub frame_id: u32,
+    /// Empty when not a single chunk of the frame arrived, so its size is
+    /// unknown: the whole frame, please.
+    pub chunks: Vec<u16>,
+}
+
+/// When to ask for repairs and when to stop waiting, in microseconds. The
+/// caller derives them from the round-trip time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Timing {
+    /// A frame's trailing chunks count as lost after this long without any
+    /// chunk of it arriving. Chunks before one that has arrived, or of a frame
+    /// older than one that has, count as lost at once.
+    pub quiet_us: u64,
+    /// Ask again for chunks still missing after this long.
+    pub retry_us: u64,
+    /// Give up on the frame the decoder is waiting for once it has made no
+    /// progress for this long.
+    pub give_up_us: u64,
+}
+
 /// Running counts, for the viewer's statistics overlay.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ReassemblyStats {
     /// Frames delivered to the decoder.
     pub delivered: u64,
-    /// Frames abandoned with chunks missing.
+    /// Frames delivered only thanks to chunks sent again.
+    pub repaired: u64,
+    /// Frames given up on with chunks missing.
     pub incomplete: u64,
     /// Complete frames dropped because the reference chain was broken.
     pub dropped_waiting_for_keyframe: u64,
-    /// Chunks for a frame already delivered or abandoned.
+    /// Chunks for a frame already delivered or given up on.
     pub late_chunks: u64,
     pub duplicate_chunks: u64,
     /// Chunks whose header contradicts itself or earlier chunks.
     pub invalid_chunks: u64,
+    /// Repair requests made, counting each frame once per request.
+    pub nacks: u64,
 }
 
 #[derive(Debug)]
-struct Partial {
+struct Pending {
     frame_id: u32,
     keyframe: bool,
     capture_ts_us: u64,
     parts: Vec<Option<Bytes>>,
     received: usize,
     bytes: usize,
+    /// Highest chunk index received: anything below it that is missing was
+    /// lost rather than still on its way.
+    highest: u16,
+    first_us: u64,
+    last_chunk_us: u64,
+    nacked_us: Option<u64>,
 }
 
+impl Pending {
+    fn complete(&self) -> bool {
+        self.received == self.parts.len()
+    }
+}
+
+/// Puts frames back together and hands them to the decoder strictly in order,
+/// holding newer frames while an older one is repaired.
 #[derive(Debug)]
 pub struct Reassembler {
-    partial: Vec<Partial>,
+    /// Frames after `last_settled`, complete or not.
+    pending: Vec<Pending>,
+    ready: VecDeque<AssembledFrame>,
     /// Newest frame delivered or given up on. Anything at or before it is late.
     last_settled: Option<u32>,
-    /// True from the start and after any loss, until a keyframe completes.
+    /// Frames of which nothing arrived, and when they were last asked for.
+    gap_nacks: Vec<(u32, u64)>,
+    /// True from the start and after any loss, until a keyframe arrives.
     waiting_for_keyframe: bool,
     keyframe_wanted: bool,
     stats: ReassemblyStats,
@@ -133,8 +188,10 @@ impl Default for Reassembler {
 impl Reassembler {
     pub fn new() -> Self {
         Self {
-            partial: Vec::with_capacity(MAX_PARTIAL),
+            pending: Vec::new(),
+            ready: VecDeque::new(),
             last_settled: None,
+            gap_nacks: Vec::new(),
             // A decoder cannot start on a P-frame.
             waiting_for_keyframe: true,
             keyframe_wanted: false,
@@ -142,66 +199,188 @@ impl Reassembler {
         }
     }
 
-    /// Feed one chunk. Returns a frame when this chunk completed one that the
-    /// decoder can use.
-    pub fn push(&mut self, chunk: VideoChunk) -> Option<AssembledFrame> {
+    /// Feed one chunk that arrived at `now_us`. Frames it makes deliverable
+    /// come out of [`Reassembler::pop`].
+    pub fn push(&mut self, chunk: VideoChunk, now_us: u64) {
         if chunk.chunks == 0 || chunk.chunk >= chunk.chunks {
             self.stats.invalid_chunks += 1;
-            return None;
+            return;
         }
         if let Some(settled) = self.last_settled
             && !is_newer(chunk.frame_id, settled)
         {
             self.stats.late_chunks += 1;
-            return None;
+            return;
         }
 
         let index = match self
-            .partial
+            .pending
             .iter()
             .position(|p| p.frame_id == chunk.frame_id)
         {
             Some(index) => index,
-            None => self.start_partial(&chunk),
+            None => {
+                // No longer a gap, if it was one.
+                self.gap_nacks.retain(|(id, _)| *id != chunk.frame_id);
+                if self.pending.len() >= MAX_PENDING {
+                    // Far more in flight than any repair could wait for.
+                    self.give_up_expected();
+                }
+                self.pending.push(Pending {
+                    frame_id: chunk.frame_id,
+                    keyframe: chunk.keyframe,
+                    capture_ts_us: chunk.capture_ts_us,
+                    parts: vec![None; usize::from(chunk.chunks)],
+                    received: 0,
+                    bytes: 0,
+                    highest: 0,
+                    first_us: now_us,
+                    last_chunk_us: now_us,
+                    nacked_us: None,
+                });
+                self.pending.len() - 1
+            }
         };
 
-        let partial = &mut self.partial[index];
-        if usize::from(chunk.chunks) != partial.parts.len() || chunk.keyframe != partial.keyframe {
+        let pending = &mut self.pending[index];
+        if usize::from(chunk.chunks) != pending.parts.len() || chunk.keyframe != pending.keyframe {
             self.stats.invalid_chunks += 1;
-            return None;
+            return;
         }
-        let slot = &mut partial.parts[usize::from(chunk.chunk)];
+        let slot = &mut pending.parts[usize::from(chunk.chunk)];
         if slot.is_some() {
             self.stats.duplicate_chunks += 1;
-            return None;
+            return;
         }
-        partial.bytes += chunk.data.len();
-        partial.received += 1;
+        pending.bytes += chunk.data.len();
+        pending.received += 1;
+        pending.highest = pending.highest.max(chunk.chunk);
+        pending.last_chunk_us = now_us;
         *slot = Some(chunk.data);
 
-        if partial.received < partial.parts.len() {
-            return None;
-        }
-        let complete = self.partial.swap_remove(index);
-        self.complete(complete)
-    }
-
-    /// Give up on every frame still missing chunks.
-    ///
-    /// For when chunks stop arriving: without a newer frame to reveal the loss,
-    /// a partial frame would otherwise wait forever — and the viewer would keep
-    /// showing the frame before it while the host has moved on.
-    pub fn abandon_partials(&mut self) {
-        for partial in std::mem::take(&mut self.partial) {
-            self.settle(partial.frame_id);
-            self.stats.incomplete += 1;
-            self.lost();
+        if pending.complete() {
+            self.drain();
         }
     }
 
-    /// Whether any frame is waiting for chunks.
-    pub fn has_partial(&self) -> bool {
-        !self.partial.is_empty()
+    /// The next frame for the decoder, in frame-id order.
+    pub fn pop(&mut self) -> Option<AssembledFrame> {
+        self.ready.pop_front()
+    }
+
+    /// What to ask the agent to send again, as of `now_us`. Each frame is
+    /// asked for at most once per `timing.retry_us`, so this can be called as
+    /// often as convenient.
+    pub fn nacks(&mut self, now_us: u64, timing: &Timing) -> Vec<Missing> {
+        let mut out = Vec::new();
+        let newest = self.newest_pending();
+        let due =
+            |asked: Option<u64>| asked.is_none_or(|t| now_us.saturating_sub(t) >= timing.retry_us);
+
+        for pending in &mut self.pending {
+            // A P-frame is useless while the chain is broken anyway.
+            if pending.complete() || (self.waiting_for_keyframe && !pending.keyframe) {
+                continue;
+            }
+            let newer_seen = newest.is_some_and(|n| is_newer(n, pending.frame_id));
+            let quiet = now_us.saturating_sub(pending.last_chunk_us) >= timing.quiet_us;
+            let chunks: Vec<u16> = (0..pending.parts.len())
+                .filter(|&i| pending.parts[i].is_none())
+                .map(|i| i as u16)
+                .filter(|&i| i < pending.highest || newer_seen || quiet)
+                .collect();
+            if !chunks.is_empty() && due(pending.nacked_us) {
+                pending.nacked_us = Some(now_us);
+                out.push(Missing {
+                    frame_id: pending.frame_id,
+                    chunks,
+                });
+            }
+        }
+
+        // Frames that left no trace but a gap in the ids. Their type is
+        // unknown, so they are worth asking for only while the chain holds.
+        if let (Some(expected), Some(newest)) = (self.expected(), newest)
+            && !self.waiting_for_keyframe
+        {
+            let mut id = expected;
+            let mut checked = 0;
+            while is_newer(newest, id) && checked < MAX_GAP_NACKS {
+                if !self.pending.iter().any(|p| p.frame_id == id) {
+                    let asked = self.gap_nacks.iter().position(|(g, _)| *g == id);
+                    if due(asked.map(|i| self.gap_nacks[i].1)) {
+                        match asked {
+                            Some(i) => self.gap_nacks[i].1 = now_us,
+                            None => self.gap_nacks.push((id, now_us)),
+                        }
+                        out.push(Missing {
+                            frame_id: id,
+                            chunks: Vec::new(),
+                        });
+                    }
+                }
+                id = id.wrapping_add(1);
+                checked += 1;
+            }
+        }
+        self.stats.nacks += out.len() as u64;
+        out
+    }
+
+    /// Give up on the frame the decoder is waiting for if it has made no
+    /// progress for `timing.give_up_us`, and on each one after it that is
+    /// just as stuck.
+    pub fn expire(&mut self, now_us: u64, timing: &Timing) {
+        while let Some(expected) = self.expected() {
+            let stuck_since = match self.pending.iter().find(|p| p.frame_id == expected) {
+                Some(pending) => pending.last_chunk_us,
+                // Nothing of it arrived: stuck since a newer frame showed up.
+                None => match self.pending.iter().map(|p| p.first_us).min() {
+                    Some(first) => first,
+                    None => return,
+                },
+            };
+            if now_us.saturating_sub(stuck_since) < timing.give_up_us {
+                return;
+            }
+            self.give_up_expected();
+        }
+    }
+
+    /// The earliest time at which [`Reassembler::nacks`] or
+    /// [`Reassembler::expire`] could do something, if anything is waiting.
+    /// Lets the caller wake exactly then instead of polling: a lost final
+    /// chunk otherwise shows up only when the next frame begins.
+    pub fn next_deadline(&self, timing: &Timing) -> Option<u64> {
+        let repairs = self
+            .pending
+            .iter()
+            .filter(|p| !p.complete() && (p.keyframe || !self.waiting_for_keyframe))
+            .map(|p| match p.nacked_us {
+                None => p.last_chunk_us + timing.quiet_us,
+                // Not before a chunk could count as lost again, either: a
+                // deadline at which `nacks` then does nothing would spin the
+                // caller.
+                Some(asked) => (asked + timing.retry_us).max(p.last_chunk_us + timing.quiet_us),
+            });
+        let gaps = self
+            .gap_nacks
+            .iter()
+            .filter(|_| !self.waiting_for_keyframe)
+            .map(|(_, asked)| asked + timing.retry_us);
+        let give_up = self.expected().and_then(|expected| {
+            let stuck_since = match self.pending.iter().find(|p| p.frame_id == expected) {
+                Some(pending) => pending.last_chunk_us,
+                None => self.pending.iter().map(|p| p.first_us).min()?,
+            };
+            Some(stuck_since + timing.give_up_us)
+        });
+        repairs.chain(gaps).chain(give_up).min()
+    }
+
+    /// Whether any frame is waiting for chunks or for an older frame.
+    pub fn has_pending(&self) -> bool {
+        !self.pending.is_empty()
     }
 
     /// True when a keyframe should be requested from the agent.
@@ -217,60 +396,77 @@ impl Reassembler {
         self.stats
     }
 
-    fn start_partial(&mut self, chunk: &VideoChunk) -> usize {
-        if self.partial.len() == MAX_PARTIAL {
-            // Evict the oldest: it has had the longest to complete.
-            let oldest = (1..self.partial.len()).fold(0, |oldest, i| {
-                if is_newer(self.partial[oldest].frame_id, self.partial[i].frame_id) {
-                    i
-                } else {
-                    oldest
-                }
-            });
-            let evicted = self.partial.swap_remove(oldest);
-            self.settle(evicted.frame_id);
-            self.stats.incomplete += 1;
-            self.lost();
+    /// The frame the decoder needs next.
+    fn expected(&self) -> Option<u32> {
+        match self.last_settled {
+            Some(settled) => Some(settled.wrapping_add(1)),
+            None => self
+                .pending
+                .iter()
+                .map(|p| p.frame_id)
+                .reduce(|a, b| if is_newer(a, b) { b } else { a }),
         }
-        self.partial.push(Partial {
-            frame_id: chunk.frame_id,
-            keyframe: chunk.keyframe,
-            capture_ts_us: chunk.capture_ts_us,
-            parts: vec![None; usize::from(chunk.chunks)],
-            received: 0,
-            bytes: 0,
-        });
-        self.partial.len() - 1
     }
 
-    fn complete(&mut self, frame: Partial) -> Option<AssembledFrame> {
-        // Everything older than this frame can no longer be decoded in order.
-        let before = self.partial.len();
-        self.partial
-            .retain(|p| is_newer(p.frame_id, frame.frame_id));
-        let abandoned = before - self.partial.len();
-        if abandoned > 0 {
-            self.stats.incomplete += abandoned as u64;
-            self.lost();
-        }
+    fn newest_pending(&self) -> Option<u32> {
+        self.pending
+            .iter()
+            .map(|p| p.frame_id)
+            .reduce(|a, b| if is_newer(a, b) { a } else { b })
+    }
 
-        // A gap in frame ids is a frame we never saw a single chunk of.
-        if let Some(settled) = self.last_settled
-            && frame.frame_id != settled.wrapping_add(1)
-        {
-            self.lost();
+    /// Deliver every frame that is now next in line and complete.
+    fn drain(&mut self) {
+        while let Some(expected) = self.expected() {
+            if let Some(index) = self
+                .pending
+                .iter()
+                .position(|p| p.frame_id == expected && p.complete())
+            {
+                let frame = self.pending.swap_remove(index);
+                self.deliver(frame);
+                continue;
+            }
+            // Stuck on an older frame, but a complete keyframe is already
+            // here: it needs nothing before it, so skip straight to it.
+            if self.pending.iter().any(|p| p.keyframe && p.complete()) {
+                self.give_up_expected_quietly();
+                continue;
+            }
+            return;
         }
+    }
+
+    /// Settle the expected frame as lost, then deliver what that unblocks.
+    fn give_up_expected(&mut self) {
+        self.give_up_expected_quietly();
+        self.lost();
+        self.drain();
+    }
+
+    fn give_up_expected_quietly(&mut self) {
+        let Some(expected) = self.expected() else {
+            return;
+        };
+        self.pending.retain(|p| p.frame_id != expected);
+        self.stats.incomplete += 1;
+        self.settle(expected);
+    }
+
+    fn deliver(&mut self, frame: Pending) {
         self.settle(frame.frame_id);
-
         if frame.keyframe {
             self.waiting_for_keyframe = false;
         } else if self.waiting_for_keyframe {
             self.stats.dropped_waiting_for_keyframe += 1;
             self.keyframe_wanted = true;
-            return None;
+            return;
         }
 
         self.stats.delivered += 1;
+        if frame.nacked_us.is_some() {
+            self.stats.repaired += 1;
+        }
         let data = if frame.parts.len() == 1 {
             frame.parts.into_iter().flatten().next().unwrap_or_default()
         } else {
@@ -280,12 +476,12 @@ impl Reassembler {
             }
             data.freeze()
         };
-        Some(AssembledFrame {
+        self.ready.push_back(AssembledFrame {
             frame_id: frame.frame_id,
             keyframe: frame.keyframe,
             capture_ts_us: frame.capture_ts_us,
             data,
-        })
+        });
     }
 
     fn settle(&mut self, frame_id: u32) {
@@ -295,6 +491,7 @@ impl Reassembler {
         {
             self.last_settled = Some(frame_id);
         }
+        self.gap_nacks.retain(|(id, _)| is_newer(*id, frame_id));
     }
 
     fn lost(&mut self) {
@@ -314,6 +511,12 @@ mod tests {
 
     const DATAGRAM: usize = 1200;
 
+    const TIMING: Timing = Timing {
+        quiet_us: 10_000,
+        retry_us: 20_000,
+        give_up_us: 100_000,
+    };
+
     fn frame(id: u32, keyframe: bool, len: usize) -> (Bytes, Vec<VideoChunk>) {
         let data: Bytes = (0..len).map(|i| (i % 251) as u8).collect::<Vec<_>>().into();
         let chunks =
@@ -322,14 +525,23 @@ mod tests {
     }
 
     fn feed(r: &mut Reassembler, chunks: Vec<VideoChunk>) -> Option<AssembledFrame> {
-        let mut out = None;
         for chunk in chunks {
-            if let Some(frame) = r.push(chunk) {
-                assert!(out.is_none(), "one frame produced twice");
-                out = Some(frame);
-            }
+            r.push(chunk, 0);
         }
+        let out = r.pop();
+        assert!(r.pop().is_none(), "one frame produced twice");
         out
+    }
+
+    fn feed_at(r: &mut Reassembler, chunks: Vec<VideoChunk>, now_us: u64) -> Vec<AssembledFrame> {
+        for chunk in chunks {
+            r.push(chunk, now_us);
+        }
+        std::iter::from_fn(|| r.pop()).collect()
+    }
+
+    fn ids(frames: &[AssembledFrame]) -> Vec<u32> {
+        frames.iter().map(|f| f.frame_id).collect()
     }
 
     #[test]
@@ -403,38 +615,146 @@ mod tests {
     }
 
     #[test]
-    fn a_lost_chunk_breaks_the_chain_until_a_keyframe() {
+    fn a_lost_chunk_is_asked_for_and_the_repair_releases_what_waited() {
         let mut r = Reassembler::new();
         feed(&mut r, frame(0, true, 500).1).expect("start");
 
-        // Frame 1 loses a chunk.
-        let (_, mut chunks) = frame(1, false, 4_000);
-        chunks.remove(1);
-        assert!(feed(&mut r, chunks).is_none());
+        // Frame 1 loses its second chunk; frames 2 and 3 arrive whole.
+        let (data1, mut chunks) = frame(1, false, 4_000);
+        let lost = chunks.remove(1);
+        assert!(feed_at(&mut r, chunks, 1_000).is_empty());
+        assert!(
+            feed_at(&mut r, frame(2, false, 500).1, 2_000).is_empty(),
+            "held behind 1"
+        );
+        assert!(feed_at(&mut r, frame(3, false, 500).1, 3_000).is_empty());
 
-        // Frame 2 completes: frame 1 is abandoned, and 2 cannot be decoded.
-        assert!(feed(&mut r, frame(2, false, 500).1).is_none());
-        assert!(r.take_keyframe_request());
-        assert_eq!(r.stats().incomplete, 1);
+        let asked = r.nacks(3_000, &TIMING);
+        assert_eq!(
+            asked,
+            [Missing {
+                frame_id: 1,
+                chunks: vec![1]
+            }]
+        );
+        // Not again before the retry interval…
+        assert!(r.nacks(10_000, &TIMING).is_empty());
+        // …but again after it, if the repair got lost too.
+        assert_eq!(r.nacks(30_000, &TIMING).len(), 1);
 
-        // Still broken, still asking.
-        assert!(feed(&mut r, frame(3, false, 500).1).is_none());
-        assert!(r.take_keyframe_request());
-
-        // The keyframe repairs it, and normal frames flow again.
-        assert!(feed(&mut r, frame(4, true, 500).1).is_some());
-        assert!(feed(&mut r, frame(5, false, 500).1).is_some());
+        let out = feed_at(&mut r, vec![lost], 35_000);
+        assert_eq!(ids(&out), [1, 2, 3]);
+        assert_eq!(out[0].data, data1);
+        assert_eq!(r.stats().repaired, 1);
+        assert_eq!(r.stats().incomplete, 0);
         assert!(!r.take_keyframe_request());
-        assert_eq!(r.stats().dropped_waiting_for_keyframe, 2);
     }
 
     #[test]
-    fn a_wholly_missing_frame_is_noticed_by_its_gap() {
+    fn trailing_chunks_are_asked_for_only_after_a_quiet_spell() {
         let mut r = Reassembler::new();
         feed(&mut r, frame(0, true, 500).1).expect("start");
-        // Frame 1 never arrives at all.
-        assert!(feed(&mut r, frame(2, false, 500).1).is_none());
+        let (_, mut chunks) = frame(1, false, 4_000);
+        let last = chunks.pop().expect("chunks");
+        feed_at(&mut r, chunks, 1_000);
+        // Still arriving, as far as anyone can tell.
+        assert!(r.nacks(5_000, &TIMING).is_empty());
+        let asked = r.nacks(12_000, &TIMING);
+        assert_eq!(asked[0].chunks, [last.chunk]);
+    }
+
+    #[test]
+    fn a_wholly_missing_frame_is_asked_for_whole() {
+        let mut r = Reassembler::new();
+        feed(&mut r, frame(0, true, 500).1).expect("start");
+        // Frame 1 never arrives at all; 2 does.
+        assert!(feed_at(&mut r, frame(2, false, 500).1, 1_000).is_empty());
+        assert_eq!(
+            r.nacks(1_000, &TIMING),
+            [Missing {
+                frame_id: 1,
+                chunks: vec![]
+            }]
+        );
+        let out = feed_at(&mut r, frame(1, false, 500).1, 5_000);
+        assert_eq!(ids(&out), [1, 2]);
+    }
+
+    #[test]
+    fn an_unrepaired_frame_is_given_up_and_breaks_the_chain() {
+        let mut r = Reassembler::new();
+        feed(&mut r, frame(0, true, 500).1).expect("start");
+        let (_, mut chunks) = frame(1, false, 4_000);
+        chunks.remove(1);
+        feed_at(&mut r, chunks, 1_000);
+        feed_at(&mut r, frame(2, false, 500).1, 2_000);
+
+        r.expire(50_000, &TIMING);
+        assert!(r.pop().is_none(), "not yet");
+        assert_eq!(r.stats().incomplete, 0);
+        r.expire(101_000, &TIMING);
+        assert_eq!(r.stats().incomplete, 1);
+        // Frame 2 cannot be decoded without 1.
+        assert!(r.pop().is_none());
+        assert_eq!(r.stats().dropped_waiting_for_keyframe, 1);
         assert!(r.take_keyframe_request());
+
+        // While the chain is broken, P-frames are not worth repairing.
+        let (_, mut chunks) = frame(3, false, 4_000);
+        chunks.remove(0);
+        feed_at(&mut r, chunks, 102_000);
+        assert!(r.nacks(200_000, &TIMING).is_empty());
+
+        // A keyframe skips past the stuck frame at once, and normal frames
+        // flow again.
+        let out = feed_at(&mut r, frame(4, true, 500).1, 203_000);
+        assert_eq!(ids(&out), [4]);
+        assert!(feed(&mut r, frame(5, false, 500).1).is_some());
+    }
+
+    #[test]
+    fn a_complete_keyframe_is_not_held_behind_a_broken_frame() {
+        let mut r = Reassembler::new();
+        feed(&mut r, frame(0, true, 500).1).expect("start");
+        let (_, mut chunks) = frame(1, false, 4_000);
+        chunks.remove(1);
+        feed_at(&mut r, chunks, 1_000);
+        let out = feed_at(&mut r, frame(2, true, 500).1, 2_000);
+        assert_eq!(ids(&out), [2]);
+        assert_eq!(r.stats().incomplete, 1);
+        assert!(!r.take_keyframe_request());
+    }
+
+    #[test]
+    fn progress_postpones_giving_up() {
+        // A large keyframe arriving slowly is not stuck.
+        let mut r = Reassembler::new();
+        let (_, chunks) = frame(0, true, 40_000);
+        for (i, chunk) in chunks.into_iter().enumerate() {
+            let now = i as u64 * 60_000;
+            r.expire(now, &TIMING);
+            r.push(chunk, now);
+        }
+        assert!(r.pop().is_some());
+        assert_eq!(r.stats().incomplete, 0);
+    }
+
+    #[test]
+    fn the_next_deadline_is_the_first_repair_or_give_up_due() {
+        let mut r = Reassembler::new();
+        assert_eq!(r.next_deadline(&TIMING), None);
+        feed(&mut r, frame(0, true, 500).1).expect("start");
+        assert_eq!(r.next_deadline(&TIMING), None, "nothing waiting");
+
+        let (_, mut chunks) = frame(1, false, 4_000);
+        chunks.pop();
+        feed_at(&mut r, chunks, 1_000);
+        assert_eq!(r.next_deadline(&TIMING), Some(1_000 + TIMING.quiet_us));
+        r.nacks(1_000 + TIMING.quiet_us, &TIMING);
+        assert_eq!(
+            r.next_deadline(&TIMING),
+            Some(1_000 + TIMING.quiet_us + TIMING.retry_us)
+        );
     }
 
     #[test]
@@ -443,12 +763,12 @@ mod tests {
         let (_, chunks) = frame(0, true, 3_000);
         let replay = chunks[0].clone();
         feed(&mut r, chunks).expect("delivered");
-        assert!(r.push(replay).is_none());
+        r.push(replay, 0);
         assert_eq!(r.stats().late_chunks, 1);
 
         let (_, chunks) = frame(1, false, 3_000);
-        assert!(r.push(chunks[0].clone()).is_none());
-        assert!(r.push(chunks[0].clone()).is_none());
+        r.push(chunks[0].clone(), 0);
+        r.push(chunks[0].clone(), 0);
         assert_eq!(r.stats().duplicate_chunks, 1);
     }
 
@@ -463,37 +783,22 @@ mod tests {
             capture_ts_us: 0,
             data: Bytes::new(),
         };
-        assert!(r.push(bad(0, 0)).is_none());
-        assert!(r.push(bad(3, 3)).is_none());
+        r.push(bad(0, 0), 0);
+        r.push(bad(3, 3), 0);
         // Chunk count changing mid-frame.
-        assert!(r.push(bad(0, 2)).is_none());
-        assert!(r.push(bad(1, 5)).is_none());
+        r.push(bad(0, 2), 0);
+        r.push(bad(1, 5), 0);
         assert_eq!(r.stats().invalid_chunks, 3);
+        assert!(r.pop().is_none());
     }
 
     #[test]
-    fn abandoning_a_stalled_frame_requests_a_keyframe() {
+    fn too_many_frames_in_flight_gives_up_the_oldest() {
         let mut r = Reassembler::new();
         feed(&mut r, frame(0, true, 500).1).expect("start");
-        let (_, chunks) = frame(1, false, 4_000);
-        r.push(chunks[0].clone());
-        assert!(r.has_partial());
-
-        r.abandon_partials();
-        assert!(!r.has_partial());
-        assert!(r.take_keyframe_request());
-        // Its remaining chunks now count as late.
-        assert!(r.push(chunks[1].clone()).is_none());
-        assert_eq!(r.stats().late_chunks, 1);
-    }
-
-    #[test]
-    fn too_many_frames_in_flight_evicts_the_oldest() {
-        let mut r = Reassembler::new();
-        feed(&mut r, frame(0, true, 500).1).expect("start");
-        for id in 1..=(MAX_PARTIAL as u32 + 1) {
+        for id in 1..=(MAX_PENDING as u32 + 1) {
             let (_, chunks) = frame(id, false, 4_000);
-            r.push(chunks[0].clone());
+            r.push(chunks[0].clone(), 0);
         }
         assert_eq!(r.stats().incomplete, 1);
         assert!(r.take_keyframe_request());

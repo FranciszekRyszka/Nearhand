@@ -181,8 +181,11 @@ pub fn show(ctx: &egui::Context, video: (u32, u32), summary: &Summary, net: &Net
                     text(
                         ui,
                         format!(
-                            "loss: {} incomplete  {} awaiting keyframe  {} kf requests",
-                            r.incomplete, r.dropped_waiting_for_keyframe, net.keyframe_requests
+                            "loss: {} repaired  {} incomplete  {} awaiting keyframe  {} kf requests",
+                            r.repaired,
+                            r.incomplete,
+                            r.dropped_waiting_for_keyframe,
+                            net.keyframe_requests
                         ),
                     );
                     ui.label(

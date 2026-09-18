@@ -21,7 +21,8 @@
 //! A protocol violation closes the connection with a code from
 //! [`nearhand_core::proto::close`] and a reason the viewer can show.
 
-use std::sync::Arc;
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
@@ -42,6 +43,12 @@ use crate::pipeline::{Pipeline, Settings};
 
 /// Highest frame rate a viewer may ask for.
 const MAX_FPS: u8 = 120;
+
+/// How much recently sent video is kept for [`Control::Nack`]: about a second
+/// at 60 fps, and never more memory than this. A repair older than that would
+/// arrive too late to show anyway.
+const SENT_FRAMES: usize = 64;
+const SENT_BYTES: usize = 16 * 1024 * 1024;
 
 /// Stream priorities, highest first. Clipboard text can be large and must
 /// never hold up the pointer.
@@ -173,6 +180,7 @@ pub async fn serve(conn: Connection, config: &SessionConfig) -> Result<()> {
         clipboard_rx,
     ));
 
+    let sent = Arc::new(Mutex::new(Sent::default()));
     let mut video: Option<Video> = None;
     // Frame ids run on across streams: switching monitors must not reset them,
     // or the viewer would take the new stream for late chunks of the old one.
@@ -210,7 +218,9 @@ pub async fn serve(conn: Connection, config: &SessionConfig) -> Result<()> {
                     max_fps: max_fps.clamp(1, MAX_FPS),
                     bitrate_kbps: config.bitrate_kbps,
                 };
-                match start_video(&conn, settings, next_frame_id, cursor.clone()).await {
+                match start_video(&conn, settings, next_frame_id, cursor.clone(), sent.clone())
+                    .await
+                {
                     Ok(started) => {
                         video = Some(started);
                         if let (Some(input), Some(m)) =
@@ -252,6 +262,24 @@ pub async fn serve(conn: Connection, config: &SessionConfig) -> Result<()> {
                 };
                 if let Err(e) = send_message(&mut send, &pong).await {
                     break Err(e.into());
+                }
+            }
+
+            Some(Control::Nack { frame_id, chunks }) => {
+                let resend = sent
+                    .lock()
+                    .map(|sent| sent.chunks(frame_id, &chunks))
+                    .unwrap_or_default();
+                tracing::trace!(
+                    frame_id,
+                    requested = chunks.len(),
+                    resending = resend.len(),
+                    "nack"
+                );
+                for datagram in resend {
+                    if conn.send_datagram(datagram).is_err() {
+                        break;
+                    }
                 }
             }
 
@@ -382,6 +410,41 @@ async fn read_clipboard(
     }
 }
 
+/// Recently sent frames, as the datagrams that carried them.
+#[derive(Debug, Default)]
+struct Sent {
+    frames: VecDeque<(u32, Vec<Bytes>)>,
+    bytes: usize,
+}
+
+impl Sent {
+    fn insert(&mut self, frame_id: u32, datagrams: Vec<Bytes>) {
+        self.bytes += datagrams.iter().map(Bytes::len).sum::<usize>();
+        self.frames.push_back((frame_id, datagrams));
+        while self.frames.len() > SENT_FRAMES || self.bytes > SENT_BYTES {
+            let Some((_, old)) = self.frames.pop_front() else {
+                break;
+            };
+            self.bytes -= old.iter().map(Bytes::len).sum::<usize>();
+        }
+    }
+
+    /// The datagrams for `chunks` of a frame, or all of them if `chunks` is
+    /// empty. Nothing for a frame no longer held or indices out of range.
+    fn chunks(&self, frame_id: u32, chunks: &[u16]) -> Vec<Bytes> {
+        let Some((_, datagrams)) = self.frames.iter().find(|(id, _)| *id == frame_id) else {
+            return Vec::new();
+        };
+        if chunks.is_empty() {
+            return datagrams.clone();
+        }
+        chunks
+            .iter()
+            .filter_map(|&i| datagrams.get(usize::from(i)).cloned())
+            .collect()
+    }
+}
+
 /// Whether the viewer closed the connection on purpose, rather than it being
 /// lost. A viewer that exits without its Bye getting through is still a
 /// normal goodbye.
@@ -398,6 +461,7 @@ async fn start_video(
     settings: Settings,
     first_frame_id: u32,
     cursor: mpsc::UnboundedSender<Cursor>,
+    sent: Arc<Mutex<Sent>>,
 ) -> Result<Video> {
     let started = Pipeline::start(settings, cursor).await?;
     tracing::info!(
@@ -408,7 +472,12 @@ async fn start_video(
         kbps = settings.bitrate_kbps,
         "video started"
     );
-    let sender = tokio::spawn(send_video(conn.clone(), started.frames, first_frame_id));
+    let sender = tokio::spawn(send_video(
+        conn.clone(),
+        started.frames,
+        first_frame_id,
+        sent,
+    ));
     Ok(Video {
         pipeline: started.pipeline,
         sender,
@@ -419,7 +488,8 @@ async fn start_video(
 ///
 /// `send_datagram` never blocks: under congestion quinn discards the oldest
 /// queued datagrams, which is the right policy — the viewer notices the gap and
-/// asks for a keyframe, rather than video falling ever further behind.
+/// asks for the chunks again, rather than video falling ever further behind.
+/// Each frame's datagrams are kept in `sent` for that.
 ///
 /// Every encoded frame consumes a frame id, sent or not. The viewer detects
 /// loss by gaps in the ids; a frame skipped here without leaving a gap would
@@ -428,6 +498,7 @@ async fn send_video(
     conn: Connection,
     mut frames: mpsc::Receiver<nearhand_codec::EncodedFrame>,
     first_frame_id: u32,
+    sent: Arc<Mutex<Sent>>,
 ) -> VideoStats {
     let mut stats = VideoStats {
         next_frame_id: first_frame_id,
@@ -456,21 +527,28 @@ async fn send_video(
             }
         };
 
-        for chunk in &chunks {
-            let datagram = match encode_chunk(chunk) {
-                Ok(datagram) => datagram,
-                Err(e) => {
-                    tracing::warn!(error = %e, "could not encode chunk");
-                    // The rest of the frame is useless without this chunk.
-                    break;
-                }
-            };
+        let datagrams: Vec<Bytes> = match chunks
+            .iter()
+            .map(|chunk| encode_chunk(chunk).map(Bytes::from))
+            .collect()
+        {
+            Ok(datagrams) => datagrams,
+            Err(e) => {
+                tracing::warn!(error = %e, frame_id, "could not encode chunks; skipping");
+                continue;
+            }
+        };
+        for datagram in &datagrams {
             stats.bytes += datagram.len() as u64;
-            if let Err(e) = conn.send_datagram(Bytes::from(datagram)) {
+            // A clone is a reference count, not a copy.
+            if let Err(e) = conn.send_datagram(datagram.clone()) {
                 tracing::debug!(error = %e, "datagram send failed; ending video");
                 return stats;
             }
             stats.datagrams += 1;
+        }
+        if let Ok(mut sent) = sent.lock() {
+            sent.insert(frame_id, datagrams);
         }
 
         stats.frames += 1;
@@ -479,4 +557,40 @@ async fn send_video(
         }
     }
     stats
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn datagrams(n: usize, size: usize) -> Vec<Bytes> {
+        (0..n).map(|i| Bytes::from(vec![i as u8; size])).collect()
+    }
+
+    #[test]
+    fn sent_frames_answer_nacks() {
+        let mut sent = Sent::default();
+        sent.insert(7, datagrams(3, 10));
+        assert_eq!(
+            sent.chunks(7, &[2, 0]),
+            [datagrams(3, 10)[2].clone(), datagrams(3, 10)[0].clone()]
+        );
+        assert_eq!(sent.chunks(7, &[]).len(), 3, "empty means all");
+        assert!(sent.chunks(7, &[3]).is_empty(), "out of range");
+        assert!(sent.chunks(8, &[0]).is_empty(), "never sent");
+    }
+
+    #[test]
+    fn sent_frames_are_bounded() {
+        let mut sent = Sent::default();
+        for id in 0..(SENT_FRAMES as u32 + 5) {
+            sent.insert(id, datagrams(1, 10));
+        }
+        assert_eq!(sent.frames.len(), SENT_FRAMES);
+        assert!(sent.chunks(0, &[]).is_empty(), "oldest dropped");
+
+        sent.insert(1000, datagrams(1, SENT_BYTES));
+        assert!(sent.bytes <= SENT_BYTES);
+        assert_eq!(sent.chunks(1000, &[]).len(), 1);
+    }
 }

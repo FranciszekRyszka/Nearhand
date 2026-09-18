@@ -19,7 +19,7 @@ use anyhow::{Context, Result, bail};
 use nearhand_clipboard::ClipboardSync;
 use nearhand_core::clock::ClockSync;
 use nearhand_core::proto::close;
-use nearhand_core::video::{AssembledFrame, Reassembler, ReassemblyStats, decode_chunk};
+use nearhand_core::video::{AssembledFrame, Reassembler, ReassemblyStats, Timing, decode_chunk};
 use nearhand_core::{
     Caps, Clipboard, Codec, Control, Cursor, Input, Monitor, PROTOCOL_VERSION, StreamKind, wire,
 };
@@ -28,11 +28,6 @@ use nearhand_transport::{
 };
 use quinn::{Connection, ConnectionError, RecvStream, SendStream};
 use tokio::sync::{Notify, mpsc};
-
-/// A frame still missing chunks after this long with no datagrams at all is
-/// abandoned. Without it, loss at the end of a burst would go unnoticed until
-/// the screen next changes, possibly seconds later.
-const PARTIAL_TIMEOUT: Duration = Duration::from_millis(100);
 
 /// Keyframes are expensive; ask at most this often. A keyframe takes an RTT
 /// plus an encode to arrive, and asking again sooner only produces two.
@@ -228,7 +223,6 @@ pub async fn run(options: Options) -> Result<()> {
     let mut stats = Stats::new();
     let started = Instant::now();
     let deadline = options.seconds.map(|s| started + Duration::from_secs(s));
-    let mut last_datagram = Instant::now();
     let mut keyframe_needed = false;
     let mut last_keyframe_request: Option<Instant> = None;
     let mut ticker = tokio::time::interval(TICK);
@@ -240,13 +234,23 @@ pub async fn run(options: Options) -> Result<()> {
     tokio::pin!(ctrl_c);
 
     let outcome: Result<()> = loop {
+        // Wake exactly when a repair falls due rather than on the next tick:
+        // a frame's lost last chunk would otherwise wait for the next frame.
+        let repair_at = reassembler
+            .next_deadline(&repair_timing(conn.rtt()))
+            .map(|at_us| {
+                let now_us = nearhand_capture::clock::now_us();
+                // At least a millisecond away, so a deadline that turns out to
+                // need nothing done can never spin the loop.
+                let wait_us = at_us.saturating_sub(now_us).max(1_000);
+                tokio::time::Instant::now() + Duration::from_micros(wait_us)
+            });
         tokio::select! {
             datagram = conn.read_datagram() => {
                 let datagram = match datagram {
                     Ok(datagram) => datagram,
                     Err(e) => break Err(explain(&conn, e.into())),
                 };
-                last_datagram = Instant::now();
                 stats.datagrams += 1;
                 stats.bytes += datagram.len() as u64;
                 if loss.drop_this() {
@@ -260,23 +264,14 @@ pub async fn run(options: Options) -> Result<()> {
                         continue;
                     }
                 };
-                if let Some(frame) = reassembler.push(chunk) {
-                    let received_us = nearhand_capture::clock::now_us();
-                    stats.frames += 1;
-                    stats.window_frames += 1;
-                    if frame.keyframe {
-                        stats.keyframes += 1;
-                    }
-                    if let Some(out) = recording.as_mut() {
-                        out.write_all(&frame.data).context("writing the recording")?;
-                    }
-                    if let Some(sink) = &options.frames
-                        && sink.send(Received { frame, received_us }).is_err()
-                    {
-                        // The window closed.
-                        break Ok(());
-                    }
+                let now_us = nearhand_capture::clock::now_us();
+                reassembler.push(chunk, now_us);
+                if !deliver(&mut reassembler, &mut stats, &mut recording, &options.frames)? {
+                    break Ok(()); // The window closed.
                 }
+                // Straight away rather than on the next tick: every
+                // millisecond here is a millisecond the frames behind it wait.
+                ask_for_repairs(&mut reassembler, now_us, &conn, &mut send).await?;
             }
 
             message = control_rx.recv() => match message {
@@ -297,10 +292,16 @@ pub async fn run(options: Options) -> Result<()> {
                 None => break Ok(()),
             },
 
-            _ = ticker.tick() => {
-                if reassembler.has_partial() && last_datagram.elapsed() > PARTIAL_TIMEOUT {
-                    reassembler.abandon_partials();
+            _ = sleep_until(repair_at), if repair_at.is_some() => {
+                let now_us = nearhand_capture::clock::now_us();
+                ask_for_repairs(&mut reassembler, now_us, &conn, &mut send).await?;
+                reassembler.expire(now_us, &repair_timing(conn.rtt()));
+                if !deliver(&mut reassembler, &mut stats, &mut recording, &options.frames)? {
+                    break Ok(());
                 }
+            }
+
+            _ = ticker.tick() => {
                 if options.shared.keyframe_wanted.swap(false, Ordering::Relaxed) {
                     keyframe_needed = true;
                 }
@@ -370,6 +371,69 @@ pub async fn run(options: Options) -> Result<()> {
 
     stats.print_summary(started.elapsed(), &reassembler, options.record.as_deref());
     outcome
+}
+
+async fn sleep_until(at: Option<tokio::time::Instant>) {
+    match at {
+        Some(at) => tokio::time::sleep_until(at).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Repair timings for the current round trip. A repair takes one round trip
+/// plus the agent's turnaround; giving up allows for the request or the
+/// repair itself being lost once.
+fn repair_timing(rtt: Duration) -> Timing {
+    let rtt_us = rtt.as_micros() as u64;
+    Timing {
+        quiet_us: rtt_us + 5_000,
+        retry_us: rtt_us * 3 / 2 + 10_000,
+        give_up_us: rtt_us * 3 + 60_000,
+    }
+}
+
+async fn ask_for_repairs(
+    reassembler: &mut Reassembler,
+    now_us: u64,
+    conn: &Connection,
+    send: &mut SendStream,
+) -> Result<()> {
+    for missing in reassembler.nacks(now_us, &repair_timing(conn.rtt())) {
+        let nack = Control::Nack {
+            frame_id: missing.frame_id,
+            chunks: missing.chunks,
+        };
+        send_message(send, &nack).await?;
+    }
+    Ok(())
+}
+
+/// Hand every frame the reassembler has ready to the recording and the
+/// decoder. False once the decoder side has gone.
+fn deliver(
+    reassembler: &mut Reassembler,
+    stats: &mut Stats,
+    recording: &mut Option<BufWriter<File>>,
+    frames: &Option<std::sync::mpsc::Sender<Received>>,
+) -> Result<bool> {
+    while let Some(frame) = reassembler.pop() {
+        let received_us = nearhand_capture::clock::now_us();
+        stats.frames += 1;
+        stats.window_frames += 1;
+        if frame.keyframe {
+            stats.keyframes += 1;
+        }
+        if let Some(out) = recording.as_mut() {
+            out.write_all(&frame.data)
+                .context("writing the recording")?;
+        }
+        if let Some(sink) = frames
+            && sink.send(Received { frame, received_us }).is_err()
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 async fn read_control(mut recv: RecvStream, tx: mpsc::Sender<nearhand_transport::Result<Control>>) {
@@ -596,11 +660,12 @@ impl Stats {
         let bytes = self.bytes - self.window_bytes;
         let r = reassembler.stats();
         println!(
-            "{:>5.1}s  {:>5.1} fps  {:>6.2} Mbit/s  delivered {}  incomplete {}  waiting-for-key {}  kf-requests {}  rtt {:.1} ms",
+            "{:>5.1}s  {:>5.1} fps  {:>6.2} Mbit/s  delivered {}  repaired {}  incomplete {}  waiting-for-key {}  kf-requests {}  rtt {:.1} ms",
             elapsed.as_secs_f64(),
             self.window_frames as f64 / secs,
             bytes as f64 * 8.0 / 1_000_000.0 / secs,
             r.delivered,
+            r.repaired,
             r.incomplete,
             r.dropped_waiting_for_keyframe,
             self.keyframe_requests,
@@ -634,8 +699,12 @@ impl Stats {
             self.frames as f64 / secs
         );
         println!(
-            "loss handling:   {} incomplete, {} dropped waiting for a keyframe, {} keyframe requests",
-            r.incomplete, r.dropped_waiting_for_keyframe, self.keyframe_requests
+            "loss handling:   {} repaired ({} repair requests), {} incomplete, {} dropped waiting for a keyframe, {} keyframe requests",
+            r.repaired,
+            r.nacks,
+            r.incomplete,
+            r.dropped_waiting_for_keyframe,
+            self.keyframe_requests
         );
         println!(
             "oddities:        {} late, {} duplicate, {} invalid, {} undecodable chunks",

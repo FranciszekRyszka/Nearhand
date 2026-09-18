@@ -22,7 +22,7 @@ pub use proto::{
 /// Application-layer protocol name negotiated in the TLS handshake. Carries the
 /// protocol version, so a mismatched peer fails at the handshake with a clear
 /// reason instead of speaking a format it does not understand.
-pub const ALPN: &[u8] = b"nearhand/0";
+pub const ALPN: &[u8] = b"nearhand/1";
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {

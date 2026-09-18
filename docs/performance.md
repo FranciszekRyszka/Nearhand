@@ -72,13 +72,31 @@ Each of these was invisible in the code and obvious in the numbers.
 | Decoder invents output timestamps once delimiters are added | timestamps drifted tens of ms | pair outputs with inputs in order |
 | Frame-rate cap measured from the end of encoding | 40 fps instead of 60; p50 18.5 ms instead of 12.8 | measure from capture |
 
-## Known weakness
+## Under packet loss
 
-Recovery from packet loss collapses at realistic loss rates: at 2% simulated
-datagram loss only 19 of 312 frames were delivered, because a 1440p keyframe is
-about 200 datagrams and rarely arrives whole. Wired LAN loss is near zero, so
-the figures above are unaffected. See `docs/protocol.md` for the options; this
-has to be fixed before M2.
+Lost video chunks are asked for again and resent (`docs/protocol.md`, "Repair").
+Measured on loopback with `--simulate-loss`, which discards that share of the
+datagrams arriving at the viewer, repairs included. Release build, watching the
+2560×1440 monitor while a small window on it animated text and a block at
+about 30 fps, 12 s per run:
+
+| Loss | Frames delivered | Repaired | Given up | Keyframe requests | Latency p50 | p95 |
+| --- | --- | --- | --- | --- | --- | --- |
+| 0% | 352 | 0 | 0 | 0 | 10–11 ms | 18–22 ms |
+| 2% | 367 | 98 | 0 | 0 | 10–12 ms | 23–29 ms |
+| 5% | 352 | 174 | 0 | 0 | 10–14 ms | 35–40 ms |
+
+The frame rate is untouched and no frame was given up. A repaired frame, and
+the frames queued behind it, arrive one repair later, which shows in p95 rather
+than p50.
+
+Before repair, loss was answered only with a keyframe. At 2% loss that
+delivered 19 of 312 frames (2.3 fps), because a 1440p keyframe is about 200
+datagrams and arrived whole about 0.98²⁰⁰ ≈ 2% of the time.
+
+On loopback the round trip is under a millisecond, so these runs show the
+mechanism rather than its cost on a real WAN. There, each repair costs about
+one round trip on top.
 
 ## Reproducing
 

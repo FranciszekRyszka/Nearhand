@@ -30,7 +30,7 @@ WebSocket fallback where WebTransport is unavailable.
 
 ## Session
 
-The TLS handshake negotiates ALPN `nearhand/0`, so a peer on a different
+The TLS handshake negotiates ALPN `nearhand/1`, so a peer on a different
 protocol version fails there rather than mid-stream. The viewer then opens one
 bidirectional stream for control and speaks first:
 
@@ -41,7 +41,7 @@ viewer                         agent
                            ◀──  MonitorList
   StartVideo               ──▶
                            ◀══  video datagrams …
-  RequestKeyframe / SetQuality / StartVideo (another monitor) / Bye
+  Nack / RequestKeyframe / SetQuality / StartVideo (another monitor) / Bye
 
   (own stream) Input …     ──▶
                            ◀──  Cursor …  (own stream)
@@ -75,18 +75,38 @@ are sized from the connection's current datagram limit, which QUIC's path MTU
 discovery raises over time, minus 32 bytes reserved for the chunk header.
 
 A frame is complete when chunks `0..chunks` for one `frame_id` have arrived.
-Nothing is retransmitted. A frame missing chunks is abandoned when a newer frame
-completes, or after 100 ms with no datagrams at all.
-
 Every encoded frame consumes a `frame_id`, sent or not, and ids continue across
-monitor switches. The viewer detects loss by gaps. After any loss it drops every
-frame until a keyframe arrives, because a P-frame decoded against a missing
-reference comes out corrupted. It asks for a keyframe at most every 250 ms, and
-the agent re-encodes its last frame if the desktop is idle, so a keyframe does
-not wait for the screen to change.
+monitor switches. Frames go to the decoder strictly in id order, because each
+P-frame is decoded against the one before it.
 
 `capture_ts_us` rides along for the latency overlay: capture-to-present is
 measured end to end, RTT-corrected when the clocks are not synced.
+
+### Repair
+
+The viewer asks for lost chunks again with `Nack { frame_id, chunks }`; an
+empty list means the whole frame, for a frame of which nothing arrived. The
+agent keeps the datagrams of the last 64 frames (at most 16 MiB) and resends
+what is asked for. It ignores frames it no longer holds. Newer frames wait in
+the viewer until the repair lands.
+
+A chunk counts as lost, and is asked for, as soon as a later chunk of its frame
+or any chunk of a newer frame has arrived. A frame's trailing chunks count as
+lost after a quiet spell of one round trip plus 5 ms. A frame is asked for
+again after 1.5 round trips plus 10 ms. The viewer gives up on a frame once it
+has made no progress for 3 round trips plus 60 ms. The core keeps no clock: the
+viewer passes the time in and derives these timings from the round trip.
+
+A frame given up on breaks the reference chain. From then on the viewer drops
+every frame until a keyframe arrives, because a P-frame decoded against a
+missing reference comes out corrupted. It asks for a keyframe at most every
+250 ms, and the agent re-encodes its last frame if the desktop is idle, so a
+keyframe does not wait for the screen to change. A complete keyframe already
+waiting behind a stuck frame is jumped to at once.
+
+Before repair existed, keyframes were the only recovery, and 2% loss let 19 of
+312 frames through. `docs/performance.md` has the measurements before and
+after.
 
 ### Switching monitors
 
@@ -96,19 +116,6 @@ stream opens with a keyframe. The new picture size travels only in that
 keyframe's sequence parameter set, so a viewer's decoder must follow a
 resolution change mid-stream. The native viewer sizes its frame textures for
 the largest monitor in `MonitorList`, so a switch never rebuilds them.
-
-### Known weakness: keyframe recovery under loss
-
-Keyframe-only recovery does not survive realistic loss. At 1440p a keyframe is
-about 200 datagrams, and at 2% datagram loss all of them arrive only
-0.98²⁰⁰ ≈ 2% of the time. Measured on loopback with 2% simulated loss: 19 of
-312 frames delivered, 2.3 fps, even though every one of 31 requested keyframes
-was sent. The frames that were delivered were correct.
-
-Wired LAN loss is close to zero, so M0 measurements are unaffected. Wi-Fi and
-WAN are not. The fix has to come before M2; options are retransmitting missing
-chunks within a short deadline, forward error correction, or intra refresh /
-long-term references so a loss costs part of a frame rather than a keyframe.
 
 ## Input
 
