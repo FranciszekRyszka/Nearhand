@@ -35,6 +35,7 @@ pub fn now_us() -> u64 {
 }
 
 /// Performance-counter ticks to microseconds, without overflow.
+#[cfg(any(windows, test))]
 pub(crate) fn ticks_to_us(ticks: i64, frequency: i64) -> u64 {
     if frequency <= 0 {
         return 0;

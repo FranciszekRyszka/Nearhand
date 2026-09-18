@@ -40,12 +40,16 @@ const PING_FAST_FOR: Duration = Duration::from_secs(2);
 const PING_SLOW: Duration = Duration::from_secs(1);
 
 /// A complete frame and when the last of it arrived, on the capture clock.
+// Read only by the window, which exists only on Windows so far (macOS: M4).
+#[cfg_attr(not(windows), allow(dead_code))]
 pub struct Received {
     pub frame: AssembledFrame,
     pub received_us: u64,
 }
 
 /// What the network side knows, for the overlay.
+// Read only by the window, which exists only on Windows so far (macOS: M4).
+#[cfg_attr(not(windows), allow(dead_code))]
 #[derive(Debug, Default, Clone)]
 pub struct NetSnapshot {
     pub fps: f64,
@@ -72,6 +76,8 @@ pub struct Shared {
 }
 
 impl Shared {
+    // Read only by the window, which exists only on Windows so far (macOS: M4).
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub fn snapshot(&self) -> NetSnapshot {
         self.net.lock().map(|s| s.clone()).unwrap_or_default()
     }
