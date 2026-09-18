@@ -10,6 +10,7 @@ mod present;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+#[cfg(windows)]
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -19,6 +20,7 @@ use nearhand_transport::Fingerprint;
 use crate::direct::Shared;
 
 /// How long to wait for the agent's monitor list before giving up.
+#[cfg(windows)]
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Parser, Debug)]
