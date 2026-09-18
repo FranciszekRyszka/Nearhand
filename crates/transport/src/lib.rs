@@ -21,14 +21,16 @@
 //! * The server learns an agent's key from the client certificate the agent
 //!   presents, and derives its ID from it.
 
+pub mod rendezvous;
+
 use std::fmt;
-use std::net::{IpAddr, SocketAddr, UdpSocket};
+use std::net::SocketAddr;
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use nearhand_core::rendezvous::{DeviceId, SERVER_ALPN};
+use nearhand_core::rendezvous::{DeviceId, Refusal, SERVER_ALPN};
 use nearhand_core::{ALPN, StreamKind, wire};
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use quinn::{
@@ -78,6 +80,12 @@ pub enum Error {
     Fingerprint(String),
     #[error("QUIC configuration: {0}")]
     Config(String),
+    #[error("the server says: {0}")]
+    Refused(Refusal),
+    #[error("unexpected answer from the server: {0}")]
+    Unexpected(String),
+    #[error("no direct path to the device ({0})")]
+    Unreachable(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -211,28 +219,37 @@ impl Identity {
 /// It can connect out as well: an agent reaches its server from this same
 /// endpoint, so the address the server sees is the one viewers can use.
 pub fn server_endpoint(bind: SocketAddr, identity: &Identity) -> Result<Endpoint> {
-    let tls = rustls::ServerConfig::builder_with_provider(provider())
-        .with_protocol_versions(&[&rustls::version::TLS13])?
-        .with_no_client_auth();
-    endpoint_serving(bind, identity, tls, ALPN)
+    Ok(Endpoint::server(peer_server_config(identity)?, bind)?)
 }
 
 /// The server's QUIC endpoint. Clients may present a certificate — agents do,
 /// to prove which device they are — and need not: viewers do not.
 pub fn rendezvous_endpoint(bind: SocketAddr, identity: &Identity) -> Result<Endpoint> {
+    Ok(Endpoint::server(rendezvous_server_config(identity)?, bind)?)
+}
+
+/// What [`server_endpoint`] serves, for an endpoint made some other way.
+pub fn peer_server_config(identity: &Identity) -> Result<ServerConfig> {
+    let tls = rustls::ServerConfig::builder_with_provider(provider())
+        .with_protocol_versions(&[&rustls::version::TLS13])?
+        .with_no_client_auth();
+    serving(identity, tls, ALPN)
+}
+
+/// What [`rendezvous_endpoint`] serves, for an endpoint made some other way.
+pub fn rendezvous_server_config(identity: &Identity) -> Result<ServerConfig> {
     let provider = provider();
     let tls = rustls::ServerConfig::builder_with_provider(provider.clone())
         .with_protocol_versions(&[&rustls::version::TLS13])?
         .with_client_cert_verifier(Arc::new(AnyClientKey { provider }));
-    endpoint_serving(bind, identity, tls, SERVER_ALPN)
+    serving(identity, tls, SERVER_ALPN)
 }
 
-fn endpoint_serving(
-    bind: SocketAddr,
+fn serving(
     identity: &Identity,
     tls: rustls::ConfigBuilder<rustls::ServerConfig, rustls::server::WantsServerCert>,
     alpn: &[u8],
-) -> Result<Endpoint> {
+) -> Result<ServerConfig> {
     let mut tls = tls.with_single_cert(
         vec![identity.cert.clone()],
         PrivateKeyDer::Pkcs8(identity.key.clone_key()),
@@ -242,7 +259,7 @@ fn endpoint_serving(
     let crypto = QuicServerConfig::try_from(tls).map_err(|e| Error::Config(e.to_string()))?;
     let mut config = ServerConfig::with_crypto(Arc::new(crypto));
     config.transport_config(Arc::new(transport_config()?));
-    Ok(Endpoint::server(config, bind)?)
+    Ok(config)
 }
 
 /// A client endpoint suited to reaching `remote`: same address family, any
@@ -286,36 +303,6 @@ pub fn peer_fingerprint(conn: &Connection) -> Option<Fingerprint> {
         .downcast::<Vec<CertificateDer<'static>>>()
         .ok()?;
     certs.first().map(Fingerprint::of)
-}
-
-/// Open this endpoint's way to `target` through the local firewall and NAT,
-/// by sending it a packet.
-///
-/// Stateful firewalls — Windows', and every NAT — let packets in from an
-/// address only after something went out to it. The packet is the first of a
-/// connection attempt that will never complete: what matters is that it left.
-/// The attempt is kept alive for `hold`, so QUIC resends it in the meantime.
-pub async fn punch(endpoint: &Endpoint, target: SocketAddr, hold: Duration) {
-    let Ok(config) = client_config(Fingerprint([0; 32]), ALPN, None) else {
-        return;
-    };
-    let Ok(connecting) = endpoint.connect_with(config, target, SERVER_NAME) else {
-        return;
-    };
-    let _ = tokio::time::timeout(hold, connecting).await;
-}
-
-/// The local address this machine would use to reach `remote`: where others
-/// on the same network can find it. No packet is sent.
-pub fn local_ip_toward(remote: SocketAddr) -> Option<IpAddr> {
-    let bind: SocketAddr = if remote.is_ipv6() {
-        (std::net::Ipv6Addr::UNSPECIFIED, 0).into()
-    } else {
-        (std::net::Ipv4Addr::UNSPECIFIED, 0).into()
-    };
-    let socket = UdpSocket::bind(bind).ok()?;
-    socket.connect(remote).ok()?;
-    socket.local_addr().ok().map(|a| a.ip())
 }
 
 fn client_config(

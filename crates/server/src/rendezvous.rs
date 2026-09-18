@@ -41,7 +41,11 @@ pub struct Registry {
 #[derive(Clone)]
 struct Agent {
     fingerprint: Fingerprint,
-    addresses: Vec<SocketAddr>,
+    /// Where the agent says it can be reached on its own network.
+    reported: Vec<SocketAddr>,
+    /// Its connection here, which tells where it is seen from now: a NAT may
+    /// have moved it since it registered.
+    conn: Connection,
     to_agent: mpsc::UnboundedSender<FromServer>,
     /// Viewers waiting for this agent to answer, by session.
     waiting: Arc<Mutex<HashMap<u64, oneshot::Sender<bool>>>>,
@@ -115,7 +119,8 @@ async fn register(
     let registration = registry.next.fetch_add(1, Ordering::Relaxed);
     let agent = Agent {
         fingerprint,
-        addresses: candidates(addresses, observed),
+        reported: addresses,
+        conn: conn.clone(),
         to_agent,
         waiting: waiting.clone(),
         registration,
@@ -203,7 +208,7 @@ async fn introduce(
     tracing::info!(%id, viewer = %observed, "introduced");
     let peer = FromServer::Peer {
         fingerprint: *agent.fingerprint.as_bytes(),
-        addresses: agent.addresses.clone(),
+        addresses: candidates(agent.reported, agent.conn.remote_address()),
     };
     send_message(send, &peer).await?;
     goodbye(conn, send).await;
@@ -323,5 +328,257 @@ mod tests {
         assert!(!registry.attempt(a));
         assert!(registry.attempt(b), "others are unaffected");
         assert_eq!(registry.online(), 0);
+    }
+
+    // --- Whole introductions, across simulated NATs -------------------------
+
+    use crate::netsim::{NatKind, Net, private, public};
+    use nearhand_transport::rendezvous::{find, stay_registered};
+    use nearhand_transport::{Error, Identity, peer_server_config, rendezvous_server_config};
+    use quinn::{EndpointConfig, ServerConfig, TokioRuntime};
+
+    #[derive(Debug, Clone, Copy)]
+    enum Place {
+        Internet,
+        Behind(NatKind),
+        /// On the agent's private network, behind the same NAT.
+        BesideAgent,
+    }
+
+    fn endpoint(
+        net: &Arc<Net>,
+        address: SocketAddr,
+        behind: Option<IpAddr>,
+        config: Option<ServerConfig>,
+    ) -> Endpoint {
+        Endpoint::new_with_abstract_socket(
+            EndpointConfig::default(),
+            config,
+            net.socket(address, behind),
+            Arc::new(TokioRuntime),
+        )
+        .expect("endpoint")
+    }
+
+    /// Where a host at `place` lives: its own address, and the NAT it is
+    /// behind, set up here. Host `own` gets network and public IP `own`.
+    fn place(net: &Net, place: Place, own: u8) -> (SocketAddr, Option<IpAddr>) {
+        match place {
+            Place::Internet => (public(own, 5000), None),
+            Place::Behind(kind) => {
+                let nat = public(own, 0).ip();
+                net.add_nat(nat, kind);
+                (private(own, 2, 5000), Some(nat))
+            }
+            Place::BesideAgent => (private(AGENT, 3, 5000), Some(public(AGENT, 0).ip())),
+        }
+    }
+
+    const AGENT: u8 = 1;
+    const VIEWER: u8 = 2;
+
+    /// A server on the internet, an agent at `agent`, and a viewer at
+    /// `viewer` trying to reach it: where the viewer's connection landed.
+    /// `punch: false` has the agent skip opening its way.
+    async fn introduce_across(
+        agent: Place,
+        viewer: Place,
+        punch: bool,
+    ) -> nearhand_transport::Result<SocketAddr> {
+        let world = World::new(agent, punch).await;
+        world.reach(viewer).await
+    }
+
+    /// A server, and an agent registered with it.
+    struct World {
+        net: Arc<Net>,
+        server_addr: SocketAddr,
+        server_fp: Fingerprint,
+        registry: Arc<Registry>,
+        id: DeviceId,
+    }
+
+    impl World {
+        async fn new(agent: Place, punch: bool) -> Self {
+            let net = Net::new();
+            let server_identity = Identity::generate().expect("identity");
+            let server_addr = public(100, 443);
+            let server = endpoint(
+                &net,
+                server_addr,
+                None,
+                Some(rendezvous_server_config(&server_identity).expect("config")),
+            );
+            let registry = Arc::new(Registry::default());
+            tokio::spawn(serve(server, registry.clone()));
+            let server_fp = server_identity.fingerprint();
+
+            let (agent_addr, agent_behind) = place(&net, agent, AGENT);
+            let agent_identity = Identity::generate().expect("identity");
+            let id = agent_identity.device_id();
+            let agent = endpoint(
+                &net,
+                agent_addr,
+                agent_behind,
+                Some(peer_server_config(&agent_identity).expect("config")),
+            );
+            let accepting = agent.clone();
+            tokio::spawn(async move {
+                while let Some(incoming) = accepting.accept().await {
+                    tokio::spawn(async move {
+                        if let Ok(conn) = incoming.await {
+                            conn.closed().await;
+                        }
+                    });
+                }
+            });
+            if punch {
+                tokio::spawn(async move {
+                    stay_registered(&agent, server_addr, server_fp, &agent_identity).await
+                });
+            } else {
+                tokio::spawn(register_without_punching(
+                    agent,
+                    server_addr,
+                    server_fp,
+                    agent_identity,
+                ));
+            }
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while registry.online() == 0 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("the agent registers");
+
+            Self {
+                net,
+                server_addr,
+                server_fp,
+                registry,
+                id,
+            }
+        }
+
+        async fn reach(&self, viewer: Place) -> nearhand_transport::Result<SocketAddr> {
+            let (viewer_addr, viewer_behind) = place(&self.net, viewer, VIEWER);
+            let viewer = endpoint(&self.net, viewer_addr, viewer_behind, None);
+            let conn = find(&viewer, self.server_addr, self.server_fp, self.id).await?;
+            Ok(conn.remote_address())
+        }
+
+        /// Where the server sees the agent now.
+        fn agent_seen_at(&self) -> SocketAddr {
+            lock(&self.registry.agents)[&self.id].conn.remote_address()
+        }
+    }
+
+    /// An agent that says it is ready without sending anything to the viewer.
+    async fn register_without_punching(
+        endpoint: Endpoint,
+        server: SocketAddr,
+        server_fp: Fingerprint,
+        identity: Identity,
+    ) -> Result<()> {
+        let conn =
+            nearhand_transport::connect_server(&endpoint, server, server_fp, Some(&identity))
+                .await?;
+        let (mut send, mut recv) = conn.open_bi().await?;
+        send_message(&mut send, &ToServer::Register { addresses: vec![] }).await?;
+        while let Some(message) = recv_message::<FromServer>(&mut recv).await? {
+            if let FromServer::Incoming { session, .. } = message {
+                send_message(&mut send, &ToServer::Ready { session }).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The table in docs/protocol.md ("Through NATs"), row by row.
+    #[tokio::test]
+    async fn which_nats_a_direct_connection_gets_through() {
+        use NatKind::*;
+        use Place::*;
+        let agent_public = public(AGENT, 0).ip();
+        let agent_private = private(AGENT, 2, 0).ip();
+        let cases = [
+            (Internet, Internet, Some(public(AGENT, 0).ip())),
+            (Behind(PortRestricted), Internet, Some(agent_public)),
+            (
+                Behind(PortRestricted),
+                Behind(PortRestricted),
+                Some(agent_public),
+            ),
+            (
+                Behind(FullCone),
+                Behind(AddressRestricted),
+                Some(agent_public),
+            ),
+            (Behind(PortRestricted), Behind(Symmetric), None),
+            (
+                Behind(AddressRestricted),
+                Behind(Symmetric),
+                Some(agent_public),
+            ),
+            (Behind(FullCone), Behind(Symmetric), Some(agent_public)),
+            (Behind(Symmetric), Internet, None),
+            (Behind(Symmetric), Behind(PortRestricted), None),
+            // Same network, and the NAT does not hairpin: the local address.
+            (Behind(PortRestricted), BesideAgent, Some(agent_private)),
+            (Behind(Symmetric), BesideAgent, Some(agent_private)),
+        ];
+        let mut runs = tokio::task::JoinSet::new();
+        for (i, (agent, viewer, expected)) in cases.into_iter().enumerate() {
+            runs.spawn(async move {
+                let result = introduce_across(agent, viewer, true).await;
+                (i, agent, viewer, expected, result)
+            });
+        }
+        let mut wrong = Vec::new();
+        while let Some(run) = runs.join_next().await {
+            let (i, agent, viewer, expected, result) = run.expect("case");
+            let landed = match &result {
+                Ok(address) => Some(address.ip()),
+                Err(Error::Unreachable(_)) => None,
+                Err(e) => panic!("case {i}: failed before connecting: {e}"),
+            };
+            if landed != expected {
+                wrong.push(format!(
+                    "case {i}: agent {agent:?}, viewer {viewer:?}: expected {expected:?}, got {result:?}"
+                ));
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
+    /// Routers drop idle mappings and restart, and the agent's next packet
+    /// leaves from a new port. The server follows it, and sends viewers there
+    /// rather than to where it registered.
+    #[tokio::test]
+    async fn an_agent_moved_by_its_nat_is_found_where_it_is_now() {
+        let world = World::new(Place::Behind(NatKind::PortRestricted), true).await;
+        let before = world.agent_seen_at();
+        world.net.forget_mappings(public(AGENT, 0).ip());
+        // The agent's keep-alive, every few seconds, leaves from the new port.
+        let after = tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                let now = world.agent_seen_at();
+                if now != before {
+                    return now;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("the server sees the agent move");
+        let landed = world.reach(Place::Internet).await.expect("reached");
+        assert_eq!(landed, after);
+    }
+
+    #[tokio::test]
+    async fn without_the_agents_punch_its_nat_keeps_the_viewer_out() {
+        let agent = Place::Behind(NatKind::PortRestricted);
+        let result = introduce_across(agent, Place::Internet, false).await;
+        assert!(matches!(result, Err(Error::Unreachable(_))), "{result:?}");
     }
 }

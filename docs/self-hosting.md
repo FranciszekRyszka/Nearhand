@@ -18,11 +18,11 @@ nearhand-viewer connect "123 456 7890" --server 203.0.113.10:443 \
     --server-fingerprint <fingerprint> --password <password>
 ```
 
-The connection between viewer and agent is direct, never through the server.
-For now it works when the viewer can reach one of the agent's addresses: on
-the same network, or when the agent's side of the internet does not block the
-way in. Hole punching across NATs, and the relay for when that fails, are the
-next steps.
+The connection between viewer and agent is direct, never through the server:
+on the same network, or across the internet through the NATs of most home
+connections ([which ones](protocol.md#through-nats)). Mobile networks and
+offices often use NATs no direct connection gets through; the relay, which
+carries a session in that case, is the next step.
 
 There is no Nearhand-run infrastructure — no project ID server, no project
 relay. Every install points at a server you run.

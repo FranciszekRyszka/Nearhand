@@ -60,7 +60,28 @@ agent            server             viewer
   it uses for the server, after sending a packet to each of the viewer's
   addresses: a stateful firewall lets packets in only from where something
   went out to.
+* The server reports the address it sees the agent at when the viewer asks,
+  not when the agent registered: a NAT may have moved it since.
 * The server allows each viewer address 10 introductions a minute.
+
+### Through NATs
+
+The address the server sees is the one a NAT maps each side's socket to, so
+the same exchange gets a direct connection through most NATs. The agent's
+packet opens its NAT to the viewer, and the viewer's connection attempt opens
+its own NAT to the agent's answer. Whether that works depends on the two NATs:
+
+| Agent's NAT | Viewer's NAT | Direct connection |
+|---|---|---|
+| none, or one port per socket (most home routers) | none, or one port per socket | yes |
+| one port per socket, answers only from that address and port | a new port per destination ("symmetric") | no |
+| one port per socket, answers from any port of that address | symmetric | yes |
+| symmetric | any | no |
+| same network as the viewer | — | yes, over the local address |
+
+Each row is a test, run against the real server, agent and viewer code over
+a simulated network (`crates/server/src/netsim.rs`). Where there is no direct
+path, the relay carries the session (next in M2).
 
 ## Session
 

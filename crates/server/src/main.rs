@@ -7,6 +7,8 @@
 //! M5 — they are deliberately not in Cargo.toml yet. So far the server does
 //! introductions (`rendezvous`), over QUIC only.
 
+#[cfg(test)]
+mod netsim;
 mod rendezvous;
 
 use std::net::SocketAddr;
