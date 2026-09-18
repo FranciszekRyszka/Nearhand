@@ -125,8 +125,10 @@ impl VideoConverter {
     ///
     /// `visible` matters for decoded frames: H.264 codes whole 16-pixel
     /// macroblocks, so a 1080-line picture decodes to a 1088-line surface whose
-    /// last 8 lines are padding. `target` must be `output_size`, in a format
-    /// the conversion produces, and bindable as a render target.
+    /// last 8 lines are padding. `target` must be at least `output_size`, in
+    /// a format the conversion produces, and bindable as a render target; a
+    /// larger target is written only in its top-left `output_size` corner,
+    /// which lets one set of textures serve pictures of several sizes.
     pub fn convert(
         &mut self,
         source: &ID3D11Texture2D,
@@ -168,6 +170,31 @@ impl VideoConverter {
                 0,
                 crop,
                 Some(&rect),
+            );
+        }
+
+        let mut target_desc = D3D11_TEXTURE2D_DESC::default();
+        unsafe { target.GetDesc(&mut target_desc) };
+        let corner = (target_desc.Width, target_desc.Height) != self.output_size;
+        let region = RECT {
+            left: 0,
+            top: 0,
+            right: self.output_size.0 as i32,
+            bottom: self.output_size.1 as i32,
+        };
+        unsafe {
+            // Without both, the processor scales the picture to fill the
+            // whole target.
+            self.video_context.VideoProcessorSetOutputTargetRect(
+                &self.processor,
+                corner,
+                Some(&region),
+            );
+            self.video_context.VideoProcessorSetStreamDestRect(
+                &self.processor,
+                0,
+                corner,
+                Some(&region),
             );
         }
 

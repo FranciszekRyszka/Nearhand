@@ -1,5 +1,10 @@
 //! Drawing the video: one textured quad, aspect-fitted into the window.
 //!
+//! The slots are sized for the host's largest monitor, and a picture from a
+//! smaller one fills only their top-left corner. The quad samples just that
+//! corner, so switching monitors changes two numbers here rather than
+//! rebuilding textures shared between two graphics APIs.
+//!
 //! Both the slots and the swap chain are plain (non-sRGB) BGRA, so sampling
 //! and writing pass pixel values straight through with no gamma conversion —
 //! the colours on screen are the colours the host rendered.
@@ -8,8 +13,13 @@ use wgpu::util::DeviceExt;
 
 const SHADER: &str = r#"
 struct Fit {
+    // The quad's size in the window, in clip space.
     scale: vec2<f32>,
-    offset: vec2<f32>,
+    // The part of the slot the picture occupies, and the furthest texel
+    // centre inside it, so filtering never reaches stale pixels beyond.
+    uv_scale: vec2<f32>,
+    uv_max: vec2<f32>,
+    _pad: vec2<f32>,
 };
 
 @group(0) @binding(0) var frame: texture_2d<f32>;
@@ -30,14 +40,14 @@ fn vs_main(@builtin(vertex_index) index: u32) -> VertexOut {
     let corner = corners[index];
     let ndc = vec2<f32>(corner.x * 2.0 - 1.0, 1.0 - corner.y * 2.0);
     var out: VertexOut;
-    out.position = vec4<f32>(ndc * fit.scale + fit.offset, 0.0, 1.0);
-    out.uv = corner;
+    out.position = vec4<f32>(ndc * fit.scale, 0.0, 1.0);
+    out.uv = corner * fit.uv_scale;
     return out;
 }
 
 @fragment
 fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
-    return vec4<f32>(textureSample(frame, frame_sampler, in.uv).rgb, 1.0);
+    return vec4<f32>(textureSample(frame, frame_sampler, min(in.uv, fit.uv_max)).rgb, 1.0);
 }
 "#;
 
@@ -46,7 +56,10 @@ pub struct VideoRenderer {
     fit: wgpu::Buffer,
     /// One per ring slot, built once.
     bind_groups: Vec<wgpu::BindGroup>,
-    video_size: (u32, u32),
+    slot_size: (u32, u32),
+    /// The picture now in the slots, and the window it is fitted into.
+    content: (u32, u32),
+    window: (u32, u32),
 }
 
 impl VideoRenderer {
@@ -54,7 +67,7 @@ impl VideoRenderer {
         device: &wgpu::Device,
         target_format: wgpu::TextureFormat,
         slots: &[wgpu::Texture],
-        video_size: (u32, u32),
+        slot_size: (u32, u32),
     ) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("video"),
@@ -82,7 +95,7 @@ impl VideoRenderer {
                 },
                 wgpu::BindGroupLayoutEntry {
                     binding: 2,
-                    visibility: wgpu::ShaderStages::VERTEX,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
@@ -131,7 +144,7 @@ impl VideoRenderer {
 
         let fit = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("video fit"),
-            contents: &fit_uniform(video_size, video_size),
+            contents: &fit_uniform(slot_size, slot_size, slot_size),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
@@ -164,13 +177,33 @@ impl VideoRenderer {
             pipeline,
             fit,
             bind_groups,
-            video_size,
+            slot_size,
+            content: slot_size,
+            window: slot_size,
         }
     }
 
     /// Re-fit the video after the window changed size.
-    pub fn resize(&self, queue: &wgpu::Queue, window: (u32, u32)) {
-        queue.write_buffer(&self.fit, 0, &fit_uniform(self.video_size, window));
+    pub fn resize(&mut self, queue: &wgpu::Queue, window: (u32, u32)) {
+        self.window = window;
+        self.write(queue);
+    }
+
+    /// The size of the picture in the slots, which changes with the monitor
+    /// being watched. Cheap when nothing changed.
+    pub fn set_content(&mut self, queue: &wgpu::Queue, content: (u32, u32)) {
+        if content != self.content {
+            self.content = content;
+            self.write(queue);
+        }
+    }
+
+    fn write(&self, queue: &wgpu::Queue) {
+        queue.write_buffer(
+            &self.fit,
+            0,
+            &fit_uniform(self.content, self.window, self.slot_size),
+        );
     }
 
     pub fn draw(&self, pass: &mut wgpu::RenderPass<'_>, slot: usize) {
@@ -180,14 +213,26 @@ impl VideoRenderer {
     }
 }
 
-/// Scale and offset that fit `video` inside `window`, keeping its aspect
-/// ratio and centring it — as raw bytes for the uniform buffer.
-fn fit_uniform(video: (u32, u32), window: (u32, u32)) -> [u8; 16] {
+/// The `Fit` uniform: `video` fitted inside `window`, keeping its aspect ratio
+/// and centred, sampled from the top-left corner of a `slot`-sized texture.
+fn fit_uniform(video: (u32, u32), window: (u32, u32), slot: (u32, u32)) -> [u8; 32] {
     let (scale_x, scale_y) = fit_scale(video, window);
-    let mut bytes = [0u8; 16];
-    bytes[0..4].copy_from_slice(&scale_x.to_le_bytes());
-    bytes[4..8].copy_from_slice(&scale_y.to_le_bytes());
-    // Offset stays zero: the quad is centred on the origin already.
+    let (sw, sh) = (slot.0.max(1) as f32, slot.1.max(1) as f32);
+    let (vw, vh) = (video.0.min(slot.0) as f32, video.1.min(slot.1) as f32);
+    let values = [
+        scale_x,
+        scale_y,
+        vw / sw,
+        vh / sh,
+        (vw - 0.5).max(0.5) / sw,
+        (vh - 0.5).max(0.5) / sh,
+        0.0,
+        0.0,
+    ];
+    let mut bytes = [0u8; 32];
+    for (chunk, value) in bytes.as_chunks_mut::<4>().0.iter_mut().zip(values) {
+        chunk.copy_from_slice(&value.to_le_bytes());
+    }
     bytes
 }
 
@@ -201,6 +246,30 @@ fn fit_scale(video: (u32, u32), window: (u32, u32)) -> (f32, f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn floats(bytes: [u8; 32]) -> Vec<f32> {
+        bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&c| f32::from_le_bytes(c))
+            .collect()
+    }
+
+    #[test]
+    fn a_smaller_picture_samples_only_its_corner_of_the_slot() {
+        let f = floats(fit_uniform((1920, 1080), (1920, 1080), (2560, 1440)));
+        assert_eq!(&f[0..2], &[1.0, 1.0]);
+        assert_eq!(&f[2..4], &[0.75, 0.75]);
+        assert!((f[4] - 1919.5 / 2560.0).abs() < 1e-6);
+        assert!((f[5] - 1079.5 / 1440.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_full_size_picture_samples_the_whole_slot() {
+        let f = floats(fit_uniform((2560, 1440), (1280, 720), (2560, 1440)));
+        assert_eq!(&f[0..4], &[1.0, 1.0, 1.0, 1.0]);
+    }
 
     #[test]
     fn same_aspect_fills_the_window() {

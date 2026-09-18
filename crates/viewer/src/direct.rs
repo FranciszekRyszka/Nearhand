@@ -21,7 +21,7 @@ use nearhand_core::clock::ClockSync;
 use nearhand_core::proto::close;
 use nearhand_core::video::{AssembledFrame, Reassembler, ReassemblyStats, decode_chunk};
 use nearhand_core::{
-    Caps, Clipboard, Codec, Control, Cursor, Input, PROTOCOL_VERSION, StreamKind, wire,
+    Caps, Clipboard, Codec, Control, Cursor, Input, Monitor, PROTOCOL_VERSION, StreamKind, wire,
 };
 use nearhand_transport::{
     Fingerprint, client_endpoint, connect, recv_message, send_all, send_message,
@@ -69,6 +69,9 @@ pub struct NetSnapshot {
     pub keyframe_requests: u64,
     /// The watched monitor's size, once known.
     pub monitor_size: Option<(u32, u32)>,
+    /// The host's monitors, and which one is being watched.
+    pub monitors: Vec<Monitor>,
+    pub watching: u8,
 }
 
 /// State shared between the network task and the presenting side.
@@ -115,6 +118,8 @@ pub struct Options {
     pub cursor: Option<Box<dyn Fn(Cursor) + Send + Sync>>,
     /// Keep this machine's clipboard in step with the agent's.
     pub clipboard: bool,
+    /// Requests to watch another of the host's monitors, by id.
+    pub switch: Option<mpsc::UnboundedReceiver<u8>>,
     pub shared: Arc<Shared>,
 }
 
@@ -150,10 +155,19 @@ pub async fn run(options: Options) -> Result<()> {
     };
     match recv_message::<Control>(&mut recv).await? {
         Some(Control::MonitorList(monitors)) => {
-            if let Some(m) = monitors.iter().find(|m| m.id == options.monitor) {
-                let size = (u32::from(m.width), u32::from(m.height));
-                options.shared.update(|s| s.monitor_size = Some(size));
-            }
+            let Some(m) = monitors.iter().find(|m| m.id == options.monitor) else {
+                bail!(
+                    "the agent has no monitor {}; it has {}",
+                    options.monitor,
+                    monitors.len()
+                );
+            };
+            let size = (u32::from(m.width), u32::from(m.height));
+            options.shared.update(|s| {
+                s.monitor_size = Some(size);
+                s.monitors = monitors.clone();
+                s.watching = options.monitor;
+            });
             for m in &monitors {
                 let marker = if m.id == options.monitor { "▶" } else { " " };
                 let primary = if m.primary { " (primary)" } else { "" };
@@ -208,6 +222,7 @@ pub async fn run(options: Options) -> Result<()> {
         None => None,
     };
 
+    let mut switch = options.switch;
     let mut reassembler = Reassembler::new();
     let mut loss = LossSimulator::new(options.simulate_loss);
     let mut stats = Stats::new();
@@ -274,6 +289,7 @@ pub async fn run(options: Options) -> Result<()> {
                 }
                 Some(Ok(Control::MonitorList(monitors))) => {
                     tracing::info!(count = monitors.len(), "monitor list updated");
+                    options.shared.update(|s| s.monitors = monitors);
                 }
                 Some(Ok(other)) => tracing::debug!(?other, "control message"),
                 Some(Err(e)) => break Err(explain(&conn, e.into())),
@@ -311,6 +327,22 @@ pub async fn run(options: Options) -> Result<()> {
 
             _ = &mut ctrl_c => break Ok(()),
             _ = options.shared.stop.notified() => break Ok(()),
+
+            Some(monitor) = next_switch(&mut switch) => {
+                let known = options.shared.snapshot().monitors.iter().any(|m| m.id == monitor);
+                if known {
+                    // The agent restarts capture and encoding on the new
+                    // monitor, starting with a keyframe whose picture size
+                    // the decoder picks up by itself; frame ids carry on.
+                    send_message(
+                        &mut send,
+                        &Control::StartVideo { monitor, codec: Codec::H264, max_fps: options.fps },
+                    )
+                    .await?;
+                    options.shared.update(|s| s.watching = monitor);
+                    println!("watching monitor {monitor}");
+                }
+            }
         }
 
         keyframe_needed |= reassembler.take_keyframe_request();
@@ -458,6 +490,14 @@ async fn read_cursor(
         if let Some(sink) = &sink {
             sink(change);
         }
+    }
+}
+
+/// The next monitor switch request, or never if nothing can make one.
+async fn next_switch(switch: &mut Option<mpsc::UnboundedReceiver<u8>>) -> Option<u8> {
+    match switch {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
     }
 }
 

@@ -45,6 +45,7 @@ viewer                         agent
 
   (own stream) Input …     ──▶
                            ◀──  Cursor …  (own stream)
+  (own stream) Clipboard … ◀─▶  Clipboard …  (own stream)
 ```
 
 Messages on streams carry a 4-byte little-endian length prefix, then the
@@ -86,6 +87,15 @@ not wait for the screen to change.
 
 `capture_ts_us` rides along for the latency overlay: capture-to-present is
 measured end to end, RTT-corrected when the clocks are not synced.
+
+### Switching monitors
+
+`StartVideo` for another monitor mid-session stops capture and encoding on
+the old one and starts them on the new one. Frame ids carry on, and the new
+stream opens with a keyframe. The new picture size travels only in that
+keyframe's sequence parameter set, so a viewer's decoder must follow a
+resolution change mid-stream. The native viewer sizes its frame textures for
+the largest monitor in `MonitorList`, so a switch never rebuilds them.
 
 ### Known weakness: keyframe recovery under loss
 

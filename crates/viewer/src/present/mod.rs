@@ -10,8 +10,9 @@
 //! event; the pixels never move — see [`interop`]. Keyboard and mouse go the
 //! other way, through [`input`] to the network task.
 //!
-//! Every key goes to the agent except one local shortcut: Ctrl+Shift+F1
-//! toggles the latency overlay.
+//! Every key goes to the agent except two local shortcuts: Ctrl+Shift+F1
+//! toggles the latency overlay, and Ctrl+Shift+F2 watches the host's next
+//! monitor.
 //!
 //! Frames are drawn as soon as they arrive rather than on a vsync tick, and
 //! the swap chain is asked for mailbox or immediate presentation with a
@@ -59,7 +60,12 @@ pub enum UserEvent {
 
 pub struct Options {
     pub title: String,
+    /// The first monitor's size. Others may differ, up to `slot_size`.
     pub video_size: (u32, u32),
+    /// The host's largest monitor, which the frame slots are sized for.
+    pub slot_size: (u32, u32),
+    /// Where requests to watch another monitor go.
+    pub switch: UnboundedSender<u8>,
     pub frames: Receiver<Received>,
     pub shared: Arc<Shared>,
     /// Where the user's keyboard and mouse go.
@@ -123,7 +129,9 @@ struct Gpu {
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
     video: VideoRenderer,
+    /// The size of the picture on screen; follows monitor switches.
     video_size: (u32, u32),
+    switch: UnboundedSender<u8>,
     interop: RenderSide,
     shared: Arc<Shared>,
     egui_ctx: egui::Context,
@@ -218,8 +226,9 @@ impl App {
         surface.configure(&device, &config);
         tracing::info!(?format, ?present_mode, adapter = %adapter.get_info().name, "presenting");
 
-        let (decode_side, interop) = interop::create(&adapter, &device, options.video_size)?;
-        let video = VideoRenderer::new(&device, format, &interop.slots, options.video_size);
+        let (decode_side, interop) = interop::create(&adapter, &device, options.slot_size)?;
+        let mut video = VideoRenderer::new(&device, format, &interop.slots, options.slot_size);
+        video.set_content(&queue, options.video_size);
         video.resize(&queue, (config.width, config.height));
 
         let egui_ctx = egui::Context::default();
@@ -237,6 +246,7 @@ impl App {
         self.decode_thread = Some(decode::spawn(
             decode_side,
             options.video_size,
+            options.slot_size,
             options.frames,
             self.proxy.clone(),
             options.shared.clone(),
@@ -250,6 +260,7 @@ impl App {
             config,
             video,
             video_size: options.video_size,
+            switch: options.switch,
             interop,
             shared: options.shared,
             egui_ctx,
@@ -288,6 +299,8 @@ impl App {
 
         if let Some(frame) = fresh {
             gpu.interop.wait_for_frame(frame.fence_value)?;
+            gpu.video.set_content(&gpu.queue, frame.size);
+            gpu.video_size = frame.size;
         }
         let showing = fresh.or(self.shown);
 
@@ -457,6 +470,23 @@ impl ApplicationHandler<UserEvent> for App {
                     gpu.window.request_redraw();
                 }
             }
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        physical_key: PhysicalKey::Code(KeyCode::F2),
+                        state: ElementState::Pressed,
+                        repeat: false,
+                        ..
+                    },
+                ..
+            } if self.modifiers == ModifiersState::CONTROL | ModifiersState::SHIFT => {
+                if let Some(gpu) = &self.gpu {
+                    let net = gpu.shared.snapshot();
+                    if let Some(next) = next_monitor(&net.monitors, net.watching) {
+                        let _ = gpu.switch.send(next);
+                    }
+                }
+            }
             // Synthetic events are winit's bookkeeping for keys pressed
             // while the window was not focused; the agent never saw those.
             WindowEvent::KeyboardInput {
@@ -546,4 +576,43 @@ fn custom_cursor(event_loop: &ActiveEventLoop, shape: CursorShape) -> Result<Cus
         shape.hot_y,
     )?;
     Ok(event_loop.create_custom_cursor(source))
+}
+
+/// The monitor after `watching` in id order, wrapping round; `None` when
+/// there is nowhere else to go.
+fn next_monitor(monitors: &[nearhand_core::Monitor], watching: u8) -> Option<u8> {
+    let mut ids: Vec<u8> = monitors.iter().map(|m| m.id).collect();
+    ids.sort_unstable();
+    let next = ids
+        .iter()
+        .copied()
+        .find(|&id| id > watching)
+        .or(ids.first().copied())?;
+    (next != watching).then_some(next)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn monitors(ids: &[u8]) -> Vec<nearhand_core::Monitor> {
+        ids.iter()
+            .map(|&id| nearhand_core::Monitor {
+                id,
+                width: 1920,
+                height: 1080,
+                x: 0,
+                y: 0,
+                primary: id == 0,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn next_monitor_cycles_in_id_order() {
+        assert_eq!(next_monitor(&monitors(&[0, 1, 2]), 0), Some(1));
+        assert_eq!(next_monitor(&monitors(&[2, 0, 1]), 2), Some(0));
+        assert_eq!(next_monitor(&monitors(&[0]), 0), None);
+        assert_eq!(next_monitor(&[], 0), None);
+    }
 }

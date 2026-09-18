@@ -98,6 +98,7 @@ fn main() -> Result<()> {
                 input: None,
                 cursor: None,
                 clipboard: false,
+                switch: None,
                 shared: Arc::new(Shared::default()),
             };
             if headless {
@@ -123,6 +124,8 @@ fn windowed(mut options: direct::Options) -> Result<()> {
     let event_loop = present::event_loop()?;
     let proxy = event_loop.create_proxy();
     options.clipboard = true;
+    let (switch_tx, switch_rx) = tokio::sync::mpsc::unbounded_channel();
+    options.switch = Some(switch_rx);
     options.cursor = Some(Box::new(move |change| {
         let _ = proxy.send_event(present::UserEvent::Cursor(change));
     }));
@@ -154,14 +157,23 @@ fn windowed(mut options: direct::Options) -> Result<()> {
         std::thread::sleep(Duration::from_millis(10));
     };
 
+    // Slots big enough for any of the host's monitors, so switching between
+    // them never has to rebuild the textures shared with the decoder.
+    let monitors = shared.snapshot().monitors;
+    let slot_size = monitors.iter().fold(video_size, |(w, h), m| {
+        (w.max(u32::from(m.width)), h.max(u32::from(m.height)))
+    });
+
     let windowed = present::run(
         event_loop,
         present::Options {
             title,
             video_size,
+            slot_size,
             frames: frames_rx,
             shared: shared.clone(),
             input: input_tx,
+            switch: switch_tx,
             runtime: runtime.handle().clone(),
             seconds,
         },

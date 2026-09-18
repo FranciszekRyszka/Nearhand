@@ -163,6 +163,20 @@ pub fn show(ctx: &egui::Context, video: (u32, u32), summary: &Summary, net: &Net
                         _ => "clock offset: measuring…".to_owned(),
                     };
                     text(ui, clock);
+                    if net.monitors.len() > 1 {
+                        let list: Vec<String> = net
+                            .monitors
+                            .iter()
+                            .map(|m| {
+                                let mark = if m.id == net.watching { "▶" } else { "" };
+                                format!("{mark}{}", m.id)
+                            })
+                            .collect();
+                        text(
+                            ui,
+                            format!("monitor {}   Ctrl+Shift+F2 next", list.join(" ")),
+                        );
+                    }
                     let r = &net.reassembly;
                     text(
                         ui,
@@ -194,6 +208,7 @@ mod tests {
             received_us: received,
             decoded_us: decoded,
             skipped: 0,
+            size: (1920, 1080),
         }
     }
 

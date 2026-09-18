@@ -39,11 +39,16 @@ pub struct FrameReady {
     pub decoded_us: u64,
     /// Frames decoded but never shown because a newer one was already queued.
     pub skipped: u32,
+    /// The picture's size: the top-left corner of the slot it fills.
+    pub size: (u32, u32),
 }
 
+/// `size` is the first picture's, for setting up; later pictures may differ,
+/// when the viewer switches monitors, but none may exceed `slot_size`.
 pub fn spawn(
     side: DecodeSide,
     size: (u32, u32),
+    slot_size: (u32, u32),
     frames: Receiver<Received>,
     proxy: EventLoopProxy<UserEvent>,
     shared: Arc<Shared>,
@@ -51,7 +56,7 @@ pub fn spawn(
     std::thread::Builder::new()
         .name("nearhand-decode".to_owned())
         .spawn(move || {
-            if let Err(e) = run(side, size, frames, &proxy, &shared) {
+            if let Err(e) = run(side, size, slot_size, frames, &proxy, &shared) {
                 let _ = proxy.send_event(UserEvent::Failed(format!("{e:#}")));
             }
         })
@@ -61,6 +66,7 @@ pub fn spawn(
 fn run(
     side: DecodeSide,
     size: (u32, u32),
+    slot_size: (u32, u32),
     frames: Receiver<Received>,
     proxy: &EventLoopProxy<UserEvent>,
     shared: &Shared,
@@ -108,6 +114,27 @@ fn run(
             continue;
         };
 
+        // A new monitor: the decoder follows the stream by itself, the
+        // converter is rebuilt for the new output size.
+        let picture = (decoded.width, decoded.height);
+        if picture.0 > slot_size.0 || picture.1 > slot_size.1 {
+            tracing::warn!(
+                ?picture,
+                ?slot_size,
+                "picture larger than the slots; not shown"
+            );
+            unshown += skipped + 1;
+            continue;
+        }
+        if converter.output_size() != picture {
+            tracing::info!(
+                width = picture.0,
+                height = picture.1,
+                "picture size changed"
+            );
+            converter = VideoConverter::new(&side.device, Conversion::NV12_TO_RGB, picture, 60)?;
+        }
+
         let value = next_value;
         let slot = (value as usize - 1) % SLOTS;
         // The renderer is behind. The frame is decoded, which is all the next
@@ -147,6 +174,7 @@ fn run(
             received_us,
             decoded_us: nearhand_capture::clock::now_us(),
             skipped: skipped + std::mem::take(&mut unshown),
+            size: picture,
         };
         if proxy.send_event(UserEvent::Frame(ready)).is_err() {
             return Ok(()); // The window is gone.
