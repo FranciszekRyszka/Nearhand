@@ -98,6 +98,57 @@ On loopback the round trip is under a millisecond, so these runs show the
 mechanism rather than its cost on a real WAN. There, each repair costs about
 one round trip on top.
 
+## Rate control
+
+The agent re-decides the video bitrate and frame rate every 500 ms
+(`crates/agent/src/rate.rs`). Its signals, in order:
+
+1. **Its own send backlog.** Video waiting in QUIC's datagram buffer is exact
+   and immediate. Over about 150 ms of it, the sender stops taking frames, so
+   capture pauses rather than queueing stale frames.
+2. **Queueing delay.** This is QUIC's smoothed round trip over the lowest
+   smoothed value of the last 10 s.
+3. **Loss**, as QUIC counts it. Repairable random loss up to 10% holds the
+   rate rather than cutting it.
+
+The frame rate follows how much of the budget the encoder uses: it goes up
+when there is room, and down only when frames would get too few bits for sharp
+text. The encoder's rate-control buffer is capped at 250 ms, so a keyframe
+cannot burst to many times the average frame.
+
+Measured through `netem` (below) on loopback, release build, 2560×1440 under
+the same ~30 fps load, 30 s per run. The agent's ceiling is 10 Mbit/s:
+
+| Link | Frames (fps) | Given up | Keyframe requests | Latency p50 / p95 | Bitrate target |
+| --- | --- | --- | --- | --- | --- |
+| No limit, no delay | 1353 (43) | 0 | 0 | 16 / 27 ms | 10 Mbit/s throughout |
+| 3 Mbit/s, 20 ms each way, 100 ms queue | 846 (27) | 25 | 8 | 51 / 98 ms | 0.7–4.5 Mbit/s |
+| 20 ms each way, 5% loss both ways | 1135 (36) | 19 | 8 | 89 / 169 ms | 10 Mbit/s throughout |
+
+The latency figures include the link's own 40 ms round trip.
+
+What it took to get there, each step found by measuring:
+
+| Problem | Effect | Fix |
+| --- | --- | --- |
+| QUIC's 4 MB datagram buffer filled during an early burst, then drained at link rate for seconds | the link's queue stayed full long after the target had dropped; target fell to the 300 kbit/s floor at 5 fps | read the backlog; back off on it and stop taking frames while it is long |
+| Kept cutting while the queue was already draining | same collapse, more slowly | never back off while the round trip is falling; wait 1 s between back-offs |
+| Frame rate derived from pixel count, as if every frame changed the whole screen | 11 fps while using a third of the budget | frame rate follows budget use |
+| Baseline was QUIC's lifetime minimum RTT, one lucky sample | ordinary jitter read as a queue | lowest smoothed RTT of the last 10 s |
+| Uncapped keyframes of several hundred KB | each overflowed a 3 Mbit/s link's queue and asked for the next | 250 ms rate-control buffer |
+| Climbed 8% a step straight through the level that last overflowed | a sawtooth with latency spikes | 2% steps near that level for 10 s |
+| quinn's default Cubic treats every loss as congestion | at 5% random loss: 6.5 fps and a 300 kbit/s target | BBR |
+
+On BBR: with Cubic instead, the 3 Mbit/s link does a little better (1 frame
+given up, 3 keyframe requests, p95 76 ms). BBR briefly probes about 25% above
+the link rate, which a queue as shallow as 100 ms punishes. But at 5% random
+loss Cubic delivers 6.5 fps where BBR delivers 36, and random loss is what
+Wi-Fi does. quinn marks its BBR as experimental. It decides only how fast
+packets leave, never what they say.
+
+Known limit: a queue that stands for more than 10 s becomes the new baseline.
+Loss and the send backlog still catch the overflow, but later than delay would.
+
 ## Reproducing
 
 ```bash
@@ -106,4 +157,18 @@ nearhand-viewer direct 127.0.0.1:4433 --fingerprint <printed> --seconds 10
 ```
 
 The viewer prints a latency summary every two seconds, and the overlay
-(Ctrl+Shift+F1) shows the same figures live.
+(Ctrl+Shift+F1) shows the same figures live. `--simulate-loss N` makes the
+viewer discard N% of arriving video datagrams.
+
+For a slower or lossier link, put the `netem` example between the two. It is a
+UDP forwarder with a bandwidth cap, a tail-drop queue, delay and loss:
+
+```bash
+cargo run --release -p nearhand-transport --example netem -- \
+    --listen 127.0.0.1:5000 --upstream 127.0.0.1:4433 \
+    --down-kbps 3000 --delay-ms 20 --queue-ms 100 --loss 0
+nearhand-viewer direct 127.0.0.1:5000 --fingerprint <printed>
+```
+
+`nearhand-agent listen -v` logs every rate-control interval: target, what was
+sent, round trip, and how the interval was read.

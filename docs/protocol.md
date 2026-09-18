@@ -108,6 +108,13 @@ Before repair existed, keyframes were the only recovery, and 2% loss let 19 of
 312 frames through. `docs/performance.md` has the measurements before and
 after.
 
+### Rate
+
+The agent picks the bitrate and frame rate itself, from what QUIC reports and
+its own send backlog (`docs/performance.md`, "Rate control"). `SetQuality`
+from the viewer sets a ceiling that rate control stays under, not a fixed
+rate. The frame rate asked for in `StartVideo` is a ceiling too.
+
 ### Switching monitors
 
 `StartVideo` for another monitor mid-session stops capture and encoding on

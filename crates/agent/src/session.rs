@@ -23,6 +23,7 @@
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
@@ -35,11 +36,12 @@ use nearhand_core::{
 use nearhand_transport::{recv_message, send_all, send_message};
 use quinn::{Connection, RecvStream};
 use serde::Serialize;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
 use crate::input::Injection;
-use crate::pipeline::{Pipeline, Settings};
+use crate::pipeline::{Pipeline, QualityControl, Settings};
+use crate::rate::{self, Quality, RateController};
 
 /// Highest frame rate a viewer may ask for.
 const MAX_FPS: u8 = 120;
@@ -50,12 +52,17 @@ const MAX_FPS: u8 = 120;
 const SENT_FRAMES: usize = 64;
 const SENT_BYTES: usize = 16 * 1024 * 1024;
 
+/// How often a backlogged sender looks again. Short against a frame interval,
+/// long against the cost of asking.
+const BACKLOG_POLL: Duration = Duration::from_millis(2);
+
 /// Stream priorities, highest first. Clipboard text can be large and must
 /// never hold up the pointer.
 const CURSOR_PRIORITY: i32 = 0;
 const CLIPBOARD_PRIORITY: i32 = -1;
 
 pub struct SessionConfig {
+    /// The most video bitrate to use; rate control picks what the link takes.
     pub bitrate_kbps: u32,
 }
 
@@ -64,6 +71,9 @@ pub struct SessionConfig {
 struct VideoStats {
     /// Where the next stream in this session continues numbering.
     next_frame_id: u32,
+    /// The rate control's target when it ended, for the next stream to
+    /// start from.
+    target_kbps: u32,
     frames: u64,
     keyframes: u64,
     datagrams: u64,
@@ -76,8 +86,9 @@ struct Video {
 }
 
 impl Video {
-    /// Stop, and return the frame id the next stream should start from.
-    async fn stop(self) -> Option<u32> {
+    /// Stop, and return the frame id and bitrate the next stream should
+    /// start from.
+    async fn stop(self) -> Option<(u32, u32)> {
         self.pipeline.stop().await;
         // The pipeline dropped its end of the frame channel, so the sender
         // drains and finishes on its own.
@@ -87,9 +98,10 @@ impl Video {
             keyframes = stats.keyframes,
             datagrams = stats.datagrams,
             kib = stats.bytes / 1024,
+            kbps = stats.target_kbps,
             "video stream ended"
         );
-        Some(stats.next_frame_id)
+        Some((stats.next_frame_id, stats.target_kbps))
     }
 }
 
@@ -181,6 +193,12 @@ pub async fn serve(conn: Connection, config: &SessionConfig) -> Result<()> {
     ));
 
     let sent = Arc::new(Mutex::new(Sent::default()));
+    // What the viewer allows at most; rate control stays under it.
+    let (ceiling, _) = watch::channel(Quality {
+        bitrate_kbps: config.bitrate_kbps,
+        fps: MAX_FPS,
+    });
+    let mut start_kbps = config.bitrate_kbps;
     let mut video: Option<Video> = None;
     // Frame ids run on across streams: switching monitors must not reset them,
     // or the viewer would take the new stream for late chunks of the old one.
@@ -200,9 +218,10 @@ pub async fn serve(conn: Connection, config: &SessionConfig) -> Result<()> {
                 max_fps,
             }) => {
                 if let Some(running) = video.take()
-                    && let Some(next) = running.stop().await
+                    && let Some((next, kbps)) = running.stop().await
                 {
                     next_frame_id = next;
+                    start_kbps = kbps;
                 }
                 if !monitors.iter().any(|m| m.id == monitor) {
                     conn.close(close::PROTOCOL.into(), b"no such monitor");
@@ -212,15 +231,20 @@ pub async fn serve(conn: Connection, config: &SessionConfig) -> Result<()> {
                     conn.close(close::PROTOCOL.into(), b"codec not offered");
                     break Err(anyhow::anyhow!("viewer asked for {codec:?}"));
                 }
+                ceiling.send_modify(|c| c.fps = max_fps.clamp(1, MAX_FPS));
                 let settings = Settings {
                     monitor,
                     codec,
-                    max_fps: max_fps.clamp(1, MAX_FPS),
-                    bitrate_kbps: config.bitrate_kbps,
+                    max_fps: ceiling.borrow().fps,
+                    bitrate_kbps: start_kbps,
                 };
-                match start_video(&conn, settings, next_frame_id, cursor.clone(), sent.clone())
-                    .await
-                {
+                let stream = Stream {
+                    first_frame_id: next_frame_id,
+                    cursor: cursor.clone(),
+                    sent: sent.clone(),
+                    ceiling: ceiling.subscribe(),
+                };
+                match start_video(&conn, settings, stream).await {
                     Ok(started) => {
                         video = Some(started);
                         if let (Some(input), Some(m)) =
@@ -243,13 +267,14 @@ pub async fn serve(conn: Connection, config: &SessionConfig) -> Result<()> {
                 }
             }
 
+            // A ceiling for rate control, which picks what the link takes
+            // beneath it.
             Some(Control::SetQuality { bitrate_kbps, fps }) => {
-                if let Some(running) = &video
-                    && bitrate_kbps > 0
-                {
-                    running
-                        .pipeline
-                        .set_quality(bitrate_kbps, fps.clamp(1, MAX_FPS));
+                if bitrate_kbps > 0 {
+                    ceiling.send_replace(Quality {
+                        bitrate_kbps,
+                        fps: fps.clamp(1, MAX_FPS),
+                    });
                 }
             }
 
@@ -410,6 +435,17 @@ async fn read_clipboard(
     }
 }
 
+/// Bytes of video waiting in QUIC's datagram send buffer.
+fn backlog(conn: &Connection) -> usize {
+    nearhand_transport::DATAGRAM_BUFFER.saturating_sub(conn.datagram_send_buffer_space())
+}
+
+/// A stream's rate controller and the pipeline it steers.
+struct Rate {
+    rate: RateController,
+    control: QualityControl,
+}
+
 /// Recently sent frames, as the datagrams that carried them.
 #[derive(Debug, Default)]
 struct Sent {
@@ -456,14 +492,16 @@ fn closed_normally(conn: &Connection) -> bool {
     )
 }
 
-async fn start_video(
-    conn: &Connection,
-    settings: Settings,
+/// What a video stream shares with the session around it.
+struct Stream {
     first_frame_id: u32,
     cursor: mpsc::UnboundedSender<Cursor>,
     sent: Arc<Mutex<Sent>>,
-) -> Result<Video> {
-    let started = Pipeline::start(settings, cursor).await?;
+    ceiling: watch::Receiver<Quality>,
+}
+
+async fn start_video(conn: &Connection, settings: Settings, stream: Stream) -> Result<Video> {
+    let started = Pipeline::start(settings, stream.cursor.clone()).await?;
     tracing::info!(
         monitor = settings.monitor,
         width = started.width,
@@ -472,11 +510,22 @@ async fn start_video(
         kbps = settings.bitrate_kbps,
         "video started"
     );
+    let rate = RateController::new(
+        *stream.ceiling.borrow(),
+        settings.bitrate_kbps,
+        started.width,
+        started.height,
+    );
+    let control = started.pipeline.quality_control();
+    let initial = rate.initial();
+    if (initial.bitrate_kbps, initial.fps) != (settings.bitrate_kbps, settings.max_fps) {
+        control.set(initial.bitrate_kbps, initial.fps);
+    }
     let sender = tokio::spawn(send_video(
         conn.clone(),
         started.frames,
-        first_frame_id,
-        sent,
+        stream,
+        Rate { rate, control },
     ));
     Ok(Video {
         pipeline: started.pipeline,
@@ -497,15 +546,77 @@ async fn start_video(
 async fn send_video(
     conn: Connection,
     mut frames: mpsc::Receiver<nearhand_codec::EncodedFrame>,
-    first_frame_id: u32,
-    sent: Arc<Mutex<Sent>>,
+    mut stream: Stream,
+    rate: Rate,
 ) -> VideoStats {
+    let Rate {
+        rate: mut controller,
+        control,
+    } = rate;
+    let sent = stream.sent.clone();
     let mut stats = VideoStats {
-        next_frame_id: first_frame_id,
+        next_frame_id: stream.first_frame_id,
+        target_kbps: controller.target_kbps(),
         ..VideoStats::default()
     };
+    let mut ticker = tokio::time::interval(rate::INTERVAL);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut last_sample = tokio::time::Instant::now();
+    let mut bytes_at_sample = 0;
 
-    while let Some(frame) = frames.recv().await {
+    loop {
+        // While QUIC still holds a lot to send, take no more frames: the
+        // frame queue fills, capture pauses, and the frame taken next is
+        // fresh. Nothing encoded is dropped, so the reference chain holds.
+        let backlogged = backlog(&conn) > rate::backlog_limit(controller.target_kbps());
+        let frame = tokio::select! {
+            frame = frames.recv(), if !backlogged => match frame {
+                Some(frame) => frame,
+                None => break,
+            },
+            _ = tokio::time::sleep(BACKLOG_POLL), if backlogged => continue,
+            _ = ticker.tick() => {
+                let path = conn.stats().path;
+                let sample = rate::Sample {
+                    backlog_bytes: backlog(&conn) as u64,
+                    rtt: path.rtt,
+                    sent_packets: path.sent_packets,
+                    lost_packets: path.lost_packets,
+                    sent_bytes: stats.bytes,
+                };
+                let elapsed = last_sample.elapsed();
+                last_sample = tokio::time::Instant::now();
+                tracing::debug!(
+                    target_kbps = controller.target_kbps(),
+                    sent_kbps = (stats.bytes - bytes_at_sample) * 8 / 1000 * 1000
+                        / (elapsed.as_millis().max(1) as u64),
+                    rtt_ms = path.rtt.as_millis() as u64,
+                    reading = ?controller.last_reading(),
+                    "rate sample"
+                );
+                bytes_at_sample = stats.bytes;
+                if let Some(quality) = controller.update(sample, elapsed) {
+                    tracing::info!(
+                        kbps = quality.bitrate_kbps,
+                        fps = quality.fps,
+                        rtt_ms = sample.rtt.as_secs_f64() * 1000.0,
+                        baseline_rtt_ms = controller.baseline_rtt().as_secs_f64() * 1000.0,
+                        "rate changed"
+                    );
+                    control.set(quality.bitrate_kbps, quality.fps);
+                }
+                stats.target_kbps = controller.target_kbps();
+                continue;
+            }
+            Ok(()) = stream.ceiling.changed() => {
+                let ceiling = *stream.ceiling.borrow_and_update();
+                if let Some(quality) = controller.set_ceiling(ceiling) {
+                    control.set(quality.bitrate_kbps, quality.fps);
+                }
+                stats.target_kbps = controller.target_kbps();
+                continue;
+            }
+        };
         let frame_id = stats.next_frame_id;
         stats.next_frame_id = frame_id.wrapping_add(1);
 

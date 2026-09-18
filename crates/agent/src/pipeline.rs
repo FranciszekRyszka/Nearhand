@@ -38,6 +38,17 @@ enum Command {
     Quality { bitrate_kbps: u32, fps: u8 },
 }
 
+/// Changes a running pipeline's bitrate and frame rate.
+#[derive(Clone)]
+pub struct QualityControl(mpsc::Sender<Command>);
+
+impl QualityControl {
+    pub fn set(&self, bitrate_kbps: u32, fps: u8) {
+        // Fails only once the pipeline has stopped.
+        let _ = self.0.send(Command::Quality { bitrate_kbps, fps });
+    }
+}
+
 /// A running pipeline. Stop it with [`Pipeline::stop`]; dropping it also
 /// stops the thread, just without waiting for it.
 pub struct Pipeline {
@@ -92,8 +103,10 @@ impl Pipeline {
         let _ = self.commands.send(Command::Keyframe);
     }
 
-    pub fn set_quality(&self, bitrate_kbps: u32, fps: u8) {
-        let _ = self.commands.send(Command::Quality { bitrate_kbps, fps });
+    /// A handle that can change the quality from another task — the rate
+    /// controller's — for as long as the pipeline runs.
+    pub fn quality_control(&self) -> QualityControl {
+        QualityControl(self.commands.clone())
     }
 
     /// Stop the thread and wait for it, so its capture duplication and

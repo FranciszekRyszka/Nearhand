@@ -48,11 +48,11 @@ use windows::Win32::Graphics::Direct3D11::{
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_NV12;
 use windows::Win32::Media::MediaFoundation::{
-    CODECAPI_AVEncCommonMeanBitRate, CODECAPI_AVEncCommonRateControlMode,
-    CODECAPI_AVEncMPVDefaultBPictureCount, CODECAPI_AVEncMPVGOPSize,
-    CODECAPI_AVEncVideoForceKeyFrame, CODECAPI_AVLowLatencyMode, ICodecAPI, IMF2DBuffer,
-    IMFDXGIDeviceManager, IMFMediaEventGenerator, IMFMediaType, IMFSample, IMFShutdown,
-    IMFTransform, MEDIA_EVENT_GENERATOR_GET_EVENT_FLAGS, METransformHaveOutput,
+    CODECAPI_AVEncCommonBufferSize, CODECAPI_AVEncCommonMeanBitRate,
+    CODECAPI_AVEncCommonRateControlMode, CODECAPI_AVEncMPVDefaultBPictureCount,
+    CODECAPI_AVEncMPVGOPSize, CODECAPI_AVEncVideoForceKeyFrame, CODECAPI_AVLowLatencyMode,
+    ICodecAPI, IMF2DBuffer, IMFDXGIDeviceManager, IMFMediaEventGenerator, IMFMediaType, IMFSample,
+    IMFShutdown, IMFTransform, MEDIA_EVENT_GENERATOR_GET_EVENT_FLAGS, METransformHaveOutput,
     METransformNeedInput, MF_E_TRANSFORM_STREAM_CHANGE, MF_LOW_LATENCY, MF_MT_AVG_BITRATE,
     MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE,
     MF_MT_MPEG2_PROFILE, MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE, MF_MT_TRANSFER_FUNCTION,
@@ -479,6 +479,13 @@ impl Session {
             let bps = bitrate_kbps.saturating_mul(1000);
             unsafe { api.SetValue(&CODECAPI_AVEncCommonMeanBitRate, &variant_u32(bps)) }
                 .map_err(|e| backend("CODECAPI_AVEncCommonMeanBitRate", e))?;
+            // Best-effort, as at setup: without it only bursts get larger.
+            let _ = unsafe {
+                api.SetValue(
+                    &CODECAPI_AVEncCommonBufferSize,
+                    &variant_u32(vbv_bits(bitrate_kbps)),
+                )
+            };
         }
         // The frame rate in the media type is fixed for the session; changing it
         // would mean renegotiating mid-stream. Sample durations are what rate
@@ -521,7 +528,7 @@ impl Drop for Session {
 /// quality or latency rather than breaking the stream.
 fn configure_low_latency(api: &ICodecAPI, config: &EncoderConfig, name: &str) {
     let gop = u32::from(config.max_fps).saturating_mul(3600);
-    let settings: [(&str, GUID, VARIANT); 5] = [
+    let settings: [(&str, GUID, VARIANT); 6] = [
         ("low latency", CODECAPI_AVLowLatencyMode, variant_bool(true)),
         (
             "CBR",
@@ -541,12 +548,31 @@ fn configure_low_latency(api: &ICodecAPI, config: &EncoderConfig, name: &str) {
         // An hour of frames at full rate. Capture only produces frames on
         // change, so in practice keyframes come only when the viewer asks.
         ("GOP", CODECAPI_AVEncMPVGOPSize, variant_u32(gop)),
+        (
+            "VBV buffer",
+            CODECAPI_AVEncCommonBufferSize,
+            variant_u32(vbv_bits(config.bitrate_kbps)),
+        ),
     ];
     for (what, key, value) in settings {
         if let Err(e) = unsafe { api.SetValue(&key, &value) } {
             tracing::warn!(encoder = %name, setting = what, error = %e, "encoder rejected setting");
         }
     }
+}
+
+/// How much a single frame may exceed its share of the bitrate: the rate
+/// control's buffer, as this much of the bitrate.
+///
+/// Without a cap a keyframe comes out many times the average frame — at 1440p
+/// a few hundred kilobytes, nearly a second of a 3 Mbit/s link. It then
+/// overflows the bottleneck's queue, its chunks are dropped faster than they
+/// can be repaired, and the next keyframe request does the same again. Capped,
+/// a keyframe starts a little soft and sharpens over the next frames.
+const VBV_WINDOW_MS: u32 = 250;
+
+fn vbv_bits(bitrate_kbps: u32) -> u32 {
+    bitrate_kbps.saturating_mul(VBV_WINDOW_MS)
 }
 
 fn h264_type(config: &EncoderConfig, width: u32, height: u32) -> Result<IMFMediaType> {

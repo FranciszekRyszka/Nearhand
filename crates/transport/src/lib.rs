@@ -39,7 +39,11 @@ pub const SERVER_NAME: &str = "nearhand-agent";
 /// Room for a whole keyframe burst. `send_datagram` discards the oldest queued
 /// datagrams when this fills, which is the right policy for video, but it must
 /// not trigger on a single keyframe: a 300 KB IDR frame is ~250 datagrams.
-const DATAGRAM_BUFFER: usize = 4 * 1024 * 1024;
+///
+/// On a slow link this much is seconds of video, so the agent never lets it
+/// fill: it reads the backlog (this minus `datagram_send_buffer_space`) and
+/// stops taking frames while it is long.
+pub const DATAGRAM_BUFFER: usize = 4 * 1024 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -261,6 +265,13 @@ fn transport_config() -> Result<TransportConfig> {
         ))
         .datagram_send_buffer_size(DATAGRAM_BUFFER)
         .datagram_receive_buffer_size(Some(DATAGRAM_BUFFER));
+    // BBR rather than quinn's default Cubic. Cubic reads every lost packet as
+    // congestion, so random loss alone caps it: on a 40 ms path with 5% loss
+    // it could not send more than about 1.5 Mbit/s, and video fell to 6.5 fps.
+    // BBR paces to the bandwidth it measures and held 36 fps at full bitrate
+    // on the same path (docs/performance.md). quinn marks its BBR
+    // experimental; it only shapes how fast packets leave, not what they say.
+    config.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
     Ok(config)
 }
 

@@ -9,6 +9,7 @@
 
 mod input;
 mod pipeline;
+mod rate;
 mod session;
 
 use std::net::SocketAddr;

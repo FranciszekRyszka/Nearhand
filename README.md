@@ -4,7 +4,7 @@ A self-hosted, open-source remote desktop — an alternative to TeamViewer, AnyD
 
 There is no Nearhand-run infrastructure. Every install points at a server you run yourself.
 
-> **Status: pre-alpha, M1 started.** On Windows, the agent streams the screen to the viewer over QUIC with hardware encode and decode end to end: **12.5 ms capture-to-present p50** at 2560×1440 on loopback, against an 80 ms target ([details](docs/performance.md)). The viewer now controls the host's keyboard and mouse, shows the host's pointer as its own, syncs clipboard text both ways, and switches between the host's monitors (Ctrl+Shift+F2). No server, no macOS yet — see the roadmap below.
+> **Status: pre-alpha, M1 done.** On Windows, the agent streams the screen to the viewer over QUIC with hardware encode and decode end to end: **12.5 ms capture-to-present p50** at 2560×1440 on loopback, against an 80 ms target ([details](docs/performance.md)). The viewer now controls the host's keyboard and mouse, shows the host's pointer as its own, syncs clipboard text both ways, switches between the host's monitors (Ctrl+Shift+F2), repairs lost video, and adapts bitrate and frame rate to the link. No server, no macOS yet — see the roadmap below.
 
 ## Targets
 
