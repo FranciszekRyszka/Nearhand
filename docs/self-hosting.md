@@ -1,7 +1,28 @@
 # Self-hosting
 
-> **Status: not yet implemented.** The server lands in M2; this is the shape it
-> is being built to. Nothing here works today.
+> **Status: early.** Today the server introduces portable agents to viewers
+> by device ID, and nothing else. The rest of this page is the shape it is being
+> built to: relay (M2), and accounts, enrollment and the console (M5).
+
+## What works today
+
+```bash
+# On the server — prints the fingerprint agents and viewers pin:
+nearhand-server serve --bind 0.0.0.0:443 --key /var/lib/nearhand/server.key
+
+# On the machine to be helped — prints an ID and a password:
+nearhand-agent portable --server 203.0.113.10:443 --server-fingerprint <fingerprint>
+
+# On the helper's machine:
+nearhand-viewer connect "123 456 7890" --server 203.0.113.10:443 \
+    --server-fingerprint <fingerprint> --password <password>
+```
+
+The connection between viewer and agent is direct, never through the server.
+For now it works when the viewer can reach one of the agent's addresses: on
+the same network, or when the agent's side of the internet does not block the
+way in. Hole punching across NATs, and the relay for when that fails, are the
+next steps.
 
 There is no Nearhand-run infrastructure — no project ID server, no project
 relay. Every install points at a server you run.

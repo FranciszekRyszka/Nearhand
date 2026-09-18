@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
+use nearhand_core::rendezvous::DeviceId;
 use nearhand_transport::Fingerprint;
 
 use crate::direct::Shared;
@@ -36,39 +37,61 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// M0 only: connect straight to an agent by address, no server.
+    /// Connect to a device by its ID, through a server.
     ///
     /// Opens a window showing the remote screen and sends it keyboard and
-    /// mouse, with a latency overlay (Ctrl+Shift+F1 toggles it). `--headless`
-    /// skips the window and only watches; `--record` writes the stream to a
-    /// playable file in either mode.
+    /// mouse, with a latency overlay (Ctrl+Shift+F1 toggles it).
+    Connect {
+        /// The device's ID, as its agent shows it: `123 456 7890`.
+        id: DeviceId,
+        /// The server's address, for example `203.0.113.10:443`.
+        #[arg(long)]
+        server: SocketAddr,
+        /// The fingerprint the server printed when it started.
+        #[arg(long)]
+        server_fingerprint: Fingerprint,
+        /// The password the agent shows. Asked for if the agent wants one
+        /// and it is not given here.
+        #[arg(long)]
+        password: Option<String>,
+        #[command(flatten)]
+        watch: Watch,
+    },
+    /// Connect straight to an agent's `listen` address, no server.
     Direct {
         /// Agent address, for example `192.168.1.20:4433`.
         address: SocketAddr,
         /// The fingerprint the agent printed when it started.
         #[arg(long)]
         fingerprint: Fingerprint,
-        /// Which of the agent's monitors to watch.
-        #[arg(long, default_value_t = 0)]
-        monitor: u8,
-        /// Frame-rate cap to ask the agent for.
-        #[arg(long, default_value_t = 60)]
-        fps: u8,
-        /// Disconnect after this many seconds; otherwise run until the window
-        /// closes or Ctrl+C.
-        #[arg(long)]
-        seconds: Option<u64>,
-        /// Write the received H.264 stream (Annex B) to this file.
-        #[arg(long)]
-        record: Option<PathBuf>,
-        /// Receive without opening a window.
-        #[arg(long)]
-        headless: bool,
-        /// Diagnostic: discard this percentage of incoming datagrams, to
-        /// exercise loss recovery on a network that does not lose any.
-        #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u8).range(0..=100))]
-        simulate_loss: u8,
+        #[command(flatten)]
+        watch: Watch,
     },
+}
+
+/// How to watch, whichever way the agent was reached.
+#[derive(clap::Args, Debug)]
+struct Watch {
+    /// Which of the agent's monitors to watch.
+    #[arg(long, default_value_t = 0)]
+    monitor: u8,
+    /// Frame-rate cap to ask the agent for.
+    #[arg(long, default_value_t = 60)]
+    fps: u8,
+    /// Disconnect after this many seconds; otherwise run until the window
+    /// closes or Ctrl+C.
+    #[arg(long)]
+    seconds: Option<u64>,
+    /// Write the received H.264 stream (Annex B) to this file.
+    #[arg(long)]
+    record: Option<PathBuf>,
+    /// Receive without opening a window.
+    #[arg(long)]
+    headless: bool,
+    /// Diagnostic: discard this percentage of incoming datagrams, to
+    /// exercise loss recovery on a network that does not lose any.
+    #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u8).range(0..=100))]
+    simulate_loss: u8,
 }
 
 fn main() -> Result<()> {
@@ -76,40 +99,57 @@ fn main() -> Result<()> {
     init_tracing(cli.verbose);
 
     match cli.command {
+        Some(Command::Connect {
+            id,
+            server,
+            server_fingerprint,
+            password,
+            watch,
+        }) => {
+            let target = direct::Target::Server {
+                server,
+                server_fingerprint,
+                id,
+            };
+            watch_target(target, password, watch)
+        }
         Some(Command::Direct {
             address,
             fingerprint,
-            monitor,
-            fps,
-            seconds,
-            record,
-            headless,
-            simulate_loss,
+            watch,
         }) => {
-            let options = direct::Options {
+            let target = direct::Target::Direct {
                 address,
                 fingerprint,
-                monitor,
-                fps: fps.max(1),
-                seconds,
-                record,
-                simulate_loss,
-                frames: None,
-                input: None,
-                cursor: None,
-                clipboard: false,
-                switch: None,
-                shared: Arc::new(Shared::default()),
             };
-            if headless {
-                let runtime = tokio::runtime::Runtime::new().context("starting the runtime")?;
-                runtime.block_on(direct::run(options))
-            } else {
-                windowed(options)
-            }
+            watch_target(target, None, watch)
         }
         // No subcommand opens the address book, which needs a server. [M2]
         None => bail!("not implemented: scheduled for M2, see the roadmap in README.md"),
+    }
+}
+
+fn watch_target(target: direct::Target, password: Option<String>, watch: Watch) -> Result<()> {
+    let options = direct::Options {
+        target,
+        password,
+        monitor: watch.monitor,
+        fps: watch.fps.max(1),
+        seconds: watch.seconds,
+        record: watch.record,
+        simulate_loss: watch.simulate_loss,
+        frames: None,
+        input: None,
+        cursor: None,
+        clipboard: false,
+        switch: None,
+        shared: Arc::new(Shared::default()),
+    };
+    if watch.headless {
+        let runtime = tokio::runtime::Runtime::new().context("starting the runtime")?;
+        runtime.block_on(direct::run(options))
+    } else {
+        windowed(options)
     }
 }
 
@@ -133,7 +173,7 @@ fn windowed(mut options: direct::Options) -> Result<()> {
     options.frames = Some(frames_tx);
     let (input_tx, input_rx) = tokio::sync::mpsc::unbounded_channel();
     options.input = Some(input_rx);
-    let title = format!("Nearhand — {}", options.address);
+    let title = format!("Nearhand — {}", options.target);
     // The window owns the deadline, so the network side runs until told.
     let seconds = options.seconds.take();
     let network = runtime.spawn(direct::run(options));

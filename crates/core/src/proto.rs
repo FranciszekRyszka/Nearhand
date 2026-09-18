@@ -1,4 +1,4 @@
-//! Wire protocol, version 1. See `docs/protocol.md` for the prose version.
+//! Wire protocol, version 2. See `docs/protocol.md` for the prose version.
 //!
 //! Every connection opens with [`Control::Hello`] so the format can still change
 //! freely before 1.0. Encoding is `postcard`.
@@ -7,7 +7,7 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
 /// Bumped on any incompatible change while we are pre-1.0.
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 
 /// Video codec negotiated between viewer and agent.
 ///
@@ -60,6 +60,15 @@ pub enum Control {
         fps: u8,
     },
     MonitorList(Vec<Monitor>),
+    /// Agent to viewer, in place of [`Control::MonitorList`] after `Hello`:
+    /// this agent takes viewers only with its current one-time password.
+    AuthRequired,
+    /// Viewer to agent, answering [`Control::AuthRequired`]. A wrong one
+    /// closes the connection with [`close::AUTH_FAILED`]; right, and the agent
+    /// goes on with `MonitorList`. The agent checks it, never the server.
+    Authenticate {
+        password: String,
+    },
     Bye,
     /// Clock probe from the viewer, answered at once with [`Control::Pong`].
     /// Lets the viewer place the agent's capture timestamps on its own clock.
@@ -219,6 +228,8 @@ pub mod close {
     pub const BUSY: u32 = 3;
     /// Capture or encoding failed on the agent; the reason says which.
     pub const PIPELINE_FAILED: u32 = 4;
+    /// Wrong password. After a few, the agent picks a new one.
+    pub const AUTH_FAILED: u32 = 5;
 }
 
 #[cfg(test)]
@@ -269,6 +280,10 @@ mod tests {
                 primary: true,
             }]),
             Control::Bye,
+            Control::AuthRequired,
+            Control::Authenticate {
+                password: "482913".to_owned(),
+            },
             Control::Ping { viewer_us: 17 },
             Control::Pong {
                 viewer_us: 17,

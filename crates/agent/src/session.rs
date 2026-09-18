@@ -40,6 +40,7 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
 use crate::input::Injection;
+use crate::password::{Check, Password};
 use crate::pipeline::{Pipeline, QualityControl, Settings};
 use crate::rate::{self, Quality, RateController};
 
@@ -64,6 +65,8 @@ const CLIPBOARD_PRIORITY: i32 = -1;
 pub struct SessionConfig {
     /// The most video bitrate to use; rate control picks what the link takes.
     pub bitrate_kbps: u32,
+    /// Viewers must give this before anything else, when set.
+    pub password: Option<Arc<Password>>,
 }
 
 /// What one video stream sent, for the log.
@@ -151,6 +154,9 @@ pub async fn serve(conn: Connection, config: &SessionConfig) -> Result<()> {
         },
     )
     .await?;
+    if let Some(password) = &config.password {
+        authenticate(&conn, &mut send, &mut recv, password).await?;
+    }
     send_message(&mut send, &Control::MonitorList(monitors.clone())).await?;
 
     // Until the viewer picks a monitor, input lands on the primary one.
@@ -308,9 +314,14 @@ pub async fn serve(conn: Connection, config: &SessionConfig) -> Result<()> {
                 }
             }
 
-            // Agent-to-viewer messages have no business arriving here.
+            // Agent-to-viewer messages, and the handshake's, have no business
+            // arriving here.
             Some(
-                other @ (Control::Hello { .. } | Control::MonitorList(_) | Control::Pong { .. }),
+                other @ (Control::Hello { .. }
+                | Control::MonitorList(_)
+                | Control::Pong { .. }
+                | Control::AuthRequired
+                | Control::Authenticate { .. }),
             ) => {
                 conn.close(close::PROTOCOL.into(), b"unexpected message");
                 break Err(anyhow::anyhow!("unexpected {other:?}"));
@@ -326,6 +337,37 @@ pub async fn serve(conn: Connection, config: &SessionConfig) -> Result<()> {
     clipboard_stream.abort();
     conn.close(close::NORMAL.into(), b"bye");
     outcome
+}
+
+/// Ask for the password and check it. A wrong one ends the connection: each
+/// guess costs a whole handshake, and a few wrong ones replace the password.
+async fn authenticate(
+    conn: &Connection,
+    send: &mut quinn::SendStream,
+    recv: &mut RecvStream,
+    password: &Password,
+) -> Result<()> {
+    send_message(send, &Control::AuthRequired).await?;
+    let attempt = match recv_message::<Control>(recv).await? {
+        Some(Control::Authenticate { password }) => password,
+        other => {
+            conn.close(close::PROTOCOL.into(), b"expected Authenticate");
+            bail!("expected Authenticate, got {other:?}");
+        }
+    };
+    match password.check(&attempt) {
+        Check::Accepted => Ok(()),
+        Check::Rejected => {
+            conn.close(close::AUTH_FAILED.into(), b"wrong password");
+            bail!("wrong password");
+        }
+        Check::Replaced(new) => {
+            conn.close(close::AUTH_FAILED.into(), b"wrong password");
+            // Printed: the person at this machine has to read out the new one.
+            println!("too many wrong passwords; the password is now {new}");
+            bail!("wrong password, replaced");
+        }
+    }
 }
 
 fn target(monitor: &Monitor) -> nearhand_input::Target {

@@ -4,21 +4,25 @@
 //! connection to its server and never listens on a port; see `docs/security.md`.
 //!
 //! The one exception is `listen`, the M0 test mode: it accepts a viewer
-//! directly on the LAN so the capture-to-screen latency can be measured before
-//! any server exists. It goes away once M2 brings signaling.
+//! directly on the LAN, with no server, so the pipeline can be measured on its
+//! own.
 
 mod input;
+mod password;
 mod pipeline;
+mod portable;
 mod rate;
 mod session;
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use nearhand_core::proto::close;
-use nearhand_transport::{Identity, server_endpoint};
+use nearhand_transport::{Fingerprint, Identity, server_endpoint};
+use quinn::Endpoint;
 use tokio::sync::Semaphore;
 
 use crate::session::SessionConfig;
@@ -49,8 +53,23 @@ enum Command {
     Uninstall,
     /// Run in the foreground, connected to the enrolled server. [M2]
     Run,
-    /// Portable quick-support mode: show an ID and one-time password. [M2]
-    Portable,
+    /// Portable quick-support mode: register with a server and show an ID
+    /// and one-time password for the viewer to use.
+    Portable {
+        /// The server's address, for example `203.0.113.10:443`.
+        #[arg(long)]
+        server: SocketAddr,
+        /// The fingerprint the server printed when it started.
+        #[arg(long)]
+        server_fingerprint: Fingerprint,
+        /// This device's key, created on first use. It is the device's
+        /// identity: its ID is derived from it.
+        #[arg(long, default_value_os_t = portable::default_key_path())]
+        key: PathBuf,
+        /// The most video bitrate to use.
+        #[arg(long, default_value_t = 10_000)]
+        bitrate_kbps: u32,
+    },
     /// M0 only: accept a viewer directly on the LAN, no server.
     ///
     /// Prints a certificate fingerprint to give to the viewer. The viewer
@@ -74,9 +93,27 @@ fn main() -> Result<()> {
     match cli.command {
         Command::Listen { bind, bitrate_kbps } => {
             let runtime = tokio::runtime::Runtime::new().context("starting the runtime")?;
-            runtime.block_on(listen(bind, SessionConfig { bitrate_kbps }))
+            let config = SessionConfig {
+                bitrate_kbps,
+                password: None,
+            };
+            runtime.block_on(listen(bind, config))
         }
-        Command::Install { .. } | Command::Uninstall | Command::Run | Command::Portable => {
+        Command::Portable {
+            server,
+            server_fingerprint,
+            key,
+            bitrate_kbps,
+        } => {
+            let runtime = tokio::runtime::Runtime::new().context("starting the runtime")?;
+            runtime.block_on(portable::run(portable::Options {
+                server,
+                server_fingerprint,
+                key,
+                bitrate_kbps,
+            }))
+        }
+        Command::Install { .. } | Command::Uninstall | Command::Run => {
             anyhow::bail!("not implemented: scheduled for M2/M3, see the roadmap in README.md")
         }
     }
@@ -96,23 +133,22 @@ async fn listen(bind: SocketAddr, config: SessionConfig) -> Result<()> {
         identity.fingerprint()
     );
 
-    let config = Arc::new(config);
+    tokio::select! {
+        () = accept_viewers(endpoint.clone(), Arc::new(config)) => {}
+        _ = tokio::signal::ctrl_c() => println!("stopping"),
+    }
+    endpoint.close(close::NORMAL.into(), b"agent stopping");
+    endpoint.wait_idle().await;
+    Ok(())
+}
+
+/// Serve viewers connecting to `endpoint`, one at a time, until it closes.
+async fn accept_viewers(endpoint: Endpoint, config: Arc<SessionConfig>) {
     // One viewer at a time: two would fight over the display duplication and
     // the hardware encoder.
     let slot = Arc::new(Semaphore::new(1));
 
-    loop {
-        let incoming = tokio::select! {
-            incoming = endpoint.accept() => match incoming {
-                Some(incoming) => incoming,
-                None => break,
-            },
-            _ = tokio::signal::ctrl_c() => {
-                println!("stopping");
-                break;
-            }
-        };
-
+    while let Some(incoming) = endpoint.accept().await {
         let config = config.clone();
         let slot = slot.clone();
         tokio::spawn(async move {
@@ -137,10 +173,6 @@ async fn listen(bind: SocketAddr, config: SessionConfig) -> Result<()> {
             }
         });
     }
-
-    endpoint.close(close::NORMAL.into(), b"agent stopping");
-    endpoint.wait_idle().await;
-    Ok(())
 }
 
 /// Work in physical pixels. Without this, Windows scales coordinates for a

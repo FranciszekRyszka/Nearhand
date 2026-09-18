@@ -1,7 +1,9 @@
 # Security
 
-> **Status: design, not yet implemented.** This describes what the code must do;
-> track the gap against the roadmap in the README.
+> **Status: partly implemented.** Device keys, pinning and the portable
+> agent's one-time password exist; enrollment, grants, the per-device access
+> password, the relay, signed releases and the session indicator do not yet.
+> Track the gap against the roadmap in the README.
 
 Nearhand hands one machine full control of another. The threat model is built in
 from the start rather than bolted on, because retrofitting any of it would mean
@@ -16,6 +18,16 @@ changing the wire format.
   the way SSH does — it is not a warning the user can click through.
 - The agent pins the **server key** at enrollment.
 
+### What the device ID is, and is not
+
+A device ID is ten digits derived from the device's key. That makes it stable
+without the server storing anything, but it is a name, not a proof. Ten digits
+are about 33 bits, and a malicious server could find another key with the same
+ID in minutes. What the viewer pins is the full fingerprint the server reports,
+so for an attended session the viewer trusts the server to report it
+honestly. The one-time password then decides who gets in, and only the agent
+checks it.
+
 ## Authorisation
 
 - **Unattended** sessions require a grant signed by the pinned server key.
@@ -23,6 +35,13 @@ changing the wire format.
   a compromised server alone is not enough to take over a machine.
 - **Attended** sessions require the person at the host to accept, or a one-time
   password. Attempts are rate-limited.
+  - *Implemented:* the portable agent shows six random digits. The agent
+    checks them and the server never sees them. Each wrong guess costs a
+    whole connection, and three wrong guesses replace the password. The
+    server also limits each viewer address to 10 introductions a minute.
+  - *Not yet:* the accept prompt, which comes with the portable agent's
+    window. Until then the password stays valid while the agent runs. A
+    viewer who has had it can come back without asking again.
 - The **relay** forwards only for sessions holding a server-issued ticket, so it
   cannot be turned into an open proxy. It only ever sees ciphertext — the
   QUIC/TLS handshake is between viewer and agent.
@@ -45,6 +64,13 @@ changing the wire format.
 - External review before 1.0.
 
 ## Known limits
+
+A **malicious server** can put itself between a viewer and a portable agent.
+It can report its own key as the device's, since the ID does not pin the key.
+It can then relay the password the viewer types to the real agent. The
+password protects against anyone who is not the server; it does not protect
+against the server itself. A password-authenticated key exchange (PAKE) would
+close this gap, and is worth adding before 1.0.
 
 A **fully compromised management server** could issue itself a grant. The
 mitigations are the per-device access password, which the server never learns,

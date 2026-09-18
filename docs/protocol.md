@@ -28,9 +28,43 @@ choosing QUIC:
 For the browser viewer the same messages travel over WebTransport, with a
 WebSocket fallback where WebTransport is unavailable.
 
+## Finding a device: the server
+
+A viewer reaches an agent by its ten-digit device ID, through the server both
+are configured with. The server speaks its own protocol, ALPN
+`nearhand-server/1` (`core::rendezvous`), and steps out once the two are
+introduced:
+
+```text
+agent            server             viewer
+  Register  ──▶                                  (agent presents its certificate)
+            ◀──  Registered { id }
+                             ◀──  Connect { id }
+            ◀──  Incoming { session, viewer's addresses }
+  (sends a packet to each, opening its own firewall to them)
+  Ready     ──▶
+                             ──▶  Peer { fingerprint, agent's addresses }
+  ◀═══════ QUIC, viewer to agent, pinned to the fingerprint ═══════
+```
+
+* The agent connects with its certificate as a TLS client certificate. The
+  server derives the agent's ID from it, so an agent cannot register under an
+  ID that is not its own.
+* A device ID is the first 64 bits of the certificate's SHA-256, modulo 10¹⁰,
+  shown as `123 456 7890`. It is stable for as long as the key is, and it is a
+  name, not a proof: see `docs/security.md`.
+* Each side reports the local address it would use toward the server, and the
+  server adds the address it sees. The viewer tries them all at once, from
+  the same socket it reached the server from.
+* The agent never listens on a fixed port. It accepts the viewer on the socket
+  it uses for the server, after sending a packet to each of the viewer's
+  addresses: a stateful firewall lets packets in only from where something
+  went out to.
+* The server allows each viewer address 10 introductions a minute.
+
 ## Session
 
-The TLS handshake negotiates ALPN `nearhand/1`, so a peer on a different
+The TLS handshake negotiates ALPN `nearhand/2`, so a peer on a different
 protocol version fails there rather than mid-stream. The viewer then opens one
 bidirectional stream for control and speaks first:
 
@@ -38,6 +72,8 @@ bidirectional stream for control and speaks first:
 viewer                         agent
   Hello { version, caps }  ──▶
                            ◀──  Hello { version, caps }
+                           ◀──  AuthRequired           (portable agents only)
+  Authenticate { password } ──▶
                            ◀──  MonitorList
   StartVideo               ──▶
                            ◀══  video datagrams …
@@ -63,10 +99,13 @@ itself. Close codes (`core::proto::close`) travel with a readable reason:
 | 2 | Protocol version mismatch |
 | 3 | Agent busy with another viewer |
 | 4 | Capture or encoding failed; the reason says which |
+| 5 | Wrong password |
 
-In M0 the agent's certificate is self-signed and generated per run. The viewer
-pins its SHA-256 fingerprint, and the handshake still proves the agent holds the
-key. From M2 the fingerprint comes from the server instead.
+Every certificate is self-signed over an Ed25519 key. The viewer pins the
+agent's certificate by its SHA-256 fingerprint, which the server reports (or,
+with `direct`, is copied by hand). The handshake still proves the agent holds
+the key. A certificate is a pure function of its key, so a key kept on disk
+gives the same fingerprint on every run.
 
 ## Video framing
 

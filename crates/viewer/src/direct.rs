@@ -19,14 +19,16 @@ use anyhow::{Context, Result, bail};
 use nearhand_clipboard::ClipboardSync;
 use nearhand_core::clock::ClockSync;
 use nearhand_core::proto::close;
+use nearhand_core::rendezvous::{DeviceId, FromServer, ToServer};
 use nearhand_core::video::{AssembledFrame, Reassembler, ReassemblyStats, Timing, decode_chunk};
 use nearhand_core::{
     Caps, Clipboard, Codec, Control, Cursor, Input, Monitor, PROTOCOL_VERSION, StreamKind, wire,
 };
 use nearhand_transport::{
-    Fingerprint, client_endpoint, connect, recv_message, send_all, send_message,
+    Fingerprint, client_endpoint, connect, connect_server, local_ip_toward, recv_message, send_all,
+    send_message,
 };
-use quinn::{Connection, ConnectionError, RecvStream, SendStream};
+use quinn::{Connection, ConnectionError, Endpoint, RecvStream, SendStream};
 use tokio::sync::{Notify, mpsc};
 
 /// Keyframes are expensive; ask at most this often. A keyframe takes an RTT
@@ -94,9 +96,39 @@ impl Shared {
     }
 }
 
+/// Which agent to reach, and how.
+#[derive(Debug, Clone)]
+pub enum Target {
+    /// Straight to an address, pinned to a fingerprint copied by hand.
+    Direct {
+        address: SocketAddr,
+        fingerprint: Fingerprint,
+    },
+    /// By device ID, introduced by a server.
+    Server {
+        server: SocketAddr,
+        server_fingerprint: Fingerprint,
+        id: DeviceId,
+    },
+}
+
+impl std::fmt::Display for Target {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Target::Direct { address, .. } => write!(f, "{address}"),
+            Target::Server { id, .. } => write!(f, "{id}"),
+        }
+    }
+}
+
+/// How long each of a device's addresses gets to answer.
+const PEER_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
 pub struct Options {
-    pub address: SocketAddr,
-    pub fingerprint: Fingerprint,
+    pub target: Target,
+    /// For an agent that asks for one; asked for on the terminal if needed
+    /// and not given.
+    pub password: Option<String>,
     pub monitor: u8,
     pub fps: u8,
     pub seconds: Option<u64>,
@@ -119,11 +151,29 @@ pub struct Options {
 }
 
 pub async fn run(options: Options) -> Result<()> {
-    let endpoint = client_endpoint(options.address)?;
-    let conn = connect(&endpoint, options.address, options.fingerprint)
-        .await
-        .with_context(|| format!("connecting to {}", options.address))?;
-    println!("connected to {} (rtt {:?})", options.address, conn.rtt());
+    let (endpoint, conn) = match &options.target {
+        Target::Direct {
+            address,
+            fingerprint,
+        } => {
+            let endpoint = client_endpoint(*address)?;
+            let conn = connect(&endpoint, *address, *fingerprint)
+                .await
+                .with_context(|| format!("connecting to {address}"))?;
+            (endpoint, conn)
+        }
+        Target::Server {
+            server,
+            server_fingerprint,
+            id,
+        } => through_server(*server, *server_fingerprint, *id).await?,
+    };
+    println!(
+        "connected to {} at {} (rtt {:?})",
+        options.target,
+        conn.remote_address(),
+        conn.rtt()
+    );
 
     let (mut send, mut recv) = conn.open_bi().await?;
     send_message(
@@ -148,7 +198,16 @@ pub async fn run(options: Options) -> Result<()> {
         Ok(other) => bail!("expected Hello, got {other:?}"),
         Err(e) => return Err(explain(&conn, e.into())),
     };
-    match recv_message::<Control>(&mut recv).await? {
+    let mut next = recv_message::<Control>(&mut recv).await;
+    if let Ok(Some(Control::AuthRequired)) = next {
+        let password = match options.password.clone() {
+            Some(password) => password,
+            None => ask_password().await?,
+        };
+        send_message(&mut send, &Control::Authenticate { password }).await?;
+        next = recv_message::<Control>(&mut recv).await;
+    }
+    match next.map_err(|e| explain(&conn, e.into()))? {
         Some(Control::MonitorList(monitors)) => {
             let Some(m) = monitors.iter().find(|m| m.id == options.monitor) else {
                 bail!(
@@ -555,6 +614,93 @@ async fn read_cursor(
             sink(change);
         }
     }
+}
+
+/// Ask the server to introduce us to device `id`, then connect to it
+/// directly, from the same socket the server saw — that is the address the
+/// agent opened its firewall to.
+async fn through_server(
+    server: SocketAddr,
+    server_fingerprint: Fingerprint,
+    id: DeviceId,
+) -> Result<(Endpoint, Connection)> {
+    let endpoint = client_endpoint(server)?;
+    let introducer = connect_server(&endpoint, server, server_fingerprint, None)
+        .await
+        .with_context(|| format!("connecting to the server at {server}"))?;
+    let (mut send, mut recv) = introducer.open_bi().await?;
+    let port = endpoint.local_addr()?.port();
+    let addresses: Vec<SocketAddr> = local_ip_toward(server)
+        .map(|ip| SocketAddr::new(ip, port))
+        .into_iter()
+        .collect();
+    send_message(&mut send, &ToServer::Connect { id, addresses }).await?;
+    let answer = recv_message::<FromServer>(&mut recv).await?;
+    introducer.close(close::NORMAL.into(), b"introduced");
+
+    let (fingerprint, addresses) = match answer {
+        Some(FromServer::Peer {
+            fingerprint,
+            addresses,
+        }) => (Fingerprint::from_bytes(fingerprint), addresses),
+        Some(FromServer::Refused(refusal)) => bail!("the server says: {refusal}"),
+        other => bail!("unexpected answer from the server: {other:?}"),
+    };
+    // Not a security check — ten digits are easily matched on purpose — but
+    // it catches a server that mixes up its devices.
+    if fingerprint.device_id() != id {
+        bail!("the server answered with another device's key");
+    }
+    tracing::info!(?addresses, "introduced; connecting");
+    let conn = race(&endpoint, &addresses, fingerprint).await?;
+    Ok((endpoint, conn))
+}
+
+/// Try every address at once and keep the first connection made. On a LAN
+/// the local address wins; across the internet, the one the server saw.
+async fn race(
+    endpoint: &Endpoint,
+    addresses: &[SocketAddr],
+    fingerprint: Fingerprint,
+) -> Result<Connection> {
+    let mut attempts = tokio::task::JoinSet::new();
+    for &address in addresses {
+        let endpoint = endpoint.clone();
+        attempts.spawn(async move {
+            let result = tokio::time::timeout(
+                PEER_CONNECT_TIMEOUT,
+                connect(&endpoint, address, fingerprint),
+            )
+            .await;
+            (address, result)
+        });
+    }
+    let mut failures = Vec::new();
+    while let Some(joined) = attempts.join_next().await {
+        match joined {
+            Ok((_, Ok(Ok(conn)))) => {
+                attempts.abort_all();
+                return Ok(conn);
+            }
+            Ok((address, Ok(Err(e)))) => failures.push(format!("{address}: {e}")),
+            Ok((address, Err(_))) => failures.push(format!("{address}: no answer")),
+            Err(e) => failures.push(e.to_string()),
+        }
+    }
+    bail!("could not reach the device ({})", failures.join("; "))
+}
+
+async fn ask_password() -> Result<String> {
+    tokio::task::spawn_blocking(|| {
+        use std::io::Write as _;
+        print!("password: ");
+        std::io::stdout().flush()?;
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line)?;
+        Ok(line.trim().to_owned())
+    })
+    .await
+    .context("reading the password")?
 }
 
 /// The next monitor switch request, or never if nothing can make one.
