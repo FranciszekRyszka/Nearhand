@@ -34,7 +34,6 @@
 //!   [`Error::NoHardwareEncoder`]; the `openh264` fallback is separate work.
 
 use std::collections::VecDeque;
-use std::ffi::c_void;
 use std::mem::ManuallyDrop;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread::JoinHandle;
@@ -43,50 +42,41 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use nearhand_capture::Frame;
 use nearhand_core::Codec;
-use windows::Win32::Foundation::{LUID, RPC_E_CHANGED_MODE, VARIANT_TRUE};
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_TEX2D_VPIV, D3D11_TEX2D_VPOV,
-    D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE,
-    D3D11_VIDEO_PROCESSOR_CONTENT_DESC, D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC,
-    D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0, D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC,
-    D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0, D3D11_VIDEO_PROCESSOR_STREAM,
-    D3D11_VIDEO_USAGE_OPTIMAL_SPEED, D3D11_VPIV_DIMENSION_TEXTURE2D,
-    D3D11_VPOV_DIMENSION_TEXTURE2D, ID3D11Device, ID3D11DeviceContext, ID3D11Multithread,
-    ID3D11Texture2D, ID3D11VideoContext1, ID3D11VideoDevice, ID3D11VideoProcessor,
-    ID3D11VideoProcessorEnumerator, ID3D11VideoProcessorInputView, ID3D11VideoProcessorOutputView,
+    D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, ID3D11Device, ID3D11Multithread,
+    ID3D11Texture2D,
 };
-use windows::Win32::Graphics::Dxgi::Common::{
-    DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709, DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709,
-    DXGI_FORMAT_NV12, DXGI_RATIONAL, DXGI_SAMPLE_DESC,
-};
-use windows::Win32::Graphics::Dxgi::IDXGIDevice;
+use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_NV12;
 use windows::Win32::Media::MediaFoundation::{
     CODECAPI_AVEncCommonMeanBitRate, CODECAPI_AVEncCommonRateControlMode,
     CODECAPI_AVEncMPVDefaultBPictureCount, CODECAPI_AVEncMPVGOPSize,
     CODECAPI_AVEncVideoForceKeyFrame, CODECAPI_AVLowLatencyMode, ICodecAPI, IMF2DBuffer,
-    IMFActivate, IMFAttributes, IMFDXGIDeviceManager, IMFMediaEventGenerator, IMFMediaType,
-    IMFSample, IMFShutdown, IMFTransform, MEDIA_EVENT_GENERATOR_GET_EVENT_FLAGS,
-    METransformHaveOutput, METransformNeedInput, MF_E_TRANSFORM_STREAM_CHANGE, MF_LOW_LATENCY,
-    MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE,
+    IMFDXGIDeviceManager, IMFMediaEventGenerator, IMFMediaType, IMFSample, IMFShutdown,
+    IMFTransform, MEDIA_EVENT_GENERATOR_GET_EVENT_FLAGS, METransformHaveOutput,
+    METransformNeedInput, MF_E_TRANSFORM_STREAM_CHANGE, MF_LOW_LATENCY, MF_MT_AVG_BITRATE,
+    MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE,
     MF_MT_MPEG2_PROFILE, MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE, MF_MT_TRANSFER_FUNCTION,
     MF_MT_VIDEO_NOMINAL_RANGE, MF_MT_VIDEO_PRIMARIES, MF_MT_YUV_MATRIX, MF_SA_D3D11_AWARE,
-    MF_TRANSFORM_ASYNC, MF_TRANSFORM_ASYNC_UNLOCK, MF_VERSION, MFCreateAttributes,
-    MFCreateDXGIDeviceManager, MFCreateDXGISurfaceBuffer, MFCreateMediaType, MFCreateMemoryBuffer,
-    MFCreateSample, MFMediaType_Video, MFNominalRange_16_235, MFSTARTUP_FULL,
-    MFSampleExtension_CleanPoint, MFShutdown, MFStartup, MFT_CATEGORY_VIDEO_ENCODER,
-    MFT_ENUM_ADAPTER_LUID, MFT_ENUM_FLAG_HARDWARE, MFT_ENUM_FLAG_SORTANDFILTER,
-    MFT_FRIENDLY_NAME_Attribute, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
-    MFT_MESSAGE_NOTIFY_END_OF_STREAM, MFT_MESSAGE_NOTIFY_END_STREAMING,
-    MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_MESSAGE_SET_D3D_MANAGER, MFT_OUTPUT_DATA_BUFFER,
-    MFT_OUTPUT_STREAM_PROVIDES_SAMPLES, MFT_REGISTER_TYPE_INFO, MFTEnum2, MFVideoFormat_H264,
-    MFVideoFormat_NV12, MFVideoInterlace_Progressive, MFVideoPrimaries_BT709, MFVideoTransFunc_709,
-    MFVideoTransferMatrix_BT709, eAVEncCommonRateControlMode_CBR, eAVEncH264VProfile_High,
+    MF_TRANSFORM_ASYNC, MF_TRANSFORM_ASYNC_UNLOCK, MFCreateDXGIDeviceManager,
+    MFCreateDXGISurfaceBuffer, MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample,
+    MFMediaType_Video, MFNominalRange_16_235, MFSampleExtension_CleanPoint,
+    MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_NOTIFY_END_OF_STREAM,
+    MFT_MESSAGE_NOTIFY_END_STREAMING, MFT_MESSAGE_NOTIFY_START_OF_STREAM,
+    MFT_MESSAGE_SET_D3D_MANAGER, MFT_OUTPUT_DATA_BUFFER, MFT_OUTPUT_STREAM_PROVIDES_SAMPLES,
+    MFVideoFormat_H264, MFVideoFormat_NV12, MFVideoInterlace_Progressive, MFVideoPrimaries_BT709,
+    MFVideoTransFunc_709, MFVideoTransferMatrix_BT709, eAVEncCommonRateControlMode_CBR,
+    eAVEncH264VProfile_High,
 };
-use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoTaskMemFree};
-use windows::Win32::System::Variant::{VARIANT, VT_BOOL, VT_UI4};
-use windows::core::{GUID, Interface, PWSTR};
+use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx};
+use windows::Win32::System::Variant::VARIANT;
+use windows::core::{GUID, Interface};
 
-use super::{EncodedFrame, Encoder, EncoderConfig, Error, Result};
+use super::convert::{Conversion, VideoConverter, create_texture};
+use super::{
+    Runtime, adapter_luid, backend, enumerate_encoders, friendly_name, pack, texture_device,
+    variant_bool, variant_u32,
+};
+use crate::{EncodedFrame, Encoder, EncoderConfig, Error, Result};
 
 /// How long `encode` waits for the frame it just submitted to come out.
 ///
@@ -103,25 +93,6 @@ const INPUT_TIMEOUT: Duration = Duration::from_secs(2);
 /// frame N while the video processor writes frame N+1.
 const NV12_RING: usize = 3;
 
-pub fn encoder(config: EncoderConfig) -> Result<Box<dyn Encoder>> {
-    Ok(Box::new(MfEncoder::new(config)?))
-}
-
-/// Codecs a hardware encoder on this machine can produce, best first.
-///
-/// Only H.264 today: it is the baseline every viewer decodes, and the only codec
-/// this module drives. HEVC and AV1 are negotiated later, once there is an
-/// encoder path for them to take.
-pub fn hardware_encoders() -> Vec<Codec> {
-    let Ok(_runtime) = Runtime::start() else {
-        return Vec::new();
-    };
-    match enumerate_encoders(MFVideoFormat_H264, None) {
-        Ok(found) if !found.is_empty() => vec![Codec::H264],
-        _ => Vec::new(),
-    }
-}
-
 pub struct MfEncoder {
     config: EncoderConfig,
     width: u32,
@@ -133,7 +104,7 @@ pub struct MfEncoder {
 }
 
 impl MfEncoder {
-    fn new(config: EncoderConfig) -> Result<Self> {
+    pub(crate) fn new(config: EncoderConfig) -> Result<Self> {
         if config.codec != Codec::H264 {
             return Err(Error::UnsupportedCodec(config.codec));
         }
@@ -210,7 +181,10 @@ impl Encoder for MfEncoder {
 /// One hardware encoder instance bound to one D3D11 device.
 struct Session {
     device: ID3D11Device,
-    converter: Converter,
+    converter: VideoConverter,
+    /// Rotated so the encoder can still read frame N while N+1 is written.
+    nv12: Vec<ID3D11Texture2D>,
+    next_nv12: usize,
     transform: IMFTransform,
     codec_api: Option<ICodecAPI>,
     events: Receiver<Event>,
@@ -302,13 +276,24 @@ impl Session {
         unsafe { transform.ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0) }
             .map_err(|e| backend("MFT_MESSAGE_NOTIFY_START_OF_STREAM", e))?;
 
-        let converter = Converter::new(&device, width, height, config.max_fps)?;
+        let converter = VideoConverter::new(
+            &device,
+            Conversion::RGB_TO_NV12,
+            (width, height),
+            config.max_fps,
+        )?;
+        let bind = (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32;
+        let nv12 = (0..NV12_RING)
+            .map(|_| create_texture(&device, (width, height), DXGI_FORMAT_NV12, bind, 0))
+            .collect::<Result<Vec<_>>>()?;
 
         tracing::info!(encoder = %name, width, height, "hardware H.264 encoder ready");
 
         Ok(Self {
             device,
             converter,
+            nv12,
+            next_nv12: 0,
             transform,
             codec_api,
             events,
@@ -323,7 +308,10 @@ impl Session {
     }
 
     fn encode(&mut self, frame: &Frame, force_keyframe: bool) -> Result<Option<EncodedFrame>> {
-        let nv12 = self.converter.convert(&frame.surface)?;
+        let nv12 = self.nv12[self.next_nv12].clone();
+        self.next_nv12 = (self.next_nv12 + 1) % self.nv12.len();
+        let visible = (u32::from(frame.width), u32::from(frame.height));
+        self.converter.convert(&frame.surface, 0, visible, &nv12)?;
         let sample = self.input_sample(&nv12, frame.capture_ts_us)?;
 
         if force_keyframe && let Some(api) = &self.codec_api {
@@ -528,236 +516,6 @@ impl Drop for Session {
     }
 }
 
-/// BGRA → NV12 on the GPU, through the D3D11 video processor.
-///
-/// Also scales when the encode size differs from the capture size, for free —
-/// which is what adaptive quality will lean on later.
-struct Converter {
-    video_device: ID3D11VideoDevice,
-    video_context: ID3D11VideoContext1,
-    enumerator: ID3D11VideoProcessorEnumerator,
-    processor: ID3D11VideoProcessor,
-    input_size: (u32, u32),
-    output_size: (u32, u32),
-    fps: u8,
-    /// Cached view of the capture texture, which is reused across frames.
-    input: Option<(ID3D11Texture2D, ID3D11VideoProcessorInputView)>,
-    outputs: Vec<(ID3D11Texture2D, ID3D11VideoProcessorOutputView)>,
-    next_output: usize,
-}
-
-impl Converter {
-    fn new(device: &ID3D11Device, width: u32, height: u32, fps: u8) -> Result<Self> {
-        let video_device = device.cast::<ID3D11VideoDevice>().map_err(|e| {
-            backend(
-                "ID3D11VideoDevice (was the device created with D3D11_CREATE_DEVICE_VIDEO_SUPPORT?)",
-                e,
-            )
-        })?;
-        let context = immediate_context(device)?;
-        let video_context = context
-            .cast::<ID3D11VideoContext1>()
-            .map_err(|e| backend("ID3D11VideoContext1", e))?;
-
-        // The input size is not known until the first frame; start from the
-        // output size and rebuild if the capture turns out different.
-        let (enumerator, processor) = create_processor(
-            &video_device,
-            &video_context,
-            (width, height),
-            (width, height),
-            fps,
-        )?;
-
-        let mut converter = Self {
-            video_device,
-            video_context,
-            enumerator,
-            processor,
-            input_size: (width, height),
-            output_size: (width, height),
-            fps,
-            input: None,
-            outputs: Vec::with_capacity(NV12_RING),
-            next_output: 0,
-        };
-        for _ in 0..NV12_RING {
-            let output = converter.create_output(device)?;
-            converter.outputs.push(output);
-        }
-        Ok(converter)
-    }
-
-    fn convert(&mut self, source: &ID3D11Texture2D) -> Result<ID3D11Texture2D> {
-        let mut desc = D3D11_TEXTURE2D_DESC::default();
-        unsafe { source.GetDesc(&mut desc) };
-
-        if (desc.Width, desc.Height) != self.input_size {
-            let (enumerator, processor) = create_processor(
-                &self.video_device,
-                &self.video_context,
-                (desc.Width, desc.Height),
-                self.output_size,
-                self.fps,
-            )?;
-            self.enumerator = enumerator;
-            self.processor = processor;
-            self.input_size = (desc.Width, desc.Height);
-            self.input = None;
-            // Output views are tied to the enumerator that created them.
-            let device = texture_device(source)?;
-            self.outputs.clear();
-            for _ in 0..NV12_RING {
-                let output = self.create_output(&device)?;
-                self.outputs.push(output);
-            }
-        }
-
-        let input_view = match &self.input {
-            Some((texture, view)) if texture.as_raw() == source.as_raw() => view.clone(),
-            _ => {
-                let view = self.create_input_view(source)?;
-                self.input = Some((source.clone(), view.clone()));
-                view
-            }
-        };
-
-        let (target, target_view) = self.outputs[self.next_output].clone();
-        self.next_output = (self.next_output + 1) % self.outputs.len();
-
-        let streams = [D3D11_VIDEO_PROCESSOR_STREAM {
-            Enable: true.into(),
-            pInputSurface: ManuallyDrop::new(Some(input_view)),
-            ..Default::default()
-        }];
-        let result = unsafe {
-            self.video_context
-                .VideoProcessorBlt(&self.processor, &target_view, 0, &streams)
-        };
-        // The stream struct holds its view in a ManuallyDrop; release it.
-        let [mut stream] = streams;
-        unsafe { ManuallyDrop::drop(&mut stream.pInputSurface) };
-        result.map_err(|e| backend("VideoProcessorBlt", e))?;
-
-        Ok(target)
-    }
-
-    fn create_input_view(&self, source: &ID3D11Texture2D) -> Result<ID3D11VideoProcessorInputView> {
-        let desc = D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC {
-            FourCC: 0,
-            ViewDimension: D3D11_VPIV_DIMENSION_TEXTURE2D,
-            Anonymous: D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0 {
-                Texture2D: D3D11_TEX2D_VPIV {
-                    MipSlice: 0,
-                    ArraySlice: 0,
-                },
-            },
-        };
-        let mut view = None;
-        unsafe {
-            self.video_device.CreateVideoProcessorInputView(
-                source,
-                &self.enumerator,
-                &desc,
-                Some(&mut view),
-            )
-        }
-        .map_err(|e| backend("CreateVideoProcessorInputView", e))?;
-        view.ok_or_else(|| Error::Backend("no video processor input view".to_owned()))
-    }
-
-    fn create_output(
-        &self,
-        device: &ID3D11Device,
-    ) -> Result<(ID3D11Texture2D, ID3D11VideoProcessorOutputView)> {
-        let desc = D3D11_TEXTURE2D_DESC {
-            Width: self.output_size.0,
-            Height: self.output_size.1,
-            MipLevels: 1,
-            ArraySize: 1,
-            Format: DXGI_FORMAT_NV12,
-            SampleDesc: DXGI_SAMPLE_DESC {
-                Count: 1,
-                Quality: 0,
-            },
-            Usage: D3D11_USAGE_DEFAULT,
-            BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
-            CPUAccessFlags: 0,
-            MiscFlags: 0,
-        };
-        let mut texture = None;
-        unsafe { device.CreateTexture2D(&desc, None, Some(&mut texture)) }
-            .map_err(|e| backend("CreateTexture2D (NV12)", e))?;
-        let texture =
-            texture.ok_or_else(|| Error::Backend("no NV12 texture created".to_owned()))?;
-
-        let view_desc = D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC {
-            ViewDimension: D3D11_VPOV_DIMENSION_TEXTURE2D,
-            Anonymous: D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0 {
-                Texture2D: D3D11_TEX2D_VPOV { MipSlice: 0 },
-            },
-        };
-        let mut view = None;
-        unsafe {
-            self.video_device.CreateVideoProcessorOutputView(
-                &texture,
-                &self.enumerator,
-                &view_desc,
-                Some(&mut view),
-            )
-        }
-        .map_err(|e| backend("CreateVideoProcessorOutputView", e))?;
-        let view =
-            view.ok_or_else(|| Error::Backend("no video processor output view".to_owned()))?;
-        Ok((texture, view))
-    }
-}
-
-fn create_processor(
-    video_device: &ID3D11VideoDevice,
-    video_context: &ID3D11VideoContext1,
-    input: (u32, u32),
-    output: (u32, u32),
-    fps: u8,
-) -> Result<(ID3D11VideoProcessorEnumerator, ID3D11VideoProcessor)> {
-    let rate = DXGI_RATIONAL {
-        Numerator: u32::from(fps),
-        Denominator: 1,
-    };
-    let content = D3D11_VIDEO_PROCESSOR_CONTENT_DESC {
-        InputFrameFormat: D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE,
-        InputFrameRate: rate,
-        InputWidth: input.0,
-        InputHeight: input.1,
-        OutputFrameRate: rate,
-        OutputWidth: output.0,
-        OutputHeight: output.1,
-        Usage: D3D11_VIDEO_USAGE_OPTIMAL_SPEED,
-    };
-    let enumerator = unsafe { video_device.CreateVideoProcessorEnumerator(&content) }
-        .map_err(|e| backend("CreateVideoProcessorEnumerator", e))?;
-    let processor = unsafe { video_device.CreateVideoProcessor(&enumerator, 0) }
-        .map_err(|e| backend("CreateVideoProcessor", e))?;
-
-    unsafe {
-        // The desktop is full-range sRGB-ish RGB; the stream we write is
-        // BT.709 limited range, matching what nv12_type() signals.
-        video_context.VideoProcessorSetStreamColorSpace1(
-            &processor,
-            0,
-            DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709,
-        );
-        video_context.VideoProcessorSetOutputColorSpace1(
-            &processor,
-            DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709,
-        );
-        // No driver "enhancements": text must arrive exactly as rendered.
-        video_context.VideoProcessorSetStreamAutoProcessingMode(&processor, 0, false);
-    }
-
-    Ok((enumerator, processor))
-}
-
 /// Settings that make a hardware encoder behave for interactive use. Each is
 /// best-effort: vendors support different subsets, and a missing one degrades
 /// quality or latency rather than breaking the stream.
@@ -827,119 +585,6 @@ fn nv12_type(config: &EncoderConfig, width: u32, height: u32) -> Result<IMFMedia
     Ok(t)
 }
 
-/// Hardware encoders from `NV12` to `subtype`, best first, optionally limited
-/// to one adapter.
-fn enumerate_encoders(subtype: GUID, adapter: Option<LUID>) -> Result<Vec<IMFActivate>> {
-    let input = MFT_REGISTER_TYPE_INFO {
-        guidMajorType: MFMediaType_Video,
-        guidSubtype: MFVideoFormat_NV12,
-    };
-    let output = MFT_REGISTER_TYPE_INFO {
-        guidMajorType: MFMediaType_Video,
-        guidSubtype: subtype,
-    };
-
-    let filter: Option<IMFAttributes> = match adapter {
-        Some(luid) => {
-            let mut attributes = None;
-            unsafe { MFCreateAttributes(&mut attributes, 1) }
-                .map_err(|e| backend("MFCreateAttributes", e))?;
-            let attributes = attributes
-                .ok_or_else(|| Error::Backend("MFCreateAttributes returned nothing".to_owned()))?;
-            unsafe { attributes.SetBlob(&MFT_ENUM_ADAPTER_LUID, &luid_bytes(luid)) }
-                .map_err(|e| backend("MFT_ENUM_ADAPTER_LUID", e))?;
-            Some(attributes)
-        }
-        None => None,
-    };
-
-    let mut array: *mut Option<IMFActivate> = std::ptr::null_mut();
-    let mut count = 0u32;
-    unsafe {
-        MFTEnum2(
-            MFT_CATEGORY_VIDEO_ENCODER,
-            MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER,
-            Some(&input),
-            Some(&output),
-            filter.as_ref(),
-            &mut array,
-            &mut count,
-        )
-    }
-    .map_err(|e| backend("MFTEnum2", e))?;
-
-    let mut found = Vec::with_capacity(count as usize);
-    if !array.is_null() {
-        for i in 0..count as usize {
-            // Move each reference out of the COM-allocated array; the array
-            // itself is freed below without releasing them a second time.
-            if let Some(activate) = unsafe { array.add(i).read() } {
-                found.push(activate);
-            }
-        }
-        unsafe { CoTaskMemFree(Some(array as *const c_void)) };
-    }
-    Ok(found)
-}
-
-fn friendly_name(activate: &IMFActivate) -> String {
-    let mut text = PWSTR::null();
-    let mut len = 0u32;
-    if unsafe { activate.GetAllocatedString(&MFT_FRIENDLY_NAME_Attribute, &mut text, &mut len) }
-        .is_err()
-        || text.is_null()
-    {
-        return "hardware encoder".to_owned();
-    }
-    let name = unsafe { text.to_string() }.unwrap_or_else(|_| "hardware encoder".to_owned());
-    unsafe { CoTaskMemFree(Some(text.0 as *const c_void)) };
-    name
-}
-
-fn adapter_luid(device: &ID3D11Device) -> Result<LUID> {
-    let dxgi = device
-        .cast::<IDXGIDevice>()
-        .map_err(|e| backend("IDXGIDevice", e))?;
-    let adapter = unsafe { dxgi.GetAdapter() }.map_err(|e| backend("GetAdapter", e))?;
-    let desc = unsafe { adapter.GetDesc() }.map_err(|e| backend("adapter GetDesc", e))?;
-    Ok(desc.AdapterLuid)
-}
-
-fn texture_device(texture: &ID3D11Texture2D) -> Result<ID3D11Device> {
-    unsafe { texture.GetDevice() }.map_err(|e| backend("capture texture GetDevice", e))
-}
-
-fn immediate_context(device: &ID3D11Device) -> Result<ID3D11DeviceContext> {
-    unsafe { device.GetImmediateContext() }.map_err(|e| backend("GetImmediateContext", e))
-}
-
-/// Media Foundation, started for as long as an encoder exists.
-///
-/// `MFStartup` is reference-counted, so encoders can come and go
-/// independently. COM is initialised for the calling thread and deliberately
-/// never uninitialised: that has to happen on the same thread, and an encoder
-/// may be dropped from anywhere.
-struct Runtime;
-
-impl Runtime {
-    fn start() -> Result<Self> {
-        let hr = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
-        // S_FALSE means already initialised; RPC_E_CHANGED_MODE means the
-        // thread is STA, which Media Foundation tolerates.
-        if hr.is_err() && hr != RPC_E_CHANGED_MODE {
-            return Err(Error::Backend(format!("CoInitializeEx: {hr}")));
-        }
-        unsafe { MFStartup(MF_VERSION, MFSTARTUP_FULL) }.map_err(|e| backend("MFStartup", e))?;
-        Ok(Self)
-    }
-}
-
-impl Drop for Runtime {
-    fn drop(&mut self) {
-        let _ = unsafe { MFShutdown() };
-    }
-}
-
 enum Event {
     NeedInput,
     HaveOutput,
@@ -1001,55 +646,8 @@ fn spawn_event_pump(
     Ok((rx, handle))
 }
 
-fn variant_u32(value: u32) -> VARIANT {
-    let mut variant = VARIANT::default();
-    unsafe {
-        let inner = &mut variant.Anonymous.Anonymous;
-        inner.vt = VT_UI4;
-        inner.Anonymous.ulVal = value;
-    }
-    variant
-}
-
-fn variant_bool(value: bool) -> VARIANT {
-    let mut variant = VARIANT::default();
-    unsafe {
-        let inner = &mut variant.Anonymous.Anonymous;
-        inner.vt = VT_BOOL;
-        inner.Anonymous.boolVal = if value {
-            VARIANT_TRUE
-        } else {
-            Default::default()
-        };
-    }
-    variant
-}
-
-/// Media Foundation packs sizes and ratios into one `u64`, high word first —
-/// what the `MFSetAttributeSize` macro does in C.
-fn pack(high: u32, low: u32) -> u64 {
-    (u64::from(high) << 32) | u64::from(low)
-}
-
 fn frame_duration_100ns(fps: u8) -> i64 {
     10_000_000 / i64::from(fps.max(1))
-}
-
-fn luid_bytes(luid: LUID) -> [u8; 8] {
-    let mut bytes = [0u8; 8];
-    bytes[..4].copy_from_slice(&luid.LowPart.to_le_bytes());
-    bytes[4..].copy_from_slice(&luid.HighPart.to_le_bytes());
-    bytes
-}
-
-fn backend(what: &str, e: windows::core::Error) -> Error {
-    Error::Backend(format!("{what}: {e}"))
-}
-
-impl From<windows::core::Error> for Error {
-    fn from(e: windows::core::Error) -> Self {
-        Error::Backend(e.to_string())
-    }
 }
 
 #[cfg(test)]
@@ -1057,25 +655,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn packs_size_high_word_first() {
-        assert_eq!(pack(1920, 1080), (1920u64 << 32) | 1080);
-        assert_eq!(pack(60, 1) >> 32, 60);
-    }
-
-    #[test]
     fn frame_duration_is_in_100ns_units() {
         assert_eq!(frame_duration_100ns(60), 166_666);
         assert_eq!(frame_duration_100ns(30), 333_333);
         assert_eq!(frame_duration_100ns(0), 10_000_000);
-    }
-
-    #[test]
-    fn luid_matches_its_c_layout() {
-        let luid = LUID {
-            LowPart: 0x0403_0201,
-            HighPart: 0x0807_0605,
-        };
-        assert_eq!(luid_bytes(luid), [1, 2, 3, 4, 5, 6, 7, 8]);
     }
 
     #[test]

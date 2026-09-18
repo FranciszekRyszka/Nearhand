@@ -71,14 +71,32 @@ pub trait Decoder {
     fn decode(&mut self, frame: &EncodedFrame) -> Result<Option<DecodedFrame>>;
 }
 
+/// Where a decoded picture lives: one slice of the decoder's surface array.
+///
+/// Valid only until the next call to [`Decoder::decode`], which may reuse the
+/// slice — convert or copy it out before then.
+#[cfg(windows)]
+#[derive(Debug, Clone)]
+pub struct DecodedSurface {
+    pub texture: windows::Win32::Graphics::Direct3D11::ID3D11Texture2D,
+    pub slice: u32,
+}
+
+/// Uninhabited where no decoder exists yet: a [`DecodedFrame`] cannot be made.
+#[cfg(not(windows))]
+pub type DecodedSurface = core::convert::Infallible;
+
 /// A decoded frame, ready to be presented. Like `nearhand_capture::Frame`, the
 /// pixel handle stays platform-specific so the GPU path is never broken by a
 /// round trip through system memory.
 #[derive(Debug)]
 pub struct DecodedFrame {
-    pub width: u16,
-    pub height: u16,
+    /// The visible picture. The surface may be larger: see
+    /// `VideoConverter::convert` on Windows.
+    pub width: u32,
+    pub height: u32,
     pub capture_ts_us: u64,
+    pub surface: DecodedSurface,
 }
 
 /// Open the platform's hardware encoder.
