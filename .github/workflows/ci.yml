@@ -9,7 +9,6 @@ on:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
-  RUSTFLAGS: -D warnings
 
 jobs:
   # Formatting and the wasm constraint on `core` are platform-independent, so
@@ -35,7 +34,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, macos-latest]
+        include:
+          # RUSTFLAGS replaces .cargo/config.toml's flags, so Windows repeats
+          # its static C runtime here.
+          - os: windows-latest
+            rustflags: -D warnings -C target-feature=+crt-static
+          - os: macos-latest
+            rustflags: -D warnings
+    env:
+      RUSTFLAGS: ${{ matrix.rustflags }}
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable

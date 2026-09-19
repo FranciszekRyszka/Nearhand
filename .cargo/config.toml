@@ -1,0 +1,8 @@
+# Windows binaries carry the C runtime inside them, rather than needing the
+# Visual C++ Redistributable (vcruntime140.dll) installed: a fresh Windows
+# lacks it, and the agent — portable or from the MSI — must run anywhere.
+#
+# An environment RUSTFLAGS replaces this rather than adding to it; CI sets
+# its own with the same flag (.github/workflows/ci.yml).
+[target.'cfg(all(windows, target_env = "msvc"))']
+rustflags = ["-C", "target-feature=+crt-static"]
