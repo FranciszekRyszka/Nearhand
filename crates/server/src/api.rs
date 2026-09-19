@@ -1761,7 +1761,7 @@ mod tests {
             let policy = headers[axum::http::header::CONTENT_SECURITY_POLICY]
                 .to_str()
                 .expect("policy");
-            assert!(policy.contains("script-src 'self'") && !policy.contains("unsafe"));
+            assert!(policy.contains("script-src 'self';") && !policy.contains("unsafe"));
             assert!(policy.contains("frame-ancestors 'none'"));
             assert!(
                 policy.contains("connect-src 'self' https://desk.example.com:443;"),

@@ -27,6 +27,12 @@ jobs:
       # `core` must keep compiling for the browser viewer.
       # Cheap to enforce now, painful to retrofit later.
       - run: cargo check -p nearhand-core --target wasm32-unknown-unknown
+      # The browser viewer itself; ring's C needs clang and llvm-ar.
+      - run: sudo apt-get install -y --no-install-recommends clang llvm
+      - run: cargo build --release -p nearhand-web --target wasm32-unknown-unknown
+        env:
+          CC_wasm32_unknown_unknown: clang
+          AR_wasm32_unknown_unknown: llvm-ar
 
   test:
     name: clippy + test (${{ matrix.os }})

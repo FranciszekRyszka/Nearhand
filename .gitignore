@@ -34,3 +34,6 @@ desktop.ini
 
 # Output of the encode probe
 *.h264
+
+# The web viewer, built by packaging/web/build.*
+crates/server/web/pkg/

@@ -258,7 +258,8 @@ const pages = {
         );
       }
       return h("tr", {},
-        h("td", {}, h("span", { class: d.online ? "dot on" : "dot", title: d.online ? "online" : "offline" }), d.name),
+        h("td", {}, h("span", { class: d.online ? "dot on" : "dot", title: d.online ? "online" : "offline" }), d.name,
+          d.role && d.online ? [" ", h("a", { href: `/view?device=${d.id}`, target: "_blank", rel: "noopener" }, "View")] : null),
         h("td", {}, h("code", {}, d.device_id)),
         h("td", {}, state.me.admin ? "" : d.group || "—"),
         h("td", {}, d.role || "—"),
@@ -278,7 +279,7 @@ const pages = {
       ),
       h("section", {},
         h("h2", {}, "Connecting"),
-        h("p", {}, "With an API token of yours (Account), from a machine with the viewer:"),
+        h("p", {}, "In this browser: “View” beside a device you have a grant for. Or with the native viewer and an API token of yours (Account):"),
         h("pre", {}, `NEARHAND_TOKEN=nht_… nearhand-viewer connect "<ID>" --server ${state.server.address} --server-fingerprint ${state.server.fingerprint}`),
       ));
   },

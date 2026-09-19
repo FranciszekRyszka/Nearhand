@@ -175,6 +175,18 @@ account (M5).
   possible later addition.
 - What it does not see: sessions by password (the server never learns
   them), and what happens inside any session.
+- The **web viewer** runs the same session as the native one, compiled to
+  WebAssembly: QUIC and TLS 1.3 to the agent, pinned to its fingerprint,
+  carried in WebTransport datagrams through the relay, which sees only
+  ciphertext. The page checks that the fingerprint the server introduces is
+  the one in the grant the API issued, and the agent checks the grant as
+  for any viewer. Its page may compile WebAssembly (`'wasm-unsafe-eval'`,
+  which permits nothing for JavaScript); the console's may not.
+- WebTransport uses a certificate browsers accept, not the pinned server
+  key: CA-issued, or self-signed for at most 13 days and accepted by the
+  hash the console hands over HTTPS. Whoever can serve the console could
+  therefore hand another hash — but they could equally serve other code,
+  so the browser's trust is the console's HTTPS certificate either way.
 - The web console is a page over the same REST API, served from the binary:
   no endpoint of its own, nothing loaded from elsewhere. Its
   Content-Security-Policy allows only this server's own script, style and

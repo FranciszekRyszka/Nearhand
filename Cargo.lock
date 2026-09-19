@@ -2900,6 +2900,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "nearhand-web"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "js-sys",
+ "nearhand-core",
+ "nearhand-transport",
+ "postcard",
+ "quinn",
+ "quinn-proto",
+ "ring",
+ "rustls",
+ "thiserror 2.0.20",
+ "tokio",
+ "wasm-bindgen",
+ "web-time",
+]
+
+[[package]]
 name = "nohash-hasher"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

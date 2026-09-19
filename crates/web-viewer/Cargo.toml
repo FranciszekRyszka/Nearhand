@@ -1,0 +1,31 @@
+[package]
+name = "nearhand-web"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The browser viewer: the session protocol and its QUIC connection, compiled to WebAssembly"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+bytes = "1"
+js-sys = "0.3.105"
+nearhand-core = { version = "0.1.0", path = "../core" }
+postcard = { version = "1", features = ["use-std"] }
+quinn-proto = { version = "0.11.18", default-features = false, features = ["rustls-ring"] }
+ring = "0.17.14"
+rustls = { version = "0.23.45", default-features = false, features = ["ring", "std"] }
+thiserror = "2"
+wasm-bindgen = "0.2.128"
+web-time = "1"
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+nearhand-transport = { version = "0.1.0", path = "../transport" }
+quinn = "0.11.12"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time"] }
+web-time = "1"

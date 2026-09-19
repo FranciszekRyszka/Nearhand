@@ -55,6 +55,8 @@ Errors are `{"error": "..."}` with a fitting status code.
 | `GET /grants` | administrators | `{id, user_group_id, user_group, device_group_id, device_group, role}` |
 | `POST /grants` | administrators | `{user_group_id, device_group_id, role}`, role `view`, `control` or `full`; sets the role if the two have a grant already |
 | `DELETE /grants/{id}` | administrators | deletes one |
+| `POST /devices/{id}/grant` | signed in | a grant for the caller on that device, for the web viewer: `{device_id, fingerprint, role, grant}`, `grant` the signed grant in hex; 404 without one |
+| `GET /webtransport` | signed in | `{url, certificate_hashes}`: where the web viewer's WebTransport goes, and the SHA-256 (hex) of the certificate to accept when it is self-signed |
 | `GET /audit?before=&limit=` | administrators | newest first, `limit` up to 500 (100 unless given); `before`, an entry's id, pages back: `{id, at, actor, address, action, target, detail}` |
 
 Connecting with a grant is not over this API: the viewer asks on the QUIC

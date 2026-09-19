@@ -25,8 +25,11 @@ choosing QUIC:
 | Clipboard | Reliable stream, low priority | Must never starve video |
 | Control | Reliable stream | Rare and small |
 
-For the browser viewer the same messages travel over WebTransport, with a
-WebSocket fallback where WebTransport is unavailable.
+The browser viewer runs this same connection, byte for byte, inside a
+WebTransport session with the server: a browser cannot open raw QUIC or
+punch holes, so it always takes the relay, and its session's datagrams are
+the tunnel (see *The relay* below). A WebSocket fallback, for browsers or
+networks without WebTransport, is not built yet.
 
 ## Finding a device: the server
 
@@ -68,6 +71,13 @@ agent            server             viewer
   `Granted(signed grant)` before `Peer` if the user has a grant for the
   device, and `Refused(NotSignedIn)` or `Refused(NotAllowed)` if not —
   saying nothing about whether the device is online.
+* A browser opens a WebTransport session to `https://<server>:<QUIC
+  port>/nearhand` — the server tells the QUIC side's ALPNs apart, `h3` for
+  browsers — sends `Connect { id, addresses: [] }` on its first stream, and
+  reads `Peer` or `Refused` to the end of it. From then on the session's
+  datagrams carry its relay tunnel, as a native viewer's connection's do.
+  Its grant comes from the REST API (`POST /api/v1/devices/{id}/grant`),
+  since WebTransport carries no cookie.
 * An installed agent may also enroll, once, on a connection of its own with
   its certificate: `Enroll { token, name, os, version }` ──▶, answered by
   `Enrolled { id }` or `Refused(Enrollment)`. That records the device in the

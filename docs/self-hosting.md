@@ -149,6 +149,23 @@ anything it does a script can do too. For the TOTP set-up, add the key it
 shows to the authenticator app by hand, or open the `otpauth://` link on the
 phone: the console draws no QR code.
 
+### The web viewer
+
+Beside each device a user has a grant for, and which is online, the console
+shows **View**: the device's screen in the browser tab, in current Chrome,
+Edge or Firefox. It runs the same session as the native viewer, end-to-end
+encrypted to the agent, carried over WebTransport on the QUIC port through
+the server's relay — so it works wherever the console does, as long as UDP
+reaches the QUIC port. Keyboard, mouse and clipboard from the browser come
+next; for now it watches.
+
+Browsers do not accept the server's own QUIC certificate, so WebTransport
+connections get another: the HTTPS certificate files with `tls = "files"`,
+else a self-signed one the server makes and renews by itself every six
+days, which the page accepts by its hash. With `tls = "none"` behind a
+reverse proxy the proxy does not carry this — WebTransport is UDP, straight
+to the QUIC port — and the self-signed certificate applies.
+
 ### The REST API
 
 Everything is under `/api/v1`, JSON in and out; [api.md](api.md) lists it.

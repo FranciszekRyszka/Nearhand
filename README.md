@@ -4,7 +4,7 @@ A self-hosted, open-source remote desktop — an alternative to TeamViewer, AnyD
 
 There is no Nearhand-run infrastructure. Every install points at a server you run yourself.
 
-> **Status: pre-alpha, M2 done pending a test across real networks.** On Windows, the agent streams the screen to the viewer over QUIC with hardware encode and decode end to end: **12.5 ms capture-to-present p50** at 2560×1440 on loopback, against an 80 ms target ([details](docs/performance.md)). The viewer now controls the host's keyboard and mouse, shows the host's pointer as its own, syncs clipboard text both ways, switches between the host's monitors (Ctrl+Shift+F2), repairs lost video, and adapts bitrate and frame rate to the link. A portable agent can now be reached by its device ID and a one-time password through a self-hosted server ([how](docs/self-hosting.md)); it connects directly through most home NATs, and through the server's relay where it cannot. Its window asks the person at the machine before letting anyone in, and shows for as long as a session lasts that the computer is being controlled. M3 has started: on Windows, the agent installs as a service, reachable with an access password ([how](docs/self-hosting.md#unattended-access-windows)), follows the user onto the sign-in screen and UAC prompts (Ctrl+Alt+End sends Ctrl+Alt+Del), shows the person at the machine when a session is on, and comes as an MSI — all waiting for a test in a VM. M5 has started: the server has user accounts (Argon2id passwords, TOTP, API tokens) behind a REST API, installed agents enroll into its device list with groups and presence ([how](docs/self-hosting.md#enrollment)), users reach them with grants the agent checks against the server's key ([how](docs/self-hosting.md#grants)), and a web console and audit log cover it all ([how](docs/self-hosting.md#the-web-console)). No macOS yet — see the roadmap below.
+> **Status: pre-alpha, M2 done pending a test across real networks.** On Windows, the agent streams the screen to the viewer over QUIC with hardware encode and decode end to end: **12.5 ms capture-to-present p50** at 2560×1440 on loopback, against an 80 ms target ([details](docs/performance.md)). The viewer now controls the host's keyboard and mouse, shows the host's pointer as its own, syncs clipboard text both ways, switches between the host's monitors (Ctrl+Shift+F2), repairs lost video, and adapts bitrate and frame rate to the link. A portable agent can now be reached by its device ID and a one-time password through a self-hosted server ([how](docs/self-hosting.md)); it connects directly through most home NATs, and through the server's relay where it cannot. Its window asks the person at the machine before letting anyone in, and shows for as long as a session lasts that the computer is being controlled. M3 has started: on Windows, the agent installs as a service, reachable with an access password ([how](docs/self-hosting.md#unattended-access-windows)), follows the user onto the sign-in screen and UAC prompts (Ctrl+Alt+End sends Ctrl+Alt+Del), shows the person at the machine when a session is on, and comes as an MSI — all waiting for a test in a VM. M5 has started: the server has user accounts (Argon2id passwords, TOTP, API tokens) behind a REST API, installed agents enroll into its device list with groups and presence ([how](docs/self-hosting.md#enrollment)), users reach them with grants the agent checks against the server's key ([how](docs/self-hosting.md#grants)), and a web console and audit log cover it all ([how](docs/self-hosting.md#the-web-console)). M6 has started: a browser can now watch a device — the same QUIC session compiled to WebAssembly, carried over WebTransport through the server's relay and still end-to-end encrypted to the agent, decoded with WebCodecs ([how](docs/self-hosting.md#the-web-viewer)); input from the browser is next. No macOS yet — see the roadmap below.
 
 ## Targets
 
@@ -27,13 +27,14 @@ One Cargo workspace:
 | --- | --- | --- |
 | `crates/core` | lib | Protocol, crypto, session state machine. No OS code; must compile to wasm32. |
 | `crates/capture` | lib | Screen capture — DXGI on Windows, ScreenCaptureKit on macOS |
-| `crates/codec` | lib | Encode and decode — Media Foundation, VideoToolbox, `openh264` fallback |
+| `crates/codec` | lib | Encode and decode — Media Foundation (hardware, or Windows' software encoder), VideoToolbox |
 | `crates/input` | lib | Input injection — `SendInput`, `CGEvent` |
 | `crates/clipboard` | lib | Clipboard text sync — Win32 clipboard, `NSPasteboard` |
 | `crates/transport` | lib | QUIC for the native binaries: endpoints, key pinning, stream framing |
 | `crates/agent` | bin | Runs on the controlled machine |
 | `crates/viewer` | bin | Native controlling app |
 | `crates/server` | bin | API, console, signaling, relay |
+| `crates/web-viewer` | lib (wasm32) | The browser viewer's session: QUIC to the agent and the protocol, compiled to WebAssembly |
 
 `capture`, `codec` and `input` are separate from `agent` because the viewer needs `codec` but not `capture`, platform `cfg` code stays out of the protocol crate, and each can be benchmarked alone. `transport` is separate from `core` because it depends on `quinn` and tokio, while `core` has to compile for the browser viewer, which speaks WebTransport instead.
 
@@ -61,6 +62,19 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 cargo check -p nearhand-core --target wasm32-unknown-unknown
 cargo deny check      # cargo install cargo-deny
+```
+
+The web viewer is built separately, into `crates/server/web/pkg`, from where
+the server's build embeds it (without it, the server builds and its `/view`
+page says the viewer is missing). It needs the `wasm32-unknown-unknown`
+target, `wasm-bindgen-cli` at the version in `Cargo.lock`, and clang for
+`ring`:
+
+```bash
+rustup target add wasm32-unknown-unknown
+cargo install wasm-bindgen-cli --version 0.2.128 --locked
+packaging/web/build.sh        # or packaging\web\build.ps1 -Llvm <an LLVM folder>
+cargo build -p nearhand-server
 ```
 
 ## Roadmap
