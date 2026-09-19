@@ -12,14 +12,14 @@ pub fn hidden(question: &str) -> Result<String> {
     let echo = Echo::off();
     let mut line = String::new();
     let read = std::io::stdin().lock().read_line(&mut line);
-    drop(echo);
+    echo.restore();
     // The Enter that ended the line was not echoed either.
     println!();
     read?;
     Ok(line.trim_end_matches(['\r', '\n']).to_owned())
 }
 
-/// Echo turned off until dropped.
+/// Echo turned off until restored (or dropped).
 struct Echo {
     #[cfg(windows)]
     restore: Option<(
@@ -70,5 +70,13 @@ impl Drop for Echo {
 impl Echo {
     fn off() -> Self {
         Self {}
+    }
+}
+
+impl Echo {
+    /// Turn echo back on, now rather than at the end of the scope.
+    fn restore(self) {
+        #[cfg(windows)]
+        drop(self);
     }
 }
