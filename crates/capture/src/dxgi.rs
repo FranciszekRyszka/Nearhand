@@ -13,6 +13,10 @@
 //!   its thread to the new desktop before rebuilding it ([`crate::desktop`]).
 //!   Only SYSTEM may do that for the secure desktop; anyone else gets
 //!   [`Error::Blocked`] until it goes away, and capture carries on then.
+//!   The lost duplication must be gone before the new one is made: made
+//!   beside it, the new one loses access at once, and so does each one after
+//!   (seen on a VM's basic display adapter, until it ran out of memory). The
+//!   rebuild also starts over from the output and the device.
 //! * On hybrid-graphics laptops the device and the output must live on the same
 //!   adapter, so the device is created against the adapter the output came from
 //!   rather than with `D3D_DRIVER_TYPE_HARDWARE`.
@@ -24,7 +28,7 @@
 //!   visibility beside each frame, and on frames of their own when only the
 //!   pointer changed; [`Capturer::take_pointer`] passes them on.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{E_ACCESSDENIED, HMODULE, RECT};
 use windows::Win32::Graphics::Direct3D::{
@@ -57,6 +61,11 @@ use nearhand_core::Cursor;
 /// an absurd timeout means a long wait, never an unbreakable one.
 const MAX_TIMEOUT_MS: u32 = u32::MAX - 1;
 
+/// The least time between two rebuilds of the duplication. Access lost
+/// again straight after one waits out the rest, so a desktop that will not
+/// be duplicated cannot spin the capturer.
+const REBUILD_PAUSE: Duration = Duration::from_millis(250);
+
 pub fn open(display: u8) -> Result<Box<dyn Capturer>> {
     Ok(Box::new(DxgiCapturer::new(display)?))
 }
@@ -66,7 +75,9 @@ pub struct DxgiCapturer {
     device: ID3D11Device,
     context: ID3D11DeviceContext,
     output: IDXGIOutput1,
-    duplication: IDXGIOutputDuplication,
+    /// `None` while access is lost and the duplication could not be rebuilt
+    /// yet: each call tries again.
+    duplication: Option<IDXGIOutputDuplication>,
     /// Our own copy of the desktop image, reused across frames and rebuilt only
     /// when the resolution or format changes.
     texture: Option<ID3D11Texture2D>,
@@ -80,8 +91,8 @@ pub struct DxgiCapturer {
     shape_scratch: Vec<u8>,
     /// The desktop this (the capturing) thread is attached to.
     desktop: ThreadDesktop,
-    /// The duplication is gone and could not be rebuilt yet.
-    lost: bool,
+    /// When the duplication was last rebuilt.
+    rebuilt: Option<Instant>,
 }
 
 impl DxgiCapturer {
@@ -109,7 +120,7 @@ impl DxgiCapturer {
             device,
             context,
             output: output1,
-            duplication,
+            duplication: Some(duplication),
             texture: None,
             texture_desc: D3D11_TEXTURE2D_DESC::default(),
             dirty_scratch: Vec::new(),
@@ -118,25 +129,37 @@ impl DxgiCapturer {
             pointer_visible: None,
             shape_scratch: Vec::new(),
             desktop,
-            lost: false,
+            rebuilt: None,
         })
     }
 
     /// Rebuild the duplication after `DXGI_ERROR_ACCESS_LOST`, on whichever
-    /// desktop now receives input.
+    /// desktop now receives input, from a fresh output and device.
     ///
     /// Access is lost on desktop switches, resolution changes and when another
     /// process takes exclusive fullscreen — all routine, none fatal. While it
-    /// cannot be rebuilt, the capturer stays `lost` and tries again on each
-    /// call.
+    /// cannot be rebuilt, the capturer stays without a duplication and tries
+    /// again on each call. The encoder notices the new device by itself.
     fn recover(&mut self) -> Result<()> {
-        self.lost = true;
+        // Gone first: an output allows only so many duplications at once.
+        self.duplication = None;
+        if let Some(since) = self.rebuilt.map(|at| at.elapsed())
+            && since < REBUILD_PAUSE
+        {
+            std::thread::sleep(REBUILD_PAUSE - since);
+        }
+        self.rebuilt = Some(Instant::now());
         let followed = match self.desktop.follow() {
             Ok(_) => Ok(()),
             Err(desktop::Error::NoAccess(which)) => return Err(Error::Blocked(which)),
             Err(e) => Err(e),
         };
-        self.duplication = match duplicate(&self.output, &self.device) {
+        let (adapter, output, _desc) = find_output(self.display)?;
+        let output = output
+            .cast::<IDXGIOutput1>()
+            .map_err(|e| backend("IDXGIOutput1", e))?;
+        let (device, context) = create_device(&adapter)?;
+        let duplication = match duplicate(&output, &device) {
             Ok(duplication) => duplication,
             // Say why the thread did not follow, if it tried and failed:
             // this is logged once, not at every retry.
@@ -148,7 +171,10 @@ impl DxgiCapturer {
             }
             Err(e) => return Err(e),
         };
-        self.lost = false;
+        self.device = device;
+        self.context = context;
+        self.output = output;
+        self.duplication = Some(duplication);
         self.texture = None;
         // The new duplication reports the pointer afresh; pass it all on.
         self.pointer_visible = None;
@@ -223,8 +249,9 @@ impl DxgiCapturer {
         self.shape_scratch.resize(size as usize, 0);
         let mut required = 0u32;
         let mut info = DXGI_OUTDUPL_POINTER_SHAPE_INFO::default();
+        let duplication = self.duplicated()?;
         unsafe {
-            self.duplication.GetFramePointerShape(
+            duplication.GetFramePointerShape(
                 size,
                 self.shape_scratch.as_mut_ptr().cast(),
                 &mut required,
@@ -313,7 +340,7 @@ impl DxgiCapturer {
             let mut required_bytes = 0u32;
 
             let result = unsafe {
-                self.duplication.GetFrameDirtyRects(
+                self.duplicated()?.GetFrameDirtyRects(
                     buffer_bytes as u32,
                     self.dirty_scratch.as_mut_ptr(),
                     &mut required_bytes,
@@ -342,6 +369,14 @@ impl DxgiCapturer {
         }
     }
 
+    /// The duplication, between acquiring a frame and releasing it. A clone
+    /// is a reference count, and leaves `self` free for the scratch buffers.
+    fn duplicated(&self) -> Result<IDXGIOutputDuplication> {
+        self.duplication
+            .clone()
+            .ok_or_else(|| Error::Backend("no duplication while reading a frame".to_owned()))
+    }
+
     /// Performance-counter ticks to microseconds.
     ///
     /// The epoch is boot time, not the wall clock, so this is only meaningful as
@@ -354,7 +389,7 @@ impl DxgiCapturer {
 
 impl Capturer for DxgiCapturer {
     fn next_frame(&mut self, timeout: Duration) -> Result<Option<Frame>> {
-        if self.lost {
+        let Some(duplication) = self.duplication.clone() else {
             return match self.recover() {
                 // Back: the new duplication starts with a whole frame.
                 Ok(()) => Err(Error::SourceLost),
@@ -364,14 +399,12 @@ impl Capturer for DxgiCapturer {
                     Err(e)
                 }
             };
-        }
+        };
         let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
         let mut resource: Option<IDXGIResource> = None;
 
-        let acquired = unsafe {
-            self.duplication
-                .AcquireNextFrame(timeout_ms(timeout), &mut info, &mut resource)
-        };
+        let acquired =
+            unsafe { duplication.AcquireNextFrame(timeout_ms(timeout), &mut info, &mut resource) };
 
         if let Err(e) = acquired {
             return match e.code() {
@@ -379,6 +412,11 @@ impl Capturer for DxgiCapturer {
                 // desktop, and the reason the agent costs nothing when unused.
                 DXGI_ERROR_WAIT_TIMEOUT => Ok(None),
                 DXGI_ERROR_ACCESS_LOST => {
+                    // The last reference to the lost duplication. An output
+                    // takes no second one while it lives: a rebuild with it
+                    // still here is refused, or — once it is lost — lost
+                    // straight away itself, and so on for ever.
+                    drop(duplication);
                     self.recover()?;
                     Err(Error::SourceLost)
                 }
@@ -390,7 +428,7 @@ impl Capturer for DxgiCapturer {
         let frame = self.take_frame(&info, resource);
 
         // Must happen before the next acquire, on success and failure alike.
-        if let Err(e) = unsafe { self.duplication.ReleaseFrame() } {
+        if let Err(e) = unsafe { duplication.ReleaseFrame() } {
             // A release failure after a good frame still leaves the frame good;
             // the next acquire will report the real problem.
             tracing::debug!(error = %e, "ReleaseFrame failed");
@@ -714,6 +752,25 @@ mod tests {
             }
             Ok(None) => {}
             Err(e) => panic!("capture failed: {e}"),
+        }
+    }
+
+    /// A rebuild — what losing access leads to — gives a capturer that works,
+    /// on a new device; one straight after it waits first. Needs an
+    /// interactive desktop; the frames stay in memory.
+    #[test]
+    #[ignore = "requires an interactive desktop session"]
+    fn rebuilds_from_scratch_and_not_in_a_hurry() {
+        let mut capturer = DxgiCapturer::new(0).expect("open the primary display");
+        let before = capturer.device.clone();
+        capturer.recover().expect("rebuild");
+        assert_ne!(capturer.device.as_raw(), before.as_raw(), "a new device");
+        let started = Instant::now();
+        capturer.recover().expect("rebuild again");
+        assert!(started.elapsed() >= REBUILD_PAUSE * 9 / 10, "paused");
+        match capturer.next_frame(Duration::from_millis(500)) {
+            Ok(_) => {}
+            Err(e) => panic!("capture after a rebuild failed: {e}"),
         }
     }
 
