@@ -31,7 +31,9 @@
            UpgradeCode="20F1B49E-6D91-4570-9DA2-C6EA4601F377"
            Scope="perMachine"
            Compressed="yes">
-    <MajorUpgrade DowngradeErrorMessage="A newer version of the Nearhand agent is already installed." />
+    <!-- Same-version upgrades too: a newer build of one version replaces the
+         installed one, rather than failing as a conflict. -->
+    <MajorUpgrade AllowSameVersionUpgrades="yes" DowngradeErrorMessage="A newer version of the Nearhand agent is already installed." />
     <MediaTemplate EmbedCab="yes" />
 
     <!-- Set when this machine is configured already: an upgrade or repair
