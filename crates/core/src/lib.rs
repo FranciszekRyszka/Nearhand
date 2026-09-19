@@ -12,6 +12,7 @@ pub mod clock;
 pub mod grant;
 pub mod held;
 pub mod proto;
+pub mod release;
 pub mod rendezvous;
 pub mod video;
 pub mod wire;

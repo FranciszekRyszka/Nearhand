@@ -2828,6 +2828,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "nearhand-release"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "nearhand-core",
+ "nearhand-transport",
+]
+
+[[package]]
 name = "nearhand-server"
 version = "0.1.0"
 dependencies = [

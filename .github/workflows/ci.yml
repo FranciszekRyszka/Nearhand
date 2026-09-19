@@ -75,8 +75,9 @@ jobs:
       - uses: actions/checkout@v5
       - run: sh packaging/docker/smoke-test.sh
 
-  # The agent's MSI, unsigned until there is a code-signing certificate. Kept
-  # as an artifact of each run, for testing in a VM.
+  # The agent's MSI, without an Authenticode signature until there is a
+  # code-signing certificate. Kept as an artifact of each run, for testing
+  # in a VM.
   msi:
     name: agent MSI
     runs-on: windows-latest
@@ -95,4 +96,38 @@ jobs:
         with:
           name: nearhand-agent-msi
           path: target/release/nearhand-agent-*-x64.msi
+          if-no-files-found: error
+
+  # The MSI's release signature (nearhand_core::release), which agents check
+  # before updating to it. The release key reaches only the step that signs,
+  # never a build, whose dependencies' build scripts could read it; and only
+  # on pushes to main, so no pull request sees it.
+  sign:
+    name: sign the MSI
+    needs: msi
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked -p nearhand-release
+      - uses: actions/download-artifact@v4
+        with:
+          name: nearhand-agent-msi
+          path: msi
+      - name: sign
+        env:
+          NEARHAND_RELEASE_KEY: ${{ secrets.NEARHAND_RELEASE_KEY }}
+        run: |
+          version="$(sed -n 's/^version = "\(.*\)"$/\1/p' crates/agent/Cargo.toml | head -n 1)"
+          for msi in msi/*.msi; do
+            target/release/nearhand-release sign --version "$version" "$msi"
+          done
+      # Against the key built into agents: a wrong secret fails here.
+      - run: for msi in msi/*.msi; do target/release/nearhand-release verify "$msi"; done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nearhand-agent-msi-signed
+          path: msi/
           if-no-files-found: error

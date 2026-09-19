@@ -23,6 +23,7 @@
 
 pub mod grant;
 pub mod relay;
+pub mod release;
 pub mod rendezvous;
 
 use std::fmt;

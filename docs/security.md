@@ -202,8 +202,18 @@ account (M5).
 
 ## Supply chain
 
-- Releases are signed. Agents update only from their own server, and verify
-  signatures against a key baked into the binary.
+- Releases are signed with the project's release key, an Ed25519 key of
+  its own — not a server's, not a device's. Its public half is built into
+  every agent (`nearhand_core::release::KEY`); its private half is a CI
+  secret, given only to the one step that signs, after everything is
+  built, on pushes to `main`. The signature covers the package's product,
+  version, platform, size and SHA-256 (`nearhand-release verify` checks
+  one).
+- Agents will update only from their own server, and install only a
+  package whose release the built-in key verifies and whose hash matches,
+  never an older version than they run. A server chooses when its agents
+  update, and to which of the project's releases; it cannot make them run
+  anything else.
 - `cargo-deny` and `cargo-audit` run in CI.
 - The protocol decoder gets fuzzed (`cargo-fuzz`) before 1.0.
 - External review before 1.0.
