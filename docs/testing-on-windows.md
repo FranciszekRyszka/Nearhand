@@ -90,11 +90,10 @@ With a viewer connected, sign out of the VM.
 * The viewer's session ends. `service.log` shows the agent moving to the
   sign-in screen's session (`moving the agent`, `agent started` with a new
   session number).
-* The device stays reachable: connecting again works, but **the sign-in
-  screen itself is not expected to show yet** — capturing it is the next
-  step of M3. Note what the viewer shows or says.
-* Sign back in: `service.log` shows the agent moving again, and connecting
-  shows the desktop.
+* The device stays reachable: connecting again shows the sign-in screen.
+  Sign in from the viewer — click, type the password — and the viewer
+  follows onto the desktop without reconnecting. `service.log` shows the
+  agent moving again; `agent.log` has `followed the input desktop`.
 
 ## 6. Switch users
 
@@ -108,11 +107,39 @@ in.
 ## 7. Restart the VM
 
 * After the restart, before anyone signs in, `sc query Nearhand` says
-  `RUNNING`, and `agent.log` shows it registered. (The sign-in screen does
-  not show in the viewer yet; see step 5.)
-* After signing in, connecting shows the desktop.
+  `RUNNING`, `agent.log` shows it registered, and connecting shows the
+  sign-in screen, which the viewer can use to sign in.
+* After signing in, the viewer follows onto the desktop.
 
-## 8. Stop and uninstall
+## 8. The secure desktop, in a session
+
+With a viewer connected to the signed-in desktop:
+
+* **UAC:** start something as administrator from the viewer (right-click a
+  terminal, *Run as administrator*). The viewer shows the UAC prompt, and
+  clicking *Yes* in the viewer works. Afterwards the picture comes back to
+  the desktop by itself. `agent.log` shows `followed the input desktop` to
+  `Winlogon` and back to `Default`.
+* **Lock:** press Win+L in the VM itself (Windows does not take Win+L from
+  injected input), or choose *Lock* on the Ctrl+Alt+Del screen below. The
+  viewer shows the lock screen; unlocking from the viewer brings back the
+  desktop.
+* **Ctrl+Alt+Del:** in the viewer, press Ctrl+Alt+End. The VM shows its
+  Ctrl+Alt+Del screen (Lock, Switch user, Sign out, Task Manager), in the
+  viewer too; Esc goes back. If nothing happens, check that
+  `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System`
+  has `SoftwareSASGeneration` set to 1 or 3 — `install` sets it — and send
+  `agent.log`.
+* **Elevated windows:** with an administrator terminal in front, typing into
+  it from the viewer works (the portable agent cannot do this).
+
+For comparison, the portable agent run as a normal user (`nearhand-agent
+portable ...`): on a UAC prompt its viewer keeps the last picture and
+input does nothing, and when the prompt closes, the picture resumes — the
+session is not lost. Its log, in the terminal it was started from, says
+`cannot capture this desktop; waiting`.
+
+## 9. Stop and uninstall
 
 ```bat
 sc stop Nearhand

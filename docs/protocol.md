@@ -121,7 +121,7 @@ added about 0.2 ms to the round trip, with the frame rate unchanged.
 
 ## Session
 
-The TLS handshake negotiates ALPN `nearhand/3`, so a peer on a different
+The TLS handshake negotiates ALPN `nearhand/4`, so a peer on a different
 protocol version fails there rather than mid-stream. The viewer then opens one
 bidirectional stream for control and speaks first:
 
@@ -243,6 +243,12 @@ Keys are physical positions: USB HID usages from the keyboard page (0x07),
 whatever the viewer's platform. The host maps them to its own scancodes and
 applies its own layout. A held key is sent down again for each auto-repeat.
 `Input::Text` is the fallback for keys that have no usage.
+
+`Input::SecureAttention` is Ctrl+Alt+Del. No key injection can produce it,
+and the viewer's own system keeps the real combination for itself, so the
+viewer sends it for Ctrl+Alt+End, as Remote Desktop does. The agent passes it
+to Windows' `SendSAS`, which acts on it only for an agent running as the
+service.
 
 | Message | Units |
 | --- | --- |

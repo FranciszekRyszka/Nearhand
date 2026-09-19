@@ -120,6 +120,70 @@ pub fn install(executable: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Let the agent send Ctrl+Alt+Del: Windows takes it from software only
+/// where the `SoftwareSASGeneration` policy allows services to. Adds that to
+/// whatever the policy allows already; never takes anything away.
+pub fn allow_secure_attention() -> Result<()> {
+    use windows::Win32::System::Registry::{
+        HKEY, HKEY_LOCAL_MACHINE, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_DWORD,
+        REG_OPTION_NON_VOLATILE, RRF_RT_REG_DWORD, RegCloseKey, RegCreateKeyExW, RegGetValueW,
+        RegSetValueExW,
+    };
+    use windows::core::w;
+
+    // SAFETY: the key is closed below; buffers are sized as passed.
+    unsafe {
+        let mut key = HKEY::default();
+        RegCreateKeyExW(
+            HKEY_LOCAL_MACHINE,
+            w!(r"SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System"),
+            None,
+            None,
+            REG_OPTION_NON_VOLATILE,
+            KEY_QUERY_VALUE | KEY_SET_VALUE,
+            None,
+            &mut key,
+            None,
+        )
+        .ok()
+        .context("opening the system policy key")?;
+        let mut value = 0u32;
+        let mut size = size_of::<u32>() as u32;
+        let current = RegGetValueW(
+            key,
+            None,
+            w!("SoftwareSASGeneration"),
+            RRF_RT_REG_DWORD,
+            None,
+            Some(std::ptr::from_mut(&mut value).cast()),
+            Some(&mut size),
+        )
+        .is_ok()
+        .then_some(value);
+        let result = match with_services_allowed(current) {
+            Some(new) => RegSetValueExW(
+                key,
+                w!("SoftwareSASGeneration"),
+                None,
+                REG_DWORD,
+                Some(&new.to_le_bytes()),
+            )
+            .ok()
+            .context("setting SoftwareSASGeneration"),
+            None => Ok(()),
+        };
+        let _ = RegCloseKey(key);
+        result
+    }
+}
+
+/// The `SoftwareSASGeneration` value that also lets services send Ctrl+Alt+Del
+/// (bit 1; bit 2 is for accessibility tools), or `None` if it already does.
+fn with_services_allowed(current: Option<u32>) -> Option<u32> {
+    let current = current.unwrap_or(0);
+    (current & 1 == 0).then_some(current | 1)
+}
+
 /// Stop and remove the service. Its files stay unless the caller removes
 /// them.
 pub fn uninstall() -> Result<()> {
@@ -492,6 +556,15 @@ mod tests {
             line,
             r#""C:\Program Files\Nearhand\nearhand-agent.exe" --log "C:\ProgramData\Nearhand\logs\agent.log" run --stop-event Global\NearhandAgentStop-4-1"#
         );
+    }
+
+    #[test]
+    fn the_policy_gains_services_and_loses_nothing() {
+        assert_eq!(with_services_allowed(None), Some(1));
+        assert_eq!(with_services_allowed(Some(0)), Some(1));
+        assert_eq!(with_services_allowed(Some(2)), Some(3));
+        assert_eq!(with_services_allowed(Some(1)), None);
+        assert_eq!(with_services_allowed(Some(3)), None);
     }
 
     #[test]

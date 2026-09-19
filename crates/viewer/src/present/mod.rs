@@ -487,6 +487,20 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                 }
             }
+            // Ctrl+Alt+End stands in for Ctrl+Alt+Del, which this machine
+            // keeps for itself, as in Remote Desktop.
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        physical_key: PhysicalKey::Code(KeyCode::End),
+                        state: ElementState::Pressed,
+                        repeat: false,
+                        ..
+                    },
+                ..
+            } if self.modifiers == ModifiersState::CONTROL | ModifiersState::ALT => {
+                self.input.secure_attention();
+            }
             // Synthetic events are winit's bookkeeping for keys pressed
             // while the window was not focused; the agent never saw those.
             WindowEvent::KeyboardInput {

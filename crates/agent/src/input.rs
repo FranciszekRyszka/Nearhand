@@ -1,11 +1,14 @@
 //! The viewer's keyboard and mouse, applied to this machine.
 //!
 //! Injection runs on a thread of its own rather than on the runtime: which
-//! desktop input lands on is a property of the calling thread on Windows, and
-//! the M3 service will have to switch that thread between the user's desktop,
-//! UAC and the login screen without disturbing anything else.
+//! desktop input lands on is a property of the calling thread on Windows. The
+//! thread follows the desktop receiving input — the user's, or the secure one
+//! of the sign-in screen and UAC prompts — checking before input goes out,
+//! and again when input is refused. Only SYSTEM may follow onto the secure
+//! desktop; the portable agent's input is refused there, as before.
 
 use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use nearhand_core::Input;
@@ -51,13 +54,24 @@ impl Injection {
     }
 }
 
+/// How often the input thread checks which desktop receives input, at most.
+/// Each check is a couple of system calls; input comes much faster.
+const DESKTOP_CHECK: Duration = Duration::from_millis(100);
+
 fn run(mut injector: Box<dyn nearhand_input::Injector>, commands: mpsc::Receiver<Command>) {
     let mut warned = false;
+    let mut desktop = Desktop::new();
     for command in commands {
         match command {
             Command::Retarget(target) => injector.set_target(target),
             Command::Inject(event) => {
-                if let Err(e) = injector.inject(&event) {
+                desktop.follow(false);
+                let mut result = injector.inject(&event);
+                // Refused: perhaps the desktop changed since the last check.
+                if result.is_err() && desktop.follow(true) {
+                    result = injector.inject(&event);
+                }
+                if let Err(e) = result {
                     // Typically an elevated window in the foreground, which a
                     // non-elevated agent may not touch. Worth one warning, not
                     // one per mouse move.
@@ -73,5 +87,41 @@ fn run(mut injector: Box<dyn nearhand_input::Injector>, commands: mpsc::Receiver
     }
     if let Err(e) = injector.release_all() {
         tracing::warn!(error = %e, "could not release held keys");
+    }
+}
+
+/// The desktop the input thread is on, kept on the input desktop.
+struct Desktop {
+    #[cfg(windows)]
+    thread: nearhand_capture::desktop::ThreadDesktop,
+    checked: Option<Instant>,
+}
+
+impl Desktop {
+    fn new() -> Self {
+        Self {
+            #[cfg(windows)]
+            thread: nearhand_capture::desktop::ThreadDesktop::current(),
+            checked: None,
+        }
+    }
+
+    /// Move to the input desktop if it changed; `now` skips the rate limit.
+    /// True when the thread moved.
+    fn follow(&mut self, now: bool) -> bool {
+        if !now && self.checked.is_some_and(|at| at.elapsed() < DESKTOP_CHECK) {
+            return false;
+        }
+        self.checked = Some(Instant::now());
+        #[cfg(windows)]
+        match self.thread.follow() {
+            Ok(moved) => moved,
+            Err(e) => {
+                tracing::debug!(error = %e, "input stays on the {} desktop", self.thread.name());
+                false
+            }
+        }
+        #[cfg(not(windows))]
+        false
     }
 }

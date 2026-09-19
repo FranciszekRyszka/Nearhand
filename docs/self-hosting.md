@@ -40,7 +40,9 @@ nearhand-agent install --server 203.0.113.10:443 --server-fingerprint <fingerpri
 It asks for an access password (at least 10 characters), prints the
 machine's ID, and starts the `Nearhand` service, which keeps the agent
 running in whichever session is at the console. The viewer connects with the
-ID and the access password, as with the portable agent. `nearhand-agent
+ID and the access password, as with the portable agent. Because the agent
+runs as SYSTEM, the viewer also sees and controls the sign-in and lock
+screens and UAC prompts; Ctrl+Alt+End in the viewer sends Ctrl+Alt+Del. `nearhand-agent
 status` shows the ID again, `set-password` changes the password, and
 `uninstall` removes the service (`--purge` also removes the key, and so the
 ID). Its files — key, configuration, logs — are in `%ProgramData%\Nearhand`,

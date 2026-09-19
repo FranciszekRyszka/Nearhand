@@ -21,8 +21,6 @@
 //! A protocol violation closes the connection with a code from
 //! [`nearhand_core::proto::close`] and a reason the viewer can show.
 
-use crate::host::{Host, InSession};
-use nearhand_transport::rendezvous::{Path, path_of};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -35,6 +33,7 @@ use nearhand_core::video::{encode_chunk, packetize};
 use nearhand_core::{
     Caps, Clipboard, Control, Cursor, Input, Monitor, PROTOCOL_VERSION, StreamKind,
 };
+use nearhand_transport::rendezvous::{Path, path_of};
 use nearhand_transport::{recv_message, send_all, send_message};
 use quinn::{Connection, RecvStream};
 use serde::Serialize;
@@ -42,6 +41,7 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
 use crate::gate::{Gate, Verdict};
+use crate::host::{Host, InSession};
 use crate::input::Injection;
 use crate::pipeline::{Pipeline, QualityControl, Settings};
 use crate::rate::{self, Quality, RateController};
@@ -113,12 +113,12 @@ impl Video {
     }
 }
 
-pub async fn serve(conn: Connection, config: &SessionConfig) -> Result<()> {
-    let (mut send, mut recv) = conn
-        .accept_bi()
-        .await
-        .context("waiting for the control stream")?;
-
+/// Serve one viewer, whose control stream is `send` and `recv`.
+pub async fn serve(
+    conn: Connection,
+    (mut send, mut recv): (quinn::SendStream, RecvStream),
+    config: &SessionConfig,
+) -> Result<()> {
     match recv_message::<Control>(&mut recv).await? {
         Some(Control::Hello { version, .. }) if version == PROTOCOL_VERSION => {}
         Some(Control::Hello { version, .. }) => {

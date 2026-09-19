@@ -16,6 +16,8 @@ pub mod clock;
 pub mod pointer;
 
 #[cfg(windows)]
+pub mod desktop;
+#[cfg(windows)]
 pub mod dxgi;
 #[cfg(target_os = "macos")]
 pub mod sck;
@@ -26,6 +28,11 @@ pub enum Error {
     Unsupported,
     #[error("the capture source went away (display change, session switch)")]
     SourceLost,
+    /// The screen shows a desktop this process may not capture — the secure
+    /// desktop of a UAC prompt or the sign-in screen, for anything but
+    /// SYSTEM. Temporary: capture resumes when it goes.
+    #[error("the {0} desktop is in front, which this process may not capture")]
+    Blocked(String),
     #[error("capture backend failure: {0}")]
     Backend(String),
 }

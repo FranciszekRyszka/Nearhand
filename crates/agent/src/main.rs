@@ -220,6 +220,9 @@ fn one_viewer() -> Arc<Semaphore> {
     Arc::new(Semaphore::new(1))
 }
 
+/// How long a viewer has to open its control stream once connected.
+const FIRST_STREAM: std::time::Duration = std::time::Duration::from_secs(15);
+
 /// Serve viewers arriving at `endpoint`, each once it holds `slot`. Endpoints
 /// sharing a slot share the limit.
 async fn accept_viewers(endpoint: Endpoint, config: Arc<SessionConfig>, slot: Arc<Semaphore>) {
@@ -235,6 +238,17 @@ async fn accept_viewers(endpoint: Endpoint, config: Arc<SessionConfig>, slot: Ar
                 }
             };
             let remote = conn.remote_address();
+            // A viewer may reach this agent two ways at once — directly and
+            // through the relay — and keep one: the one it opens its control
+            // stream on. Only that one may take the slot; the other is closed
+            // by the viewer, unused.
+            let control = match tokio::time::timeout(FIRST_STREAM, conn.accept_bi()).await {
+                Ok(Ok(control)) => control,
+                _ => {
+                    tracing::debug!(%remote, "connection not used by its viewer");
+                    return;
+                }
+            };
             let Ok(_permit) = slot.try_acquire_owned() else {
                 tracing::info!(%remote, "turned away: a viewer is already connected");
                 conn.close(close::BUSY.into(), b"another viewer is connected");
@@ -243,7 +257,7 @@ async fn accept_viewers(endpoint: Endpoint, config: Arc<SessionConfig>, slot: Ar
 
             let path = nearhand_transport::rendezvous::path_of(remote);
             tracing::info!(%remote, %path, "viewer connected");
-            match session::serve(conn, &config).await {
+            match session::serve(conn, control, &config).await {
                 Ok(()) => tracing::info!(%remote, "viewer left"),
                 Err(e) => tracing::info!(%remote, error = %format!("{e:#}"), "session ended"),
             }

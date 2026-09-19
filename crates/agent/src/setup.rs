@@ -42,7 +42,13 @@ pub fn install(options: Install) -> Result<()> {
         Identity::load_or_create(&machine::key_path(&dir)).context("creating the device key")?;
 
     #[cfg(windows)]
-    crate::service::install(&std::env::current_exe()?)?;
+    {
+        if let Err(e) = crate::service::allow_secure_attention() {
+            // Everything else works without it.
+            println!("Note: Ctrl+Alt+Del from a viewer will not work: {e:#}");
+        }
+        crate::service::install(&std::env::current_exe()?)?;
+    }
 
     println!("Installed. This computer's ID is {}.", identity.device_id());
     println!("Anyone with that ID and the access password can now control it,");

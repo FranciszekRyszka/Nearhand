@@ -91,6 +91,7 @@ impl Injector for SendInputInjector {
                     .collect();
                 send(&events)
             }
+            Input::SecureAttention => secure_attention(),
         }
     }
 
@@ -111,6 +112,36 @@ impl Injector for SendInputInjector {
                 .map(|(flags, data)| mouse_input(0, 0, data, flags)),
         );
         send(&events)
+    }
+}
+
+/// Ctrl+Alt+Del, through `SendSAS` — keyboard injection cannot produce it.
+///
+/// Windows honours it only from a process running as SYSTEM, and only if the
+/// `SoftwareSASGeneration` policy allows services to, which `nearhand-agent
+/// install` sets. `SendSAS` reports nothing either way, so neither can this.
+fn secure_attention() -> Result<()> {
+    use windows::Win32::Foundation::FreeLibrary;
+    use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+    use windows::core::{BOOL, s, w};
+
+    // SAFETY: SendSAS has this signature (sas.h); the library stays loaded
+    // until after the call.
+    unsafe {
+        let library = LoadLibraryW(w!("sas.dll"))
+            .map_err(|e| Error::Backend(format!("loading sas.dll: {e}")))?;
+        let result = match GetProcAddress(library, s!("SendSAS")) {
+            Some(address) => {
+                let send_sas: unsafe extern "system" fn(BOOL) = std::mem::transmute(address);
+                // FALSE: the caller is a service (SYSTEM), not the signed-in
+                // user.
+                send_sas(BOOL::from(false));
+                Ok(())
+            }
+            None => Err(Error::Backend("sas.dll has no SendSAS".to_owned())),
+        };
+        let _ = FreeLibrary(library);
+        result
     }
 }
 

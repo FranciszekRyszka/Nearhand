@@ -41,6 +41,7 @@ enum Command {
     ///
     /// Opens a window showing the remote screen and sends it keyboard and
     /// mouse, with a latency overlay (Ctrl+Shift+F1 toggles it).
+    /// Ctrl+Shift+F2 switches monitors; Ctrl+Alt+End sends Ctrl+Alt+Del.
     Connect {
         /// The device's ID, as its agent shows it: `123 456 7890`.
         id: DeviceId,

@@ -7,7 +7,7 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
 /// Bumped on any incompatible change while we are pre-1.0.
-pub const PROTOCOL_VERSION: u16 = 3;
+pub const PROTOCOL_VERSION: u16 = 4;
 
 /// Video codec negotiated between viewer and agent.
 ///
@@ -205,6 +205,11 @@ pub enum Input {
     Key { scancode: u16, down: bool },
     /// Fallback for keys that have no HID usage.
     Text(String),
+    /// Ctrl+Alt+Del: the secure attention sequence, which no keyboard
+    /// injection can produce. The viewer sends it for Ctrl+Alt+End, since
+    /// its own system keeps Ctrl+Alt+Del for itself. Takes effect only on an
+    /// agent running as the Windows service.
+    SecureAttention,
 }
 
 /// One wheel detent, in [`Input::Wheel`] units. Matches Windows' `WHEEL_DELTA`,

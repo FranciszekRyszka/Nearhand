@@ -167,6 +167,8 @@ fn run(
     // The last frame encoded. Its texture still holds the current desktop, so
     // a keyframe can be produced on demand even when nothing is changing.
     let mut last: Option<Frame> = None;
+    // Whether capture is waiting for a desktop it may not see to go away.
+    let mut blocked = false;
 
     loop {
         loop {
@@ -230,6 +232,15 @@ fn run(
                 // The capturer has already rebuilt its duplication. The new
                 // one starts with a full frame, so nothing needs forcing.
                 tracing::info!("capture source changed; continuing");
+                blocked = false;
+            }
+            Err(nearhand_capture::Error::Blocked(which)) => {
+                // The viewer keeps the last picture until the desktop comes
+                // back; worth one line in the log, not one per retry.
+                if !blocked {
+                    tracing::info!(desktop = %which, "cannot capture this desktop; waiting");
+                    blocked = true;
+                }
             }
             Err(e) => {
                 tracing::error!(error = %e, "capture failed; stopping the pipeline");

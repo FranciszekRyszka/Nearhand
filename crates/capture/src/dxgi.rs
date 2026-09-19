@@ -7,9 +7,12 @@
 //!
 //! Three things are worth knowing before debugging this:
 //!
-//! * Duplication is refused on the secure desktop — UAC prompts and the login
-//!   screen — with `E_ACCESSDENIED`. Following the user there means switching
-//!   desktops with the SYSTEM token, which belongs to M3.
+//! * Duplication covers the desktop the capturing thread is attached to. When
+//!   the input desktop changes — to the secure desktop of a UAC prompt or the
+//!   sign-in screen, and back — duplication is lost, and the capturer moves
+//!   its thread to the new desktop before rebuilding it ([`crate::desktop`]).
+//!   Only SYSTEM may do that for the secure desktop; anyone else gets
+//!   [`Error::Blocked`] until it goes away, and capture carries on then.
 //! * On hybrid-graphics laptops the device and the output must live on the same
 //!   adapter, so the device is created against the adapter the output came from
 //!   rather than with `D3D_DRIVER_TYPE_HARDWARE`.
@@ -45,6 +48,7 @@ use windows::Win32::Graphics::Dxgi::{
 use windows::Win32::System::Performance::QueryPerformanceFrequency;
 use windows::core::Interface;
 
+use super::desktop::{self, ThreadDesktop};
 use super::pointer::{self, Format};
 use super::{Capturer, Display, Error, Frame, Rect, Result};
 use nearhand_core::Cursor;
@@ -74,6 +78,10 @@ pub struct DxgiCapturer {
     pointer: Vec<Cursor>,
     pointer_visible: Option<bool>,
     shape_scratch: Vec<u8>,
+    /// The desktop this (the capturing) thread is attached to.
+    desktop: ThreadDesktop,
+    /// The duplication is gone and could not be rebuilt yet.
+    lost: bool,
 }
 
 impl DxgiCapturer {
@@ -83,6 +91,11 @@ impl DxgiCapturer {
         let output1 = output
             .cast::<IDXGIOutput1>()
             .map_err(|e| backend("IDXGIOutput1", e))?;
+        // A session may start while the secure desktop is in front.
+        let mut desktop = ThreadDesktop::current();
+        if let Err(e) = desktop.follow() {
+            tracing::debug!(error = %e, "not following the input desktop");
+        }
         let duplication = duplicate(&output1, &device)?;
 
         let mut qpc_frequency = 0i64;
@@ -104,15 +117,38 @@ impl DxgiCapturer {
             pointer: Vec::new(),
             pointer_visible: None,
             shape_scratch: Vec::new(),
+            desktop,
+            lost: false,
         })
     }
 
-    /// Rebuild the duplication after `DXGI_ERROR_ACCESS_LOST`.
+    /// Rebuild the duplication after `DXGI_ERROR_ACCESS_LOST`, on whichever
+    /// desktop now receives input.
     ///
     /// Access is lost on desktop switches, resolution changes and when another
-    /// process takes exclusive fullscreen — all routine, none fatal.
+    /// process takes exclusive fullscreen — all routine, none fatal. While it
+    /// cannot be rebuilt, the capturer stays `lost` and tries again on each
+    /// call.
     fn recover(&mut self) -> Result<()> {
-        self.duplication = duplicate(&self.output, &self.device)?;
+        self.lost = true;
+        let followed = match self.desktop.follow() {
+            Ok(_) => Ok(()),
+            Err(desktop::Error::NoAccess(which)) => return Err(Error::Blocked(which)),
+            Err(e) => Err(e),
+        };
+        self.duplication = match duplicate(&self.output, &self.device) {
+            Ok(duplication) => duplication,
+            // Say why the thread did not follow, if it tried and failed:
+            // this is logged once, not at every retry.
+            Err(Error::Blocked(which)) => {
+                return Err(Error::Blocked(match followed {
+                    Ok(()) => which,
+                    Err(e) => format!("{which}; {e}"),
+                }));
+            }
+            Err(e) => return Err(e),
+        };
+        self.lost = false;
         self.texture = None;
         // The new duplication reports the pointer afresh; pass it all on.
         self.pointer_visible = None;
@@ -318,6 +354,17 @@ impl DxgiCapturer {
 
 impl Capturer for DxgiCapturer {
     fn next_frame(&mut self, timeout: Duration) -> Result<Option<Frame>> {
+        if self.lost {
+            return match self.recover() {
+                // Back: the new duplication starts with a whole frame.
+                Ok(()) => Err(Error::SourceLost),
+                Err(e) => {
+                    // Wait as a frame would have, rather than spin.
+                    std::thread::sleep(timeout);
+                    Err(e)
+                }
+            };
+        }
         let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
         let mut resource: Option<IDXGIResource> = None;
 
@@ -508,11 +555,9 @@ fn create_device(adapter: &IDXGIAdapter1) -> Result<(ID3D11Device, ID3D11DeviceC
 /// something specific into messages that say what to do about them.
 fn duplicate(output: &IDXGIOutput1, device: &ID3D11Device) -> Result<IDXGIOutputDuplication> {
     unsafe { output.DuplicateOutput(device) }.map_err(|e| match e.code() {
-        E_ACCESSDENIED => Error::Backend(
-            "duplication denied: the secure desktop (UAC prompt or login screen) is in front, \
-             which needs the SYSTEM token and a desktop switch [M3]"
-                .to_owned(),
-        ),
+        // The secure desktop is in front, and this process may not capture
+        // it: only SYSTEM can.
+        E_ACCESSDENIED => Error::Blocked("secure (sign-in, lock or UAC)".to_owned()),
         DXGI_ERROR_NOT_CURRENTLY_AVAILABLE => Error::Backend(
             "duplication unavailable: this display already has the maximum number of duplications"
                 .to_owned(),

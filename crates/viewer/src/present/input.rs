@@ -42,6 +42,11 @@ impl Forwarder {
         let _ = self.events.send(event);
     }
 
+    /// Ctrl+Alt+Del on the host.
+    pub fn secure_attention(&mut self) {
+        self.send(Input::SecureAttention);
+    }
+
     pub fn focus(&mut self, focused: bool) {
         tracing::debug!(focused, "window focus");
         self.focused = focused;
