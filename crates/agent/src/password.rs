@@ -11,6 +11,8 @@ use std::sync::Mutex;
 
 use ring::rand::{SecureRandom, SystemRandom};
 
+use crate::gate::{Gate, Verdict};
+
 const DIGITS: usize = 6;
 pub const MAX_FAILURES: u32 = 3;
 
@@ -76,6 +78,16 @@ impl Password {
 
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(|p| p.into_inner())
+    }
+}
+
+impl Gate for Password {
+    fn check(&self, attempt: &str) -> Verdict {
+        match Password::check(self, attempt) {
+            Check::Accepted => Verdict::Accepted,
+            Check::Rejected => Verdict::Rejected("wrong password"),
+            Check::Replaced(new) => Verdict::Replaced(new),
+        }
     }
 }
 

@@ -41,8 +41,8 @@ use serde::Serialize;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
+use crate::gate::{Gate, Verdict};
 use crate::input::Injection;
-use crate::password::{Check, Password};
 use crate::pipeline::{Pipeline, QualityControl, Settings};
 use crate::rate::{self, Quality, RateController};
 
@@ -67,8 +67,8 @@ const CLIPBOARD_PRIORITY: i32 = -1;
 pub struct SessionConfig {
     /// The most video bitrate to use; rate control picks what the link takes.
     pub bitrate_kbps: u32,
-    /// Viewers must give this before anything else, when set.
-    pub password: Option<Arc<Password>>,
+    /// What viewers must give before anything else, when set.
+    pub gate: Option<Arc<dyn Gate>>,
     /// The person at this machine, who allows each session and sees it for
     /// as long as it lasts, when there is one to ask.
     pub host: Option<Arc<Host>>,
@@ -159,8 +159,8 @@ pub async fn serve(conn: Connection, config: &SessionConfig) -> Result<()> {
         },
     )
     .await?;
-    if let Some(password) = &config.password {
-        authenticate(&conn, &mut send, &mut recv, password).await?;
+    if let Some(gate) = &config.gate {
+        authenticate(&conn, &mut send, &mut recv, gate).await?;
     }
     // Shown to the person at this machine from here until the session ends.
     let _shown = match &config.host {
@@ -356,7 +356,7 @@ async fn authenticate(
     conn: &Connection,
     send: &mut quinn::SendStream,
     recv: &mut RecvStream,
-    password: &Password,
+    gate: &Arc<dyn Gate>,
 ) -> Result<()> {
     send_message(send, &Control::AuthRequired).await?;
     let attempt = match recv_message::<Control>(recv).await? {
@@ -366,13 +366,19 @@ async fn authenticate(
             bail!("expected Authenticate, got {other:?}");
         }
     };
-    match password.check(&attempt) {
-        Check::Accepted => Ok(()),
-        Check::Rejected => {
-            conn.close(close::AUTH_FAILED.into(), b"wrong password");
-            bail!("wrong password");
+    let verdict = if gate.is_slow() {
+        let gate = gate.clone();
+        tokio::task::spawn_blocking(move || gate.check(&attempt)).await?
+    } else {
+        gate.check(&attempt)
+    };
+    match verdict {
+        Verdict::Accepted => Ok(()),
+        Verdict::Rejected(reason) => {
+            conn.close(close::AUTH_FAILED.into(), reason.as_bytes());
+            bail!("{reason}");
         }
-        Check::Replaced(new) => {
+        Verdict::Replaced(new) => {
             conn.close(close::AUTH_FAILED.into(), b"wrong password");
             // Printed: the person at this machine has to read out the new one.
             println!("too many wrong passwords; the password is now {new}");

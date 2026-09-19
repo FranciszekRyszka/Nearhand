@@ -28,6 +28,24 @@ passes through the server, so the server's bandwidth matters then: a few
 Mbit/s per session, both ways combined. `--relay-only` on the viewer forces the
 relay, to test it.
 
+### Unattended access (Windows)
+
+On a machine that should be reachable with no one at it, install the agent
+as a service, from an administrator terminal:
+
+```bat
+nearhand-agent install --server 203.0.113.10:443 --server-fingerprint <fingerprint>
+```
+
+It asks for an access password (at least 10 characters), prints the
+machine's ID, and starts the `Nearhand` service, which keeps the agent
+running in whichever session is at the console. The viewer connects with the
+ID and the access password, as with the portable agent. `nearhand-agent
+status` shows the ID again, `set-password` changes the password, and
+`uninstall` removes the service (`--purge` also removes the key, and so the
+ID). Its files — key, configuration, logs — are in `%ProgramData%\Nearhand`,
+readable by administrators only. Testing it: [docs/testing-on-windows.md](testing-on-windows.md).
+
 There is no Nearhand-run infrastructure — no project ID server, no project
 relay. Every install points at a server you run.
 

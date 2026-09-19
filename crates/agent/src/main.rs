@@ -7,18 +7,26 @@
 //! directly on the LAN, with no server, so the pipeline can be measured on its
 //! own.
 
+mod access;
 mod elevation;
+mod gate;
 mod host;
 mod input;
+mod machine;
 mod password;
 mod pipeline;
 mod portable;
+mod prompt;
 mod rate;
+#[cfg(windows)]
+mod service;
 mod session;
+mod setup;
+mod unattended;
 mod window;
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -37,25 +45,62 @@ struct Cli {
     #[arg(short, long, action = clap::ArgAction::Count, global = true)]
     verbose: u8,
 
+    /// Write the log to this file instead of the terminal.
+    #[arg(long, global = true)]
+    log: Option<PathBuf>,
+
     #[command(subcommand)]
     command: Command,
 }
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Enrol this machine with a server and install the unattended service. [M3]
+    /// Set this computer up for unattended access, as administrator: its
+    /// key and ID, its server, an access password, and the Windows service
+    /// that keeps the agent running.
     Install {
-        /// Server address, for example `desk.example.com`.
+        /// The server's address, for example `203.0.113.10:443`.
         #[arg(long)]
-        server: String,
-        /// Enrollment token issued by an admin.
+        server: SocketAddr,
+        /// The fingerprint the server printed when it started.
         #[arg(long)]
-        token: String,
+        server_fingerprint: Fingerprint,
+        /// The access password. Asked for, without showing it, if not given
+        /// here — where it would stay in the shell's history.
+        #[arg(long)]
+        password: Option<String>,
+        /// The most video bitrate to use.
+        #[arg(long, default_value_t = machine::DEFAULT_BITRATE_KBPS)]
+        bitrate_kbps: u32,
     },
-    /// Remove the service and this machine's enrollment. [M3]
-    Uninstall,
-    /// Run in the foreground, connected to the enrolled server. [M2]
-    Run,
+    /// Remove the service, as administrator.
+    Uninstall {
+        /// Also delete the key and configuration. The next install gets a
+        /// new ID.
+        #[arg(long)]
+        purge: bool,
+    },
+    /// Change the access password, as administrator.
+    SetPassword {
+        /// The new password; asked for if not given.
+        #[arg(long)]
+        password: Option<String>,
+    },
+    /// Show whether the service runs, and this computer's ID.
+    Status,
+    /// Run the installed agent in the foreground. The service runs this
+    /// in the console session; run it by hand, as administrator, to watch.
+    Run {
+        /// How the service asks it to stop.
+        #[arg(long, hide = true)]
+        stop_event: Option<String>,
+        /// Another folder than the installed one, for testing.
+        #[arg(long, hide = true)]
+        dir: Option<PathBuf>,
+    },
+    /// Entry point for the Windows service manager.
+    #[command(hide = true)]
+    Service,
     /// Portable quick-support mode: register with a server and show an ID
     /// and one-time password for the viewer to use.
     Portable {
@@ -95,7 +140,7 @@ enum Command {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    init_tracing(cli.verbose);
+    init_tracing(cli.verbose, cli.log.as_deref());
     dpi_aware();
 
     match cli.command {
@@ -103,7 +148,7 @@ fn main() -> Result<()> {
             let runtime = tokio::runtime::Runtime::new().context("starting the runtime")?;
             let config = SessionConfig {
                 bitrate_kbps,
-                password: None,
+                gate: None,
                 host: None,
             };
             runtime.block_on(listen(bind, config))
@@ -121,9 +166,27 @@ fn main() -> Result<()> {
             bitrate_kbps,
             window: !console,
         }),
-        Command::Install { .. } | Command::Uninstall | Command::Run => {
-            anyhow::bail!("not implemented: scheduled for M2/M3, see the roadmap in README.md")
+        Command::Install {
+            server,
+            server_fingerprint,
+            password,
+            bitrate_kbps,
+        } => setup::install(setup::Install {
+            server,
+            server_fingerprint,
+            password,
+            bitrate_kbps,
+        }),
+        Command::Uninstall { purge } => setup::uninstall(purge),
+        Command::SetPassword { password } => setup::set_password(password),
+        Command::Status => setup::status(),
+        Command::Run { stop_event, dir } => {
+            unattended::run(dir.unwrap_or_else(machine::dir), stop_event)
         }
+        #[cfg(windows)]
+        Command::Service => service::dispatch(),
+        #[cfg(not(windows))]
+        Command::Service => anyhow::bail!("the service is Windows-only"),
     }
 }
 
@@ -206,7 +269,7 @@ fn dpi_aware() {
 #[cfg(not(windows))]
 fn dpi_aware() {}
 
-fn init_tracing(verbose: u8) {
+fn init_tracing(verbose: u8, log: Option<&Path>) {
     let level = match verbose {
         0 => tracing::Level::INFO,
         1 => tracing::Level::DEBUG,
@@ -227,8 +290,38 @@ fn init_tracing(verbose: u8) {
         .with_target("naga", quiet);
     use tracing_subscriber::layer::SubscriberExt as _;
     use tracing_subscriber::util::SubscriberInitExt as _;
-    tracing_subscriber::registry()
-        .with(tracing_subscriber::fmt::layer())
-        .with(filter)
-        .init();
+    let registry = tracing_subscriber::registry().with(filter);
+    match log.map(open_log) {
+        Some(Ok(file)) => registry
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_ansi(false)
+                    .with_writer(std::sync::Mutex::new(file)),
+            )
+            .init(),
+        other => {
+            registry.with(tracing_subscriber::fmt::layer()).init();
+            if let Some(Err(e)) = other {
+                tracing::warn!(error = %format!("{e:#}"), "cannot write the log file; logging here");
+            }
+        }
+    }
+}
+
+/// Past this, a log starts over rather than grow without end.
+const LOG_LIMIT: u64 = 10 * 1024 * 1024;
+
+fn open_log(path: &Path) -> Result<std::fs::File> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let long = std::fs::metadata(path).is_ok_and(|m| m.len() > LOG_LIMIT);
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .append(!long)
+        .truncate(long)
+        .open(path)
+        .with_context(|| format!("opening {}", path.display()))?;
+    Ok(file)
 }

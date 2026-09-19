@@ -1,9 +1,9 @@
 # Security
 
-> **Status: partly implemented.** Device keys, pinning, the relay, and the
-> portable agent's one-time password, accept prompt and session indicator
-> exist; enrollment, grants, the per-device access password and signed
-> releases do not yet.
+> **Status: partly implemented.** Device keys, pinning, the relay, the
+> portable agent's one-time password, accept prompt and session indicator,
+> and the installed agent's access password exist; enrollment, grants, the
+> unattended session indicator and signed releases do not yet.
 > Track the gap against the roadmap in the README.
 
 Nearhand hands one machine full control of another. The threat model is built in
@@ -34,6 +34,18 @@ checks it.
 - **Unattended** sessions require a grant signed by the pinned server key.
 - An optional **per-device access password** is verified by the agent itself, so
   a compromised server alone is not enough to take over a machine.
+  - *Implemented, in place of grants until accounts arrive (M5):* an
+    installed agent lets in anyone with its access password, and nobody
+    else. The password is set at install, at least 10 characters, and kept
+    only as a salted PBKDF2-HMAC-SHA256 hash (600,000 rounds) in a folder
+    only SYSTEM and administrators can read, beside the device key. Each
+    check takes a noticeable fraction of a second. After five wrong
+    passwords in a row the agent refuses every attempt for 30 seconds,
+    doubling up to 15 minutes, so guessing online is hopeless. The server
+    never sees the password.
+  - Until then the password is the *only* check: there is no grant, and no
+    one at the machine is asked. It should be treated like an
+    administrator's password.
 - **Attended** sessions require the person at the host to accept, or a one-time
   password. Attempts are rate-limited.
   - *Implemented:* the portable agent shows six random digits. The agent
@@ -82,11 +94,13 @@ checks it.
 
 ## Known limits
 
-A **malicious server** can put itself between a viewer and a portable agent.
+A **malicious server** can put itself between a viewer and an agent.
 It can report its own key as the device's, since the ID does not pin the key.
 It can then relay the password the viewer types to the real agent. The
 password protects against anyone who is not the server; it does not protect
-against the server itself. A password-authenticated key exchange (PAKE) would
+against the server itself. For an installed agent this is worse than for a
+portable one: the access password lasts, so a server that captured it once
+could use it again later. A password-authenticated key exchange (PAKE) would
 close this gap, and is worth adding before 1.0.
 
 A **fully compromised management server** could issue itself a grant. The

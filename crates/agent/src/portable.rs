@@ -48,7 +48,7 @@ pub fn run(options: Options) -> Result<()> {
     };
     let config = Arc::new(SessionConfig {
         bitrate_kbps: options.bitrate_kbps,
-        password: Some(password.clone()),
+        gate: Some(password.clone()),
         host: Some(host.clone()),
     });
     let id = identity.device_id();
@@ -82,7 +82,8 @@ pub fn run(options: Options) -> Result<()> {
     Ok(())
 }
 
-async fn serve(
+/// Stay registered and serve viewers, until the runtime stops.
+pub(crate) async fn serve(
     endpoint: Endpoint,
     server: SocketAddr,
     server_fingerprint: Fingerprint,
@@ -106,7 +107,7 @@ async fn serve(
     );
 }
 
-fn unspecified_like(addr: SocketAddr) -> SocketAddr {
+pub(crate) fn unspecified_like(addr: SocketAddr) -> SocketAddr {
     if addr.is_ipv6() {
         (std::net::Ipv6Addr::UNSPECIFIED, 0).into()
     } else {
