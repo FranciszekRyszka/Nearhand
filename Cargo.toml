@@ -22,3 +22,10 @@ lto = "fat"
 codegen-units = 1
 panic = "abort"
 strip = true
+
+# Password hashing is slow on purpose, and unoptimised it is slow enough to
+# stall the tests and a debug server. Optimise just those crates.
+[profile.dev.package.argon2]
+opt-level = 3
+[profile.dev.package.blake2]
+opt-level = 3

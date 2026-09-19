@@ -2,8 +2,9 @@
 
 > **Status: partly implemented.** Device keys, pinning, the relay, the
 > portable agent's one-time password and accept prompt, the installed
-> agent's access password, and session indicators for both exist;
-> enrollment, grants and signed releases do not yet.
+> agent's access password, session indicators for both, and server accounts
+> (Argon2id, TOTP, API tokens) exist; enrollment, grants and signed releases
+> do not yet.
 > Track the gap against the roadmap in the README.
 
 Nearhand hands one machine full control of another. The threat model is built in
@@ -28,6 +29,29 @@ ID in minutes. What the viewer pins is the full fingerprint the server reports,
 so for an attended session the viewer trusts the server to report it
 honestly. The one-time password then decides who gets in, and only the agent
 checks it.
+
+## Accounts
+
+People sign in to the server — the console, and the REST API — with an
+account (M5).
+
+- Passwords are at least 10 characters and stored as Argon2id hashes
+  (19 MiB, two passes). Signing in with an unknown name costs the same time
+  as with a known one, so the answer does not say which names exist.
+- Wrong passwords are limited to ten per quarter of an hour per address,
+  and ten per account name from anywhere.
+- TOTP (RFC 6238, any authenticator app) can be turned on per account; each
+  code works once, and turning it off takes a current code.
+- A console sign-in is a random 256-bit token in a cookie marked `HttpOnly`,
+  `Secure` and `SameSite=Strict`, for 12 hours. Requests that change
+  anything with that cookie must also not come from another site's page.
+  Changing the password or disabling the account ends its sign-ins.
+- Scripts use API tokens instead, which each user makes and deletes. Sign-in
+  and API tokens are stored only as their SHA-256, so a copy of the
+  database does not let anyone in.
+- The first administrator is made with a one-time token the server prints
+  on its first start; there is no default password.
+- The last active administrator cannot be demoted, disabled or deleted.
 
 ## Authorisation
 

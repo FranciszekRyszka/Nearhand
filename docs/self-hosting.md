@@ -1,8 +1,9 @@
 # Self-hosting
 
-> **Status: early.** Today the server introduces portable agents to viewers
-> by device ID, and nothing else. The rest of this page is the shape it is being
-> built to: relay (M2), and accounts, enrollment and the console (M5).
+> **Status: early.** The server introduces agents to viewers by device ID,
+> relays sessions that cannot go direct, and has user accounts behind a REST
+> API. Enrollment, groups and grants, the console and a Docker image are still
+> to come (M5, M6); the sections about them say so.
 
 ## What works today
 
@@ -84,17 +85,58 @@ does not pass through, every session falls back to TCP and gets slower.
 
 ## Configuration
 
-One TOML file, with environment variables overriding it. TLS is either built-in
-ACME or a certificate you supply.
+One TOML file, `nearhand.toml` in the working folder unless `--config` says
+otherwise, and every setting in it can come from the environment instead:
+`NEARHAND_<SECTION>_<KEY>`, for example `NEARHAND_HTTP_BIND`. No file at all
+means the defaults.
+
+```toml
+[data]
+dir = "/var/lib/nearhand"      # server.key, nearhand.db, https.crt/.key
+
+[quic]
+bind = "0.0.0.0:443"           # UDP: agents, viewers, the relay
+
+[http]
+bind = "0.0.0.0:443"           # TCP: the REST API (and the console, to come)
+tls = "self-signed"            # made on first start; browsers warn about it
+# tls = "files"                # a real certificate:
+# cert = "/etc/letsencrypt/live/desk.example.com/fullchain.pem"
+# key = "/etc/letsencrypt/live/desk.example.com/privkey.pem"
+# tls = "none"                 # plain HTTP behind a reverse proxy; bind to 127.0.0.1
+public_url = "https://desk.example.com"   # for the links the server prints
+```
+
+The HTTPS certificate is separate from the server key agents and viewers pin:
+browsers do not accept the Ed25519 certificate that key makes. Built-in ACME
+(Let's Encrypt) is planned; until then use `tls = "files"` with a certificate
+from certbot or similar, or a reverse proxy for the TCP side.
 
 ## Running it
 
-Either `docker compose up` with a single volume, or the binary plus a systemd
-unit. The volume holds the SQLite file and the server key.
+The binary, as a service — a systemd unit, or a Windows service wrapper.
+(A Docker image comes with M6.)
 
-The first start prints a one-time admin setup link.
+```bash
+nearhand-server serve                 # or: --config /etc/nearhand/nearhand.toml
+```
+
+The first start, with no users, prints how to create the first
+administrator: one API call with a one-time token, valid for 24 hours.
+`nearhand-server admin-link` prints a new one. The console will turn this into
+a link to click.
+
+### The REST API
+
+Everything is under `/api/v1`, JSON in and out; [api.md](api.md) lists it.
+Scripts authenticate with an API token (`Authorization: Bearer nht_…`), which
+any user makes for themselves (`POST /api/v1/me/tokens`) and which is shown
+once. Passwords are Argon2id hashes; TOTP (any authenticator app) can be
+turned on per user; wrong passwords are limited per address and per name.
 
 ## Enrollment
+
+> Not yet: this is the next step of M5.
 
 An admin creates a token — single-use or multi-use, with an expiry and a target
 group — and the agent registers against it:
@@ -108,7 +150,9 @@ address and token baked in) for rollout through GPO, Intune or MDM.
 
 ## Backup
 
-The SQLite file and the server key. That is the whole backup.
+The data folder: the SQLite file (`nearhand.db`, with its `-wal` file while
+the server runs — or stop it first, or use `sqlite3 nearhand.db ".backup
+copy.db"`) and the server key. That is the whole backup.
 
 **Losing the server key means re-enrolling every device**, because agents pin it.
 Back it up somewhere other than the server.

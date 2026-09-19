@@ -14,6 +14,12 @@ planning/
 .env.*
 *.pem
 *.key
+*.crt
+
+# A server's data folder, when run from here: its database.
+nearhand.db
+nearhand.db-*
+nearhand.toml
 
 # Editors / IDEs
 .vscode/
