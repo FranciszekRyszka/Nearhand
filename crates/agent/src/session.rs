@@ -44,7 +44,7 @@ use nearhand_transport::rendezvous::{Path, path_of};
 use nearhand_transport::{recv_message, send_all, send_message};
 use quinn::{Connection, RecvStream};
 use serde::Serialize;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
 use crate::gate::Verdict;
@@ -102,16 +102,21 @@ struct VideoStats {
 struct Video {
     pipeline: Pipeline,
     sender: JoinHandle<VideoStats>,
+    /// Tells the sender to finish.
+    stop: oneshot::Sender<()>,
 }
 
 impl Video {
     /// Stop, and return the frame id and bitrate the next stream should
     /// start from.
     async fn stop(self) -> Option<(u32, u32)> {
+        // The sender first: it lets go of the frame channel, and a pipeline
+        // waiting for room in it — the queue full, the viewer gone — gives
+        // up and ends. Joining the pipeline first would wait on it for ever.
+        let _ = self.stop.send(());
+        let stats = self.sender.await.ok();
         self.pipeline.stop().await;
-        // The pipeline dropped its end of the frame channel, so the sender
-        // drains and finishes on its own.
-        let stats = self.sender.await.ok()?;
+        let stats = stats?;
         tracing::info!(
             frames = stats.frames,
             keyframes = stats.keyframes,
@@ -681,15 +686,18 @@ async fn start_video(conn: &Connection, settings: Settings, stream: Stream) -> R
     if (initial.bitrate_kbps, initial.fps) != (settings.bitrate_kbps, settings.max_fps) {
         control.set(initial.bitrate_kbps, initial.fps);
     }
+    let (stop, stopped) = oneshot::channel();
     let sender = tokio::spawn(send_video(
         conn.clone(),
         started.frames,
         stream,
         Rate { rate, control },
+        stopped,
     ));
     Ok(Video {
         pipeline: started.pipeline,
         sender,
+        stop,
     })
 }
 
@@ -703,11 +711,16 @@ async fn start_video(conn: &Connection, settings: Settings, stream: Stream) -> R
 /// Every encoded frame consumes a frame id, sent or not. The viewer detects
 /// loss by gaps in the ids; a frame skipped here without leaving a gap would
 /// have the next P-frame decoded against the wrong reference.
+///
+/// Ends when told to through `stop`, when the pipeline ends, or when the
+/// connection does — whatever QUIC still held for it counts as backlog for
+/// ever after, so a lost viewer would otherwise be waited on for good.
 async fn send_video(
     conn: Connection,
     mut frames: mpsc::Receiver<nearhand_codec::EncodedFrame>,
     mut stream: Stream,
     rate: Rate,
+    mut stop: oneshot::Receiver<()>,
 ) -> VideoStats {
     let Rate {
         rate: mut controller,
@@ -730,6 +743,8 @@ async fn send_video(
         // fresh. Nothing encoded is dropped, so the reference chain holds.
         let backlogged = backlog(&conn) > rate::backlog_limit(controller.target_kbps());
         let frame = tokio::select! {
+            _ = &mut stop => break,
+            _ = conn.closed() => break,
             frame = frames.recv(), if !backlogged => match frame {
                 Some(frame) => frame,
                 None => break,
@@ -863,5 +878,85 @@ mod tests {
         sent.insert(1000, datagrams(1, SENT_BYTES));
         assert!(sent.bytes <= SENT_BYTES);
         assert_eq!(sent.chunks(1000, &[]).len(), 1);
+    }
+
+    /// Both ends of a QUIC connection over loopback: the agent's, the
+    /// viewer's, and the endpoints that keep them up.
+    async fn connected() -> (Connection, Connection, [quinn::Endpoint; 2]) {
+        use nearhand_transport::{Identity, client_endpoint, connect, server_endpoint};
+        let identity = Identity::generate().expect("identity");
+        let loopback = "127.0.0.1:0".parse().expect("address");
+        let agent = server_endpoint(loopback, &identity).expect("agent endpoint");
+        let address = agent.local_addr().expect("agent address");
+        let viewer = client_endpoint(address).expect("viewer endpoint");
+        let (agent_side, viewer_side) = tokio::join!(
+            async {
+                agent
+                    .accept()
+                    .await
+                    .expect("incoming")
+                    .await
+                    .expect("handshake")
+            },
+            async {
+                connect(&viewer, address, identity.fingerprint())
+                    .await
+                    .expect("connect")
+            },
+        );
+        (agent_side, viewer_side, [agent, viewer])
+    }
+
+    /// What a video sender needs besides its connection and frames.
+    fn video_stream() -> (Stream, Rate) {
+        let quality = Quality {
+            bitrate_kbps: 8000,
+            fps: 60,
+        };
+        let (cursor, _) = mpsc::unbounded_channel();
+        let stream = Stream {
+            first_frame_id: 0,
+            cursor,
+            sent: Arc::default(),
+            ceiling: watch::channel(quality).1,
+        };
+        let rate = Rate {
+            rate: RateController::new(quality, quality.bitrate_kbps, 1920, 1080),
+            control: QualityControl::detached(),
+        };
+        (stream, rate)
+    }
+
+    /// A lost viewer ends the video, though the pipeline is still there
+    /// and QUIC may still count unsent datagrams against the connection.
+    #[tokio::test]
+    async fn video_ends_with_the_connection() {
+        let (agent, viewer, _endpoints) = connected().await;
+        let (_pipeline, frames) = mpsc::channel(4);
+        let (_stop, stop) = oneshot::channel();
+        let (stream, rate) = video_stream();
+        let sender = tokio::spawn(send_video(agent, frames, stream, rate, stop));
+        viewer.close(close::NORMAL.into(), b"bye");
+        tokio::time::timeout(Duration::from_secs(5), sender)
+            .await
+            .expect("the sender ends")
+            .expect("the sender task");
+    }
+
+    /// Told to stop, the sender lets go of the frame channel: a pipeline
+    /// waiting for room in it hears so, and can be joined.
+    #[tokio::test]
+    async fn stopped_video_frees_the_pipeline() {
+        let (agent, _viewer, _endpoints) = connected().await;
+        let (pipeline, frames) = mpsc::channel(4);
+        let (stop, stopped) = oneshot::channel();
+        let (stream, rate) = video_stream();
+        let sender = tokio::spawn(send_video(agent, frames, stream, rate, stopped));
+        stop.send(()).expect("the sender listens");
+        tokio::time::timeout(Duration::from_secs(5), sender)
+            .await
+            .expect("the sender ends")
+            .expect("the sender task");
+        assert!(pipeline.is_closed());
     }
 }

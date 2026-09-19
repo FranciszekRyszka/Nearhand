@@ -47,6 +47,12 @@ impl QualityControl {
         // Fails only once the pipeline has stopped.
         let _ = self.0.send(Command::Quality { bitrate_kbps, fps });
     }
+
+    /// One that steers nothing, for tests without a pipeline.
+    #[cfg(test)]
+    pub fn detached() -> Self {
+        Self(mpsc::channel().0)
+    }
 }
 
 /// A running pipeline. Stop it with [`Pipeline::stop`]; dropping it also
