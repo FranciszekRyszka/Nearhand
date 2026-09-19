@@ -43,6 +43,8 @@ use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, Server
 use rustls::crypto::{CryptoProvider, verify_tls12_signature, verify_tls13_signature};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
 use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
+use rustls::server::{ClientHello, ResolvesServerCert};
+use rustls::sign::CertifiedKey;
 use rustls::{CertificateError, DigitallySignedStruct, DistinguishedName, SignatureScheme};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -245,6 +247,91 @@ pub fn rendezvous_server_config(identity: &Identity) -> Result<ServerConfig> {
         .with_protocol_versions(&[&rustls::version::TLS13])?
         .with_client_cert_verifier(Arc::new(AnyClientKey { provider }));
     serving(identity, tls, SERVER_ALPN, Link::Server)
+}
+
+/// ALPN of WebTransport, which runs over HTTP/3.
+pub const WEBTRANSPORT_ALPN: &[u8] = b"h3";
+
+/// The certificate the server shows browsers. They do not accept the
+/// Ed25519 one agents and viewers pin, so WebTransport connections get this
+/// instead: a certificate from a CA, or a short-lived self-signed one that
+/// the page connecting names by its hash. It can be replaced while the
+/// server runs.
+#[derive(Default)]
+pub struct WebCertificate {
+    current: std::sync::RwLock<Option<Arc<CertifiedKey>>>,
+}
+
+impl fmt::Debug for WebCertificate {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("WebCertificate")
+    }
+}
+
+impl WebCertificate {
+    /// Show `chain` (leaf first), whose key is `key`, from now on.
+    pub fn set(
+        &self,
+        chain: Vec<CertificateDer<'static>>,
+        key: PrivateKeyDer<'static>,
+    ) -> Result<()> {
+        let certified = CertifiedKey::from_der(chain, key, &provider())?;
+        *self.current.write().unwrap_or_else(|p| p.into_inner()) = Some(Arc::new(certified));
+        Ok(())
+    }
+
+    fn get(&self) -> Option<Arc<CertifiedKey>> {
+        self.current
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+}
+
+/// [`rendezvous_server_config`], also serving WebTransport to browsers with
+/// `web`'s certificate.
+pub fn rendezvous_server_config_with_web(
+    identity: &Identity,
+    web: Arc<WebCertificate>,
+) -> Result<ServerConfig> {
+    let provider = provider();
+    let native = Arc::new(CertifiedKey::from_der(
+        vec![identity.cert.clone()],
+        PrivateKeyDer::Pkcs8(identity.key.clone_key()),
+        &provider,
+    )?);
+    let mut tls = rustls::ServerConfig::builder_with_provider(provider.clone())
+        .with_protocol_versions(&[&rustls::version::TLS13])?
+        .with_client_cert_verifier(Arc::new(AnyClientKey { provider }))
+        .with_cert_resolver(Arc::new(ByAlpn { native, web }));
+    tls.alpn_protocols = vec![SERVER_ALPN.to_vec(), WEBTRANSPORT_ALPN.to_vec()];
+    // The server link's transport enables datagrams, which WebTransport
+    // needs as much as the relay does.
+    let crypto = QuicServerConfig::try_from(tls).map_err(|e| Error::Config(e.to_string()))?;
+    let mut config = ServerConfig::with_crypto(Arc::new(crypto));
+    config.transport_config(Arc::new(transport_config(Link::Server)?));
+    Ok(config)
+}
+
+/// Picks the certificate by what the client asks to speak: browsers
+/// (`h3`) get the web one, everyone else the pinned Ed25519 one.
+#[derive(Debug)]
+struct ByAlpn {
+    native: Arc<CertifiedKey>,
+    web: Arc<WebCertificate>,
+}
+
+impl ResolvesServerCert for ByAlpn {
+    fn resolve(&self, hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        let browser = hello
+            .alpn()
+            .is_some_and(|mut offered| offered.any(|p| p == WEBTRANSPORT_ALPN));
+        if browser {
+            self.web.get()
+        } else {
+            Some(self.native.clone())
+        }
+    }
 }
 
 fn serving(

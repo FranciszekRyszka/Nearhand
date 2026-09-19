@@ -18,6 +18,7 @@ mod https;
 mod netsim;
 mod rendezvous;
 mod totp;
+mod webtransport;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -26,7 +27,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use nearhand_transport::{Identity, rendezvous_endpoint};
+use nearhand_transport::{Identity, rendezvous_server_config_with_web};
 
 use crate::accounts::Accounts;
 use crate::config::Config;
@@ -123,8 +124,14 @@ async fn serve(config: Config, key: PathBuf) -> Result<()> {
         Identity::load_or_create(&key)
             .with_context(|| format!("loading the server key from {}", key.display()))?,
     );
-    let endpoint = rendezvous_endpoint(config.quic.bind, &identity)
-        .with_context(|| format!("listening on UDP {}", config.quic.bind))?;
+    // Browsers get a certificate of their own on the same port.
+    let web = webtransport::Web::new(&config)?;
+    tokio::spawn(web.clone().keep_renewing());
+    let endpoint = quinn::Endpoint::server(
+        rendezvous_server_config_with_web(&identity, web.certificate.clone())?,
+        config.quic.bind,
+    )
+    .with_context(|| format!("listening on UDP {}", config.quic.bind))?;
     let pool = db::open(&config.database_path()).await?;
     let accounts = Arc::new(Accounts::new(pool.clone()));
     let first_start = !accounts.has_users().await?;
@@ -149,6 +156,8 @@ async fn serve(config: Config, key: PathBuf) -> Result<()> {
         devices,
         grants,
         audit,
+        identity: identity.clone(),
+        web,
         registry: registry.clone(),
         server: api::ServerInfo {
             address: config.public_address(),

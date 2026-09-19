@@ -36,7 +36,9 @@ use crate::audit::{Audit, Entry, Event};
 use crate::devices::{Device, Devices, EnrollToken, Group};
 use crate::grants::{GrantRule, Grants, UserGroup};
 use crate::rendezvous::Registry;
+use crate::webtransport::Web;
 use nearhand_core::grant::Role;
+use nearhand_transport::Identity;
 
 pub const SESSION_COOKIE: &str = "nearhand_session";
 
@@ -45,6 +47,10 @@ pub struct AppState {
     pub devices: Arc<Devices>,
     pub grants: Arc<Grants>,
     pub audit: Arc<Audit>,
+    /// The server's key, which signs grants.
+    pub identity: Arc<Identity>,
+    /// What browsers need to reach the QUIC side.
+    pub web: Arc<Web>,
     /// Who is connected now.
     pub registry: Arc<Registry>,
     pub server: ServerInfo,
@@ -74,6 +80,7 @@ pub struct ServerInfo {
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
+    let console = crate::console::router(&state.server.address);
     Router::new()
         .route("/api/v1/health", get(health))
         .route("/api/v1/setup", post(setup))
@@ -119,7 +126,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/grants", get(list_grants).post(set_grant))
         .route("/api/v1/grants/{id}", delete(delete_grant))
         .route("/api/v1/audit", get(audit_log))
-        .merge(crate::console::router())
+        .route("/api/v1/devices/{id}/grant", post(device_grant))
+        .route("/api/v1/webtransport", get(webtransport))
+        .merge(console)
         .with_state(state)
 }
 
@@ -1030,6 +1039,71 @@ impl AppState {
     }
 }
 
+// --- The web viewer -----------------------------------------------------------------
+
+/// Where the web viewer connects, and the certificate hash its browser must
+/// accept if the server's is self-signed.
+async fn webtransport(
+    State(state): State<Arc<AppState>>,
+    _caller: Caller,
+) -> Json<serde_json::Value> {
+    let hashes: Vec<String> = state.web.hash().map(|h| hex(&h)).into_iter().collect();
+    Json(json!({
+        "url": format!("https://{}{}", state.server.address, crate::webtransport::PATH),
+        "certificate_hashes": hashes,
+    }))
+}
+
+/// A grant for the caller on device `id`, for the web viewer to present:
+/// what a native viewer gets from the QUIC side with an API token.
+async fn device_grant(
+    State(state): State<Arc<AppState>>,
+    caller: Caller,
+    Path(id): Path<i64>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let reachable = state
+        .grants
+        .reachable(caller.user.id)
+        .await?
+        .into_iter()
+        .find(|r| r.id == id);
+    let Some(device) = reachable else {
+        // As if it were not there: no grant says nothing about the device.
+        state
+            .record(
+                &caller,
+                "session.refuse",
+                &format!("#{id}"),
+                Some("no grant".into()),
+            )
+            .await;
+        return Err(Refused::NotFound.into());
+    };
+    let signed = crate::grants::issue(&state.identity, &device, &caller.user.name)
+        .map_err(|e| crate::accounts::internal(format!("{e:#}")))?;
+    let bytes =
+        postcard::to_stdvec(&signed).map_err(|e| crate::accounts::internal(e.to_string()))?;
+    let device_id = device.fingerprint.device_id();
+    state
+        .record(
+            &caller,
+            "session.grant",
+            &device_id.to_string(),
+            Some(format!("{}, web", device.role)),
+        )
+        .await;
+    Ok(Json(json!({
+        "device_id": device_id.to_string(),
+        "fingerprint": device.fingerprint.to_string(),
+        "role": device.role.as_str(),
+        "grant": hex(&bytes),
+    })))
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 // --- Audit log ----------------------------------------------------------------------
 
 #[derive(Deserialize)]
@@ -1079,6 +1153,8 @@ mod tests {
             devices: devices.clone(),
             grants: Arc::new(Grants::new(pool.clone())),
             audit: Arc::new(Audit::new(pool)),
+            identity: Arc::new(Identity::generate().expect("server key")),
+            web: Web::new(&crate::config::Config::default()).expect("web certificate"),
             server: ServerInfo {
                 address: "desk.example.com:443".into(),
                 fingerprint: "ab".repeat(32),
@@ -1588,6 +1664,71 @@ mod tests {
             "but reach none"
         );
 
+        // The web viewer's grant: for bob on the device he may reach, not
+        // on the other, nor for the administrator without a grant.
+        let granted = api
+            .call(
+                Method::POST,
+                &format!("/api/v1/devices/{}/grant", ids[0]),
+                &[("cookie", &bob), ("origin", "https://desk.example.com")],
+                None,
+            )
+            .await;
+        assert_eq!(granted.status, StatusCode::OK, "{}", granted.body);
+        assert_eq!(granted.body["role"], "control");
+        let bytes: Vec<u8> = granted.body["grant"]
+            .as_str()
+            .expect("grant")
+            .as_bytes()
+            .chunks(2)
+            .map(|h| u8::from_str_radix(std::str::from_utf8(h).expect("hex"), 16).expect("hex"))
+            .collect();
+        let signed: nearhand_core::grant::SignedGrant =
+            postcard::from_bytes(&bytes).expect("a signed grant");
+        let claims = signed.claims().expect("claims");
+        assert_eq!(claims.user, "bob");
+        assert_eq!(claims.device, [1u8; 32]);
+        for (who, device) in [(&bob, ids[1]), (&admin, ids[0])] {
+            let refused = api
+                .call(
+                    Method::POST,
+                    &format!("/api/v1/devices/{device}/grant"),
+                    &[("cookie", who)],
+                    None,
+                )
+                .await;
+            assert_eq!(refused.status, StatusCode::NOT_FOUND);
+        }
+        let from_elsewhere = api
+            .call(
+                Method::POST,
+                &format!("/api/v1/devices/{}/grant", ids[0]),
+                &[("cookie", &bob), ("origin", "https://evil.example")],
+                None,
+            )
+            .await;
+        assert_eq!(
+            from_elsewhere.status,
+            StatusCode::FORBIDDEN,
+            "no grants for other sites"
+        );
+        let web = api
+            .call(
+                Method::GET,
+                "/api/v1/webtransport",
+                &[("cookie", &bob)],
+                None,
+            )
+            .await;
+        assert_eq!(web.body["url"], "https://desk.example.com:443/nearhand");
+        assert_eq!(
+            web.body["certificate_hashes"]
+                .as_array()
+                .expect("hashes")
+                .len(),
+            1
+        );
+
         let server = api
             .call(Method::GET, "/api/v1/server", &[("cookie", &bob)], None)
             .await;
@@ -1622,6 +1763,10 @@ mod tests {
                 .expect("policy");
             assert!(policy.contains("script-src 'self'") && !policy.contains("unsafe"));
             assert!(policy.contains("frame-ancestors 'none'"));
+            assert!(
+                policy.contains("connect-src 'self' https://desk.example.com:443;"),
+                "the server's own WebTransport, and nothing else: {policy}"
+            );
             assert_eq!(
                 headers[axum::http::header::X_CONTENT_TYPE_OPTIONS],
                 "nosniff"

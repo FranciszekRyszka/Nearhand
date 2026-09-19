@@ -13,9 +13,14 @@
 //! tunnel carries one session only. To QUIC, each relayed peer is an address
 //! in `100::/64` — a range reserved for discarding traffic, so it can never
 //! be a real host — with the session in the low 64 bits.
+//!
+//! The tunnel's carrier need not be a QUIC connection: anything that sends
+//! and receives datagrams will do ([`Carrier`]). A browser's is a
+//! WebTransport session.
 
 use std::collections::VecDeque;
 use std::fmt;
+use std::future::Future;
 use std::io::{self, IoSliceMut};
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
@@ -69,6 +74,31 @@ pub fn untag(datagram: &Bytes) -> Option<(u64, Bytes)> {
     Some((session, datagram.slice(SESSION_LEN..)))
 }
 
+/// What a tunnel's packets travel in: a connection that sends and receives
+/// datagrams.
+pub trait Carrier: Send + Sync + 'static {
+    /// Send one datagram; false if it could not go, which is a lost packet.
+    fn send_datagram(&self, datagram: Bytes) -> bool;
+    /// The next datagram, or none once the carrier has closed.
+    fn read_datagram(&self) -> Pin<Box<dyn Future<Output = Option<Bytes>> + Send + '_>>;
+    /// For logs.
+    fn describe(&self) -> String;
+}
+
+impl Carrier for Connection {
+    fn send_datagram(&self, datagram: Bytes) -> bool {
+        Connection::send_datagram(self, datagram).is_ok()
+    }
+
+    fn read_datagram(&self) -> Pin<Box<dyn Future<Output = Option<Bytes>> + Send + '_>> {
+        Box::pin(async move { Connection::read_datagram(self).await.ok() })
+    }
+
+    fn describe(&self) -> String {
+        format!("via {}", self.remote_address())
+    }
+}
+
 /// An endpoint whose socket is a tunnel over `carrier`, serving `config` if
 /// given (the agent's) or connecting only (the viewer's).
 ///
@@ -76,6 +106,15 @@ pub fn untag(datagram: &Bytes) -> Option<(u64, Bytes)> {
 /// sessions.
 pub fn endpoint(
     carrier: Connection,
+    tagged: bool,
+    config: Option<ServerConfig>,
+) -> Result<Endpoint> {
+    endpoint_over(Arc::new(carrier), tagged, config)
+}
+
+/// [`endpoint`], over any [`Carrier`].
+pub fn endpoint_over(
+    carrier: Arc<dyn Carrier>,
     tagged: bool,
     config: Option<ServerConfig>,
 ) -> Result<Endpoint> {
@@ -87,7 +126,7 @@ pub fn endpoint(
     let inbox = tunnel.inbox.clone();
     tokio::spawn(async move {
         // Ends when the carrier closes.
-        while let Ok(datagram) = carrier.read_datagram().await {
+        while let Some(datagram) = carrier.read_datagram().await {
             let arrived = if tagged {
                 untag(&datagram).map(|(session, packet)| (relayed_address(session), packet))
             } else {
@@ -107,14 +146,14 @@ pub fn endpoint(
 }
 
 struct Tunnel {
-    carrier: Connection,
+    carrier: Arc<dyn Carrier>,
     tagged: bool,
     inbox: Arc<Inbox>,
 }
 
 impl fmt::Debug for Tunnel {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Tunnel(via {})", self.carrier.remote_address())
+        write!(f, "Tunnel({})", self.carrier.describe())
     }
 }
 
@@ -182,8 +221,8 @@ impl AsyncUdpSocket for Tunnel {
             };
             // A datagram that cannot go is a lost packet, which QUIC above
             // recovers from; as for a UDP socket, that is not an error.
-            if let Err(e) = self.carrier.send_datagram(datagram) {
-                tracing::trace!(error = %e, "relayed packet dropped");
+            if !self.carrier.send_datagram(datagram) {
+                tracing::trace!("relayed packet dropped");
             }
         }
         Ok(())

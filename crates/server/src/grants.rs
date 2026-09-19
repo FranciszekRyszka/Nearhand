@@ -11,8 +11,9 @@
 
 use std::collections::HashMap;
 
-use nearhand_core::grant::Role;
-use nearhand_transport::Fingerprint;
+use nearhand_core::grant::{Grant, LIFETIME_SECS, Role, SignedGrant};
+use nearhand_transport::{Fingerprint, Identity};
+use ring::rand::{SecureRandom, SystemRandom};
 use serde::Serialize;
 use sqlx::SqlitePool;
 
@@ -53,6 +54,25 @@ pub struct Reachable {
 
 pub struct Grants {
     pool: SqlitePool,
+}
+
+/// A grant for `user` on `device`, signed with the server's key: good for
+/// [`LIFETIME_SECS`], once.
+pub fn issue(identity: &Identity, device: &Reachable, user: &str) -> anyhow::Result<SignedGrant> {
+    let mut nonce = [0u8; 16];
+    SystemRandom::new()
+        .fill(&mut nonce)
+        .map_err(|_| anyhow::anyhow!("the system random number generator failed"))?;
+    let issued_at = now().max(0) as u64;
+    let grant = Grant {
+        device: *device.fingerprint.as_bytes(),
+        user: user.to_owned(),
+        role: device.role,
+        issued_at,
+        expires_at: issued_at + LIFETIME_SECS,
+        nonce,
+    };
+    Ok(identity.sign_grant(&grant)?)
 }
 
 type GrantRow = (i64, i64, String, i64, String, String);

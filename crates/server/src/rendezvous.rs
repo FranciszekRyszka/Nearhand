@@ -33,12 +33,11 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use nearhand_core::grant::{Grant, LIFETIME_SECS, SignedGrant};
+use nearhand_core::grant::SignedGrant;
 use nearhand_core::rendezvous::{DeviceId, Enrollment, FromServer, Refusal, ToServer};
-use nearhand_transport::relay::{tag, untag};
+use nearhand_transport::relay::{Carrier, tag, untag};
 use nearhand_transport::{Fingerprint, Identity, peer_fingerprint, recv_message, send_message};
 use quinn::{Connection, Endpoint, SendStream};
-use ring::rand::{SecureRandom, SystemRandom};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::accounts::Accounts;
@@ -61,7 +60,9 @@ const ATTEMPT_WINDOW: Duration = Duration::from_secs(60);
 type Relays = Arc<Mutex<HashMap<u64, Relay>>>;
 
 struct Relay {
-    viewer: Connection,
+    /// The viewer's side of the tunnel: its QUIC connection, or a browser's
+    /// WebTransport session.
+    viewer: Arc<dyn Carrier>,
     /// Bytes relayed to the viewer.
     to_viewer: Arc<AtomicU64>,
 }
@@ -121,11 +122,25 @@ pub async fn serve(endpoint: Endpoint, registry: Arc<Registry>) {
                 }
             };
             let remote = conn.remote_address();
-            if let Err(e) = handle(conn, &registry).await {
+            let result = if is_browser(&conn) {
+                crate::webtransport::serve(conn, &registry).await
+            } else {
+                handle(conn, &registry).await
+            };
+            if let Err(e) = result {
                 tracing::debug!(%remote, error = %format!("{e:#}"), "client ended");
             }
         });
     }
+}
+
+/// Whether `conn` is a browser's, speaking WebTransport rather than this
+/// server's own protocol.
+fn is_browser(conn: &Connection) -> bool {
+    conn.handshake_data()
+        .and_then(|data| data.downcast::<quinn::crypto::rustls::HandshakeData>().ok())
+        .and_then(|data| data.protocol)
+        .is_some_and(|alpn| alpn == nearhand_transport::WEBTRANSPORT_ALPN)
 }
 
 async fn handle(conn: Connection, registry: &Registry) -> Result<()> {
@@ -239,7 +254,7 @@ async fn register(
                 count.fetch_add(packet.len() as u64, Ordering::Relaxed);
                 // A full queue drops the oldest datagrams; the connection
                 // inside recovers, as from any loss.
-                let _ = viewer.send_datagram(packet);
+                viewer.send_datagram(packet);
             }
         }
     });
@@ -283,22 +298,77 @@ async fn introduce(
     addresses: Vec<SocketAddr>,
     token: Option<String>,
 ) -> Result<()> {
-    let observed = conn.remote_address();
+    let introduction = match arrange(registry, conn.remote_address(), id, addresses, token).await {
+        Ok(introduction) => introduction,
+        Err(refusal) => return refuse(conn, send, refusal).await,
+    };
+    for message in introduction.messages() {
+        send_message(send, &message).await?;
+    }
+    let _ = send.finish();
+    relay(
+        Arc::new(conn.clone()),
+        &introduction.agent,
+        introduction.session,
+    )
+    .await;
+    Ok(())
+}
+
+/// A viewer and an agent that has opened its way to it.
+pub(crate) struct Introduction {
+    agent: Agent,
+    session: u64,
+    /// The user and the grant signed for them, when they came with a token.
+    grant: Option<(String, SignedGrant)>,
+}
+
+impl Introduction {
+    /// What the viewer is told: its grant, if any, then the agent.
+    pub(crate) fn messages(&self) -> Vec<FromServer> {
+        let mut messages = Vec::with_capacity(2);
+        if let Some((_, grant)) = &self.grant {
+            messages.push(FromServer::Granted(grant.clone()));
+        }
+        messages.push(FromServer::Peer {
+            fingerprint: *self.agent.fingerprint.as_bytes(),
+            addresses: candidates(
+                self.agent.reported.clone(),
+                self.agent.conn.remote_address(),
+            ),
+        });
+        messages
+    }
+
+    /// Relay between `viewer` and the agent until the viewer goes.
+    pub(crate) async fn relay(self, viewer: Arc<dyn Carrier>) {
+        relay(viewer, &self.agent, self.session).await;
+    }
+}
+
+/// Introduce the viewer at `observed` to device `id`, as the user whose
+/// token this is if there is one: find the agent, ask it to open its way
+/// to `addresses`, and wait for it to answer.
+pub(crate) async fn arrange(
+    registry: &Registry,
+    observed: SocketAddr,
+    id: DeviceId,
+    addresses: Vec<SocketAddr>,
+    token: Option<String>,
+) -> std::result::Result<Introduction, Refusal> {
     if !registry.attempt(observed.ip()) {
-        return refuse(conn, send, Refusal::TooManyAttempts).await;
+        return Err(Refusal::TooManyAttempts);
     }
     let (agent, grant) = match token {
         None => {
             let agent = lock(&registry.agents).get(&id).cloned();
-            match agent {
-                Some(agent) => (agent, None),
-                None => return refuse(conn, send, Refusal::Offline).await,
-            }
+            (agent.ok_or(Refusal::Offline)?, None)
         }
-        Some(token) => match authorize(registry, &token, id, observed.ip().to_canonical()).await {
-            Ok((agent, grant)) => (agent, Some(grant)),
-            Err(refusal) => return refuse(conn, send, refusal).await,
-        },
+        Some(token) => {
+            let (agent, grant) =
+                authorize(registry, &token, id, observed.ip().to_canonical()).await?;
+            (agent, Some(grant))
+        }
     };
 
     let session = registry.next.fetch_add(1, Ordering::Relaxed);
@@ -315,27 +385,20 @@ async fn introduce(
         );
     lock(&agent.waiting).remove(&session);
     if !ready {
-        return refuse(conn, send, Refusal::Declined).await;
+        return Err(Refusal::Declined);
     }
-
     tracing::info!(%id, viewer = %observed, user = ?grant.as_ref().map(|(user, _)| user), "introduced");
-    if let Some((_, grant)) = grant {
-        send_message(send, &FromServer::Granted(grant)).await?;
-    }
-    let peer = FromServer::Peer {
-        fingerprint: *agent.fingerprint.as_bytes(),
-        addresses: candidates(agent.reported.clone(), agent.conn.remote_address()),
-    };
-    send_message(send, &peer).await?;
-    let _ = send.finish();
-    relay(conn, &agent, session).await;
-    Ok(())
+    Ok(Introduction {
+        agent,
+        session,
+        grant,
+    })
 }
 
 /// Forward the viewer's datagrams to the agent, and the agent's for this
 /// session back, until the viewer closes its connection: at once when it
 /// connected directly, at the end of the session when it did not.
-async fn relay(viewer: &Connection, agent: &Agent, session: u64) {
+async fn relay(viewer: Arc<dyn Carrier>, agent: &Agent, session: u64) {
     let to_viewer = Arc::new(AtomicU64::new(0));
     lock(&agent.relays).insert(
         session,
@@ -345,7 +408,7 @@ async fn relay(viewer: &Connection, agent: &Agent, session: u64) {
         },
     );
     let mut to_agent = 0u64;
-    while let Ok(datagram) = viewer.read_datagram().await {
+    while let Some(datagram) = viewer.read_datagram().await {
         to_agent += datagram.len() as u64;
         let _ = agent.conn.send_datagram(tag(session, &datagram));
     }
@@ -426,22 +489,8 @@ async fn authorize(
         .filter(|a| a.fingerprint == device.fingerprint)
         .cloned()
         .ok_or(Refusal::Offline)?;
-    let mut nonce = [0u8; 16];
-    SystemRandom::new().fill(&mut nonce).map_err(|_| {
-        tracing::error!("the system random number generator failed");
-        Refusal::NotAllowed
-    })?;
-    let issued_at = crate::db::now().max(0) as u64;
-    let grant = Grant {
-        device: *device.fingerprint.as_bytes(),
-        user: user.name.clone(),
-        role: device.role,
-        issued_at,
-        expires_at: issued_at + LIFETIME_SECS,
-        nonce,
-    };
-    let signed = access.identity.sign_grant(&grant).map_err(|e| {
-        tracing::error!(error = %e, "signing a grant");
+    let signed = crate::grants::issue(&access.identity, &device, &user.name).map_err(|e| {
+        tracing::error!(error = %format!("{e:#}"), "signing a grant");
         Refusal::NotAllowed
     })?;
     access
