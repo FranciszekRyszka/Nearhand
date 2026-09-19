@@ -53,3 +53,25 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check
+
+  # The agent's MSI, unsigned until there is a code-signing certificate. Kept
+  # as an artifact of each run, for testing in a VM.
+  msi:
+    name: agent MSI
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # WiX 5: from 6 on, WiX asks for its maintenance-fee licence to be
+      # accepted.
+      - run: |
+          dotnet tool install --global wix --version 5.0.2
+          wix extension add -g WixToolset.Util.wixext/5.0.2
+      - run: ./packaging/windows/build-msi.ps1
+        shell: pwsh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nearhand-agent-msi
+          path: target/release/nearhand-agent-*-x64.msi
+          if-no-files-found: error

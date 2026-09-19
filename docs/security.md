@@ -1,9 +1,9 @@
 # Security
 
 > **Status: partly implemented.** Device keys, pinning, the relay, the
-> portable agent's one-time password, accept prompt and session indicator,
-> and the installed agent's access password exist; enrollment, grants, the
-> unattended session indicator and signed releases do not yet.
+> portable agent's one-time password and accept prompt, the installed
+> agent's access password, and session indicators for both exist;
+> enrollment, grants and signed releases do not yet.
 > Track the gap against the roadmap in the README.
 
 Nearhand hands one machine full control of another. The threat model is built in
@@ -81,8 +81,17 @@ checks it.
   - *Implemented, for the portable agent:* for as long as a session lasts,
     its window says the computer is being controlled, by whom, and for how
     long, with a button to end it. The window stays on top and comes back
-    if minimised; closing it stops the agent. The service (M3) will need its
-    own indicator.
+    if minimised; closing it stops the agent.
+  - *Implemented, for the installed agent:* a small window on the user's
+    desktop, shown only during a session, says the computer is being
+    controlled remotely, by whom and for how long, with a button to end it.
+    It stays on top, comes back if minimised, and refuses to close (Alt+F4
+    included). It is not on the sign-in screen or UAC prompts, which the
+    person at the machine is looking at then.
+  - *Limit:* on a machine whose graphics cannot show a window at all — a VM
+    with no display adapter — the indicator fails, the agent logs it, and
+    sessions still work. Refusing sessions there would make headless
+    machines unreachable; the log is the record.
 
 ## Supply chain
 

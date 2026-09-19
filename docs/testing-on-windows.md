@@ -19,10 +19,12 @@ happen; when something else happens, the two log files are what to send back.
   Note the fingerprint it prints. From the VM, the server is at the host's
   address — on a NAT network, usually the address of the host's virtual
   adapter, which `ipconfig` on the host shows.
-* **The agent:** build it on the host (`cargo build --release -p
-  nearhand-agent`) and copy `target\release\nearhand-agent.exe` into the VM,
-  to `C:\Program Files\Nearhand\` — the service runs it from where it was
-  installed, so put it somewhere it will stay.
+* **The agent:** either the MSI — from the latest CI run's *nearhand-agent-msi*
+  artifact, or built on the host with `packaging\windows\build-msi.ps1` —
+  or the bare `nearhand-agent.exe` (`cargo build --release -p
+  nearhand-agent`), copied into the VM to `C:\Program Files\Nearhand\`: the
+  service runs it from where it was installed. Step 1 has both ways; the
+  rest is the same.
 * **The viewer:** on the host, `target\release\nearhand-viewer.exe`.
 
 The logs are in the VM, in `C:\ProgramData\Nearhand\logs\`: `service.log`
@@ -31,7 +33,28 @@ Both need an administrator to read them.
 
 ## 1. Install
 
-In an administrator terminal in the VM:
+**With the MSI**, in an administrator terminal in the VM:
+
+```bat
+msiexec /i nearhand-agent-0.1.0-x64.msi /l*v install.log SERVER=<host address>:4433 SERVER_FINGERPRINT=<fingerprint> ACCESS_PASSWORD=<password>
+```
+
+* Windows warns that the MSI is unsigned; that is expected for now.
+* It installs to `C:\Program Files\Nearhand`, and `sc query Nearhand` says
+  `RUNNING`. `sc qfailure Nearhand` lists three restarts.
+* `install.log` must **not** contain the password: search it for the
+  password itself. Only `**********` should appear where it was.
+* Without the three properties, on a machine never configured, it refuses
+  to install and says which properties it needs.
+* `nearhand-agent status` (as administrator, in `C:\Program Files\Nearhand`)
+  shows the ID.
+
+The checks under *Either way* below apply too. Later, check an upgrade: build a copy with the version raised in `crates\agent\Cargo.toml`,
+run `msiexec /i` on it with **no** properties, and the ID stays the same.
+Uninstalling from *Installed apps* removes the service and the program, and
+keeps `C:\ProgramData\Nearhand`.
+
+**Without the MSI**, in an administrator terminal in the VM:
 
 ```bat
 cd "C:\Program Files\Nearhand"
@@ -42,6 +65,9 @@ nearhand-agent install --server <host address>:4433 --server-fingerprint <finger
   one shorter than 10 characters.
 * It prints the ID, and says it installed.
 * `sc query Nearhand` says `RUNNING`.
+
+**Either way:**
+
 * `icacls C:\ProgramData\Nearhand` lists only `NT AUTHORITY\SYSTEM` and
   `BUILTIN\Administrators`.
 * `service.log` has `service running` and `agent started`; `agent.log` has
@@ -139,7 +165,21 @@ input does nothing, and when the prompt closes, the picture resumes — the
 session is not lost. Its log, in the terminal it was started from, says
 `cannot capture this desktop; waiting`.
 
-## 9. Stop and uninstall
+## 9. The session indicator
+
+With the viewer connected to the signed-in desktop:
+
+* A small red window, *Nearhand — remote session*, says the computer is
+  being controlled remotely, by whom, and for how long. It stays on top.
+* It cannot be closed: it has no close button, and Alt+F4 on it does
+  nothing. Minimising it (Win+D) brings it back.
+* *End session* ends the viewer's session, with the viewer saying "ended by
+  the person at the device"; the window goes away.
+* With no session, it is not shown — also right after signing in.
+* If it never appears, `agent.log` says why (`no session indicator`) —
+  likely graphics the VM cannot provide. Note which.
+
+## 10. Stop and uninstall
 
 ```bat
 sc stop Nearhand

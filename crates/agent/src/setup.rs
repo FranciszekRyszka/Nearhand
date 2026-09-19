@@ -20,6 +20,21 @@ pub struct Install {
 /// the service. Run again, it replaces the configuration but keeps the key,
 /// and so the ID.
 pub fn install(options: Install) -> Result<()> {
+    let server = options.server;
+    let identity = configure(options)?;
+    #[cfg(windows)]
+    crate::service::install(&std::env::current_exe()?)?;
+
+    println!("Installed. This computer's ID is {}.", identity.device_id());
+    println!("Anyone with that ID and the access password can now control it,");
+    println!("through {server} — keep the password safe.");
+    Ok(())
+}
+
+/// Everything `install` does but the service: the configuration, the key,
+/// and the policy that lets the agent send Ctrl+Alt+Del. The MSI runs this,
+/// and registers the service itself.
+pub fn configure(options: Install) -> Result<Identity> {
     supported()?;
     let password = match options.password {
         Some(password) => password,
@@ -42,18 +57,11 @@ pub fn install(options: Install) -> Result<()> {
         Identity::load_or_create(&machine::key_path(&dir)).context("creating the device key")?;
 
     #[cfg(windows)]
-    {
-        if let Err(e) = crate::service::allow_secure_attention() {
-            // Everything else works without it.
-            println!("Note: Ctrl+Alt+Del from a viewer will not work: {e:#}");
-        }
-        crate::service::install(&std::env::current_exe()?)?;
+    if let Err(e) = crate::service::allow_secure_attention() {
+        // Everything else works without it.
+        println!("Note: Ctrl+Alt+Del from a viewer will not work: {e:#}");
     }
-
-    println!("Installed. This computer's ID is {}.", identity.device_id());
-    println!("Anyone with that ID and the access password can now control it,");
-    println!("through {} — keep the password safe.", options.server);
-    Ok(())
+    Ok(identity)
 }
 
 /// Stop and remove the service; with `purge`, also the key and

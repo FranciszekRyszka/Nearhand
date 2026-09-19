@@ -196,6 +196,11 @@ impl Host {
         }
     }
 
+    /// Wake whoever shows this, to look again: for news from outside.
+    pub fn poke(&self) {
+        self.changed();
+    }
+
     fn changed(&self) {
         if let Some(notify) = &*self.notify.lock().unwrap_or_else(|p| p.into_inner()) {
             notify();

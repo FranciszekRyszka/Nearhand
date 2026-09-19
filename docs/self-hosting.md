@@ -46,7 +46,22 @@ screens and UAC prompts; Ctrl+Alt+End in the viewer sends Ctrl+Alt+Del. `nearhan
 status` shows the ID again, `set-password` changes the password, and
 `uninstall` removes the service (`--purge` also removes the key, and so the
 ID). Its files — key, configuration, logs — are in `%ProgramData%\Nearhand`,
-readable by administrators only. Testing it: [docs/testing-on-windows.md](testing-on-windows.md).
+readable by administrators only. While a session lasts, a small window on
+the user's desktop says so, and can end it.
+
+Or install the MSI (built by `packaging/windows/build-msi.ps1`, and by CI on
+every push), which does the same and suits a silent rollout:
+
+```bat
+msiexec /i nearhand-agent-0.1.0-x64.msi /qn SERVER=203.0.113.10:443 ^
+    SERVER_FINGERPRINT=<fingerprint> ACCESS_PASSWORD=<password>
+```
+
+An MSI installation is removed from *Installed apps* (or `msiexec /x`), not
+with `nearhand-agent uninstall`; both keep the key, and so the ID. The MSI is
+not signed yet, so Windows warns before running it.
+
+Testing it: [docs/testing-on-windows.md](testing-on-windows.md).
 
 There is no Nearhand-run infrastructure — no project ID server, no project
 relay. Every install points at a server you run.

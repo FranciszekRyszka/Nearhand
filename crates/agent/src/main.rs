@@ -11,6 +11,7 @@ mod access;
 mod elevation;
 mod gate;
 mod host;
+mod indicator;
 mod input;
 mod machine;
 mod password;
@@ -70,6 +71,18 @@ enum Command {
         #[arg(long)]
         password: Option<String>,
         /// The most video bitrate to use.
+        #[arg(long, default_value_t = machine::DEFAULT_BITRATE_KBPS)]
+        bitrate_kbps: u32,
+    },
+    /// `install` without the service, which the MSI registers itself.
+    #[command(hide = true)]
+    Configure {
+        #[arg(long)]
+        server: SocketAddr,
+        #[arg(long)]
+        server_fingerprint: Fingerprint,
+        #[arg(long)]
+        password: Option<String>,
         #[arg(long, default_value_t = machine::DEFAULT_BITRATE_KBPS)]
         bitrate_kbps: u32,
     },
@@ -176,6 +189,23 @@ fn main() -> Result<()> {
             server_fingerprint,
             password,
             bitrate_kbps,
+        }),
+        Command::Configure {
+            server,
+            server_fingerprint,
+            password,
+            bitrate_kbps,
+        } => setup::configure(setup::Install {
+            server,
+            server_fingerprint,
+            password,
+            bitrate_kbps,
+        })
+        .map(|identity| {
+            println!(
+                "Configured. This computer's ID is {}.",
+                identity.device_id()
+            )
         }),
         Command::Uninstall { purge } => setup::uninstall(purge),
         Command::SetPassword { password } => setup::set_password(password),

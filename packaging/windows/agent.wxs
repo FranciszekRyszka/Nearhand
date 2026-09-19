@@ -1,0 +1,102 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The Nearhand agent for unattended access, as an MSI (WiX 5).
+
+  Installs nearhand-agent.exe to Program Files and registers the Nearhand
+  service, as `nearhand-agent install` does. The machine's configuration —
+  server, its fingerprint, access password — comes from properties, so the
+  same MSI serves a silent rollout (GPO, Intune):
+
+    msiexec /i nearhand-agent.msi /qn SERVER=203.0.113.10:443
+            SERVER_FINGERPRINT=<hex> ACCESS_PASSWORD=<password>
+
+  An upgrade or repair on a configured machine needs none of them: the
+  configuration and key in %ProgramData%\Nearhand are kept, and so is the ID.
+  Uninstalling removes the service and the program, and keeps those too;
+  running `nearhand-agent uninstall` with its purge option first removes them.
+
+  Build with build-msi.ps1.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
+  <Package Name="Nearhand Agent"
+           Manufacturer="Nearhand"
+           Version="$(Version)"
+           UpgradeCode="20F1B49E-6D91-4570-9DA2-C6EA4601F377"
+           Scope="perMachine"
+           Compressed="yes">
+    <MajorUpgrade DowngradeErrorMessage="A newer version of the Nearhand agent is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <!-- Set when this machine is configured already: an upgrade or repair
+         needs no server or password then. -->
+    <Property Id="CONFIGURED">
+      <DirectorySearch Id="NearhandData" Path="[CommonAppDataFolder]Nearhand" Depth="0">
+        <FileSearch Name="agent.toml" />
+      </DirectorySearch>
+    </Property>
+    <!-- Kept out of the installer's logs: the password, and the command
+         line built from it below. -->
+    <Property Id="ACCESS_PASSWORD" Hidden="yes" Secure="yes" />
+    <Property Id="Configure" Hidden="yes" />
+    <Property Id="SERVER" Secure="yes" />
+    <Property Id="SERVER_FINGERPRINT" Secure="yes" />
+
+    <Launch Condition="Installed OR CONFIGURED OR (SERVER AND SERVER_FINGERPRINT AND ACCESS_PASSWORD)"
+            Message="Install with SERVER, SERVER_FINGERPRINT and ACCESS_PASSWORD, for example: msiexec /i nearhand-agent.msi SERVER=203.0.113.10:443 SERVER_FINGERPRINT=... ACCESS_PASSWORD=..." />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="Nearhand">
+        <Component Id="Agent" Bitness="always64">
+          <File Id="AgentExe" Source="$(AgentExe)" Name="nearhand-agent.exe" KeyPath="yes" />
+          <ServiceInstall Id="NearhandService"
+                          Name="Nearhand"
+                          DisplayName="Nearhand"
+                          Description="Lets people with this computer's access password control it remotely, through the Nearhand server it was installed with."
+                          Type="ownProcess"
+                          Start="auto"
+                          ErrorControl="normal"
+                          Account="LocalSystem"
+                          Arguments="--log &quot;[CommonAppDataFolder]Nearhand\logs\service.log&quot; service">
+            <!-- If the service itself fails, Windows starts it again. -->
+            <util:ServiceConfig FirstFailureActionType="restart"
+                                SecondFailureActionType="restart"
+                                ThirdFailureActionType="restart"
+                                RestartServiceDelayInSeconds="5"
+                                ResetPeriodInDays="1" />
+          </ServiceInstall>
+          <ServiceControl Id="NearhandService"
+                          Name="Nearhand"
+                          Start="install"
+                          Stop="both"
+                          Remove="uninstall"
+                          Wait="yes" />
+        </Component>
+      </Directory>
+    </StandardDirectory>
+
+    <!-- `nearhand-agent configure`, as SYSTEM, before the service starts:
+         the configuration, the key, and the Ctrl+Alt+Del policy. Only when
+         the properties are given; the command line, which holds the
+         password, is kept out of the logs. -->
+    <SetProperty Id="Configure"
+                 Value="&quot;[#AgentExe]&quot; configure --server &quot;[SERVER]&quot; --server-fingerprint &quot;[SERVER_FINGERPRINT]&quot; --password &quot;[ACCESS_PASSWORD]&quot;"
+                 Before="Configure"
+                 Sequence="execute"
+                 Condition="ACCESS_PASSWORD AND NOT REMOVE" />
+    <CustomAction Id="Configure"
+                  BinaryRef="Wix4UtilCA_X64"
+                  DllEntry="WixQuietExec"
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="check"
+                  HideTarget="yes" />
+    <InstallExecuteSequence>
+      <Custom Action="Configure" After="InstallFiles" Condition="ACCESS_PASSWORD AND NOT REMOVE" />
+    </InstallExecuteSequence>
+
+    <Feature Id="Main">
+      <ComponentRef Id="Agent" />
+    </Feature>
+  </Package>
+</Wix>
