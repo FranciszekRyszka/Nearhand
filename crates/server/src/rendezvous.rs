@@ -42,6 +42,7 @@ use ring::rand::{SecureRandom, SystemRandom};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::accounts::Accounts;
+use crate::audit::{Audit, Event};
 use crate::devices::Devices;
 use crate::grants::Grants;
 
@@ -83,6 +84,8 @@ pub struct Access {
     pub grants: Arc<Grants>,
     /// The server's own key, which signs them.
     pub identity: Arc<Identity>,
+    /// Where grants handed out, refused, and devices enrolled are recorded.
+    pub audit: Arc<Audit>,
 }
 
 #[derive(Clone)]
@@ -292,7 +295,7 @@ async fn introduce(
                 None => return refuse(conn, send, Refusal::Offline).await,
             }
         }
-        Some(token) => match authorize(registry, &token, id).await {
+        Some(token) => match authorize(registry, &token, id, observed.ip().to_canonical()).await {
             Ok((agent, grant)) => (agent, Some(grant)),
             Err(refusal) => return refuse(conn, send, refusal).await,
         },
@@ -385,6 +388,7 @@ async fn authorize(
     registry: &Registry,
     token: &str,
     id: DeviceId,
+    from: IpAddr,
 ) -> std::result::Result<(Agent, (String, SignedGrant)), Refusal> {
     let Some(access) = &registry.access else {
         return Err(Refusal::NotAllowed);
@@ -405,7 +409,16 @@ async fn authorize(
         .into_iter()
         .find(|r| r.fingerprint.device_id() == id)
     else {
-        tracing::info!(%id, user = %user.name, "no grant for that device");
+        access
+            .audit
+            .record(Event {
+                actor: Some(&user.name),
+                address: Some(from),
+                action: "session.refuse",
+                target: Some(&id.to_string()),
+                detail: Some("no grant".into()),
+            })
+            .await;
         return Err(Refusal::NotAllowed);
     };
     let agent = lock(&registry.agents)
@@ -431,6 +444,16 @@ async fn authorize(
         tracing::error!(error = %e, "signing a grant");
         Refusal::NotAllowed
     })?;
+    access
+        .audit
+        .record(Event {
+            actor: Some(&user.name),
+            address: Some(from),
+            action: "session.grant",
+            target: Some(&id.to_string()),
+            detail: Some(device.role.to_string()),
+        })
+        .await;
     Ok((agent, (user.name, signed)))
 }
 
@@ -455,7 +478,18 @@ async fn enroll(
     let id = fingerprint.device_id();
     match devices.enroll(&fingerprint, &enrollment, from).await {
         Ok(device) => {
-            tracing::info!(%id, name = %device.name, %from, "device enrolled");
+            if let Some(access) = &registry.access {
+                access
+                    .audit
+                    .record(Event {
+                        address: Some(from.ip().to_canonical()),
+                        action: "device.enroll",
+                        target: Some(&device.name),
+                        detail: Some(id.to_string()),
+                        ..Event::default()
+                    })
+                    .await;
+            }
             // Registered already, under this key: managed from now on.
             if let Some(agent) = lock(&registry.agents).get_mut(&id)
                 && agent.fingerprint == fingerprint
@@ -467,7 +501,18 @@ async fn enroll(
             Ok(())
         }
         Err(refused) => {
-            tracing::info!(%id, %from, error = %refused, "enrollment refused");
+            if let Some(access) = &registry.access {
+                access
+                    .audit
+                    .record(Event {
+                        address: Some(from.ip().to_canonical()),
+                        action: "device.enroll_fail",
+                        target: Some(&enrollment.name),
+                        detail: Some(refused.to_string()),
+                        ..Event::default()
+                    })
+                    .await;
+            }
             refuse(conn, send, Refusal::Enrollment).await
         }
     }
@@ -681,7 +726,8 @@ mod tests {
             .await
             .expect("token");
         let devices = Arc::new(Devices::new(pool.clone()));
-        let grants = Arc::new(Grants::new(pool));
+        let grants = Arc::new(Grants::new(pool.clone()));
+        let audit = Arc::new(Audit::new(pool));
         let office = devices.create_group("Office").await.expect("group");
         let staff = grants.create_user_group("Staff").await.expect("group");
         grants.add_member(staff.id, bob.id).await.expect("member");
@@ -703,6 +749,7 @@ mod tests {
             accounts,
             grants,
             identity: server_identity.clone(),
+            audit: audit.clone(),
         }));
         tokio::spawn(serve(server.clone(), registry.clone()));
 
@@ -777,6 +824,22 @@ mod tests {
         assert_eq!(
             refused(find_granted(&viewer, server_addr, fp, id, Route::Best, "nht_guess").await),
             Some(Refusal::NotSignedIn)
+        );
+        let actions: Vec<(Option<String>, String)> = audit
+            .entries(None, 10)
+            .await
+            .expect("audit")
+            .into_iter()
+            .rev()
+            .map(|e| (e.actor, e.action))
+            .collect();
+        assert_eq!(
+            actions,
+            [
+                (None, "device.enroll".to_owned()),
+                (Some("bob".to_owned()), "session.grant".to_owned()),
+                (Some("ada".to_owned()), "session.refuse".to_owned()),
+            ]
         );
         server.close(0u32.into(), b"done");
     }

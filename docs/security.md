@@ -3,8 +3,8 @@
 > **Status: partly implemented.** Device keys, pinning, the relay, the
 > portable agent's one-time password and accept prompt, the installed
 > agent's access password, session indicators for both, server accounts
-> (Argon2id, TOTP, API tokens), enrollment and signed grants exist; the
-> audit log and signed releases do not yet.
+> (Argon2id, TOTP, API tokens), enrollment, signed grants, the audit log
+> and the web console exist; signed releases do not yet.
 > Track the gap against the roadmap in the README.
 
 Nearhand hands one machine full control of another. The threat model is built in
@@ -161,6 +161,28 @@ account (M5).
     sessions still work. Refusing sessions there would make headless
     machines unreachable; the log is the record.
 
+## Audit log and console
+
+- The server records every change an administrator makes, every sign-in
+  and failed one, every device enrolled, and every session a grant opened
+  or a missing grant refused: when, who, from which address, what, to
+  what. Rows are only ever added; administrators read them (`GET
+  /api/v1/audit`, or the console). A failure to write one is logged, and
+  does not stop what it records.
+- It is kept in the same database as everything else, so it tells what
+  happened, not what a server's administrator — or someone who took the
+  server — chose to erase. Shipping it somewhere else as it is written is a
+  possible later addition.
+- What it does not see: sessions by password (the server never learns
+  them), and what happens inside any session.
+- The web console is a page over the same REST API, served from the binary:
+  no endpoint of its own, nothing loaded from elsewhere. Its
+  Content-Security-Policy allows only this server's own script, style and
+  API, no inline script and no framing, and the page puts everything the
+  server sends on screen as text, never as HTML. Tokens are shown once, when
+  made. The first administrator's link carries its token after `#`, which
+  browsers do not send, so it stays out of any proxy's logs.
+
 ## Supply chain
 
 - Releases are signed. Agents update only from their own server, and verify
@@ -183,7 +205,7 @@ close this gap, and is worth adding before 1.0.
 A **fully compromised management server** could issue itself a grant, and
 open every machine enrolled with it. Machines installed with only an access
 password, which the server never learns, are out of its reach; the audit log
-(to come) will show what happened. Requiring a grant *and* the password on
+shows what happened, unless the attacker erased it. Requiring a grant *and* the password on
 the same machine is a possible later option. This is stated rather than
 solved; a server you do not trust is a server you should not enroll
 against.

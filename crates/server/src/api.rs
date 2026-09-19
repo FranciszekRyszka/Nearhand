@@ -1,5 +1,5 @@
-//! The REST API, under `/api/v1`. The console (M5, later) is built on it,
-//! so anything the console does, a script can.
+//! The REST API, under `/api/v1`. The web console (`console`, served from
+//! `/`) is built on it, so anything the console does, a script can.
 //!
 //! Two ways to be someone:
 //!
@@ -11,12 +11,16 @@
 //!
 //! Errors are `{"error": "…"}` with a fitting status; signing in without a
 //! needed TOTP code also says `"totp_needed": true`.
+//!
+//! Every change goes in the audit log (`audit`), with who made it and from
+//! where; so do sign-ins, failed ones included.
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
+use std::ops::Deref;
 use std::sync::Arc;
 
-use axum::extract::{ConnectInfo, FromRequestParts, Path, State};
+use axum::extract::{ConnectInfo, FromRequestParts, Path, Query, State};
 use axum::http::header::{AUTHORIZATION, COOKIE, HOST, ORIGIN, SET_COOKIE};
 use axum::http::request::Parts;
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
@@ -28,6 +32,7 @@ use serde::{Deserialize, Deserializer};
 use serde_json::json;
 
 use crate::accounts::{Accounts, Refused, User};
+use crate::audit::{Audit, Entry, Event};
 use crate::devices::{Device, Devices, EnrollToken, Group};
 use crate::grants::{GrantRule, Grants, UserGroup};
 use crate::rendezvous::Registry;
@@ -39,9 +44,25 @@ pub struct AppState {
     pub accounts: Arc<Accounts>,
     pub devices: Arc<Devices>,
     pub grants: Arc<Grants>,
+    pub audit: Arc<Audit>,
     /// Who is connected now.
     pub registry: Arc<Registry>,
     pub server: ServerInfo,
+}
+
+impl AppState {
+    /// Put what `who` did in the audit log.
+    async fn record(&self, who: &Caller, action: &str, target: &str, detail: Option<String>) {
+        self.audit
+            .record(Event {
+                actor: Some(&who.user.name),
+                address: who.from,
+                action,
+                target: Some(target),
+                detail,
+            })
+            .await;
+    }
 }
 
 /// What agents and viewers need to reach and pin this server.
@@ -97,6 +118,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/api/v1/grants", get(list_grants).post(set_grant))
         .route("/api/v1/grants/{id}", delete(delete_grant))
+        .route("/api/v1/audit", get(audit_log))
+        .merge(crate::console::router())
         .with_state(state)
 }
 
@@ -149,13 +172,29 @@ type ApiResult<T> = Result<T, ApiError>;
 
 // --- Who is asking --------------------------------------------------------------
 
-/// The signed-in caller, by API token or session cookie.
+/// The signed-in caller, by API token or session cookie, and where from.
 pub struct Caller {
     pub user: User,
+    pub from: Option<IpAddr>,
 }
 
 /// A caller who is an administrator.
-pub struct Admin(pub User);
+pub struct Admin(pub Caller);
+
+impl Deref for Admin {
+    type Target = Caller;
+
+    fn deref(&self) -> &Caller {
+        &self.0
+    }
+}
+
+fn address(parts: &Parts) -> Option<IpAddr> {
+    parts
+        .extensions
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ConnectInfo(from)| from.ip().to_canonical())
+}
 
 impl FromRequestParts<Arc<AppState>> for Caller {
     type Rejection = ApiError;
@@ -164,10 +203,11 @@ impl FromRequestParts<Arc<AppState>> for Caller {
         parts: &mut Parts,
         state: &Arc<AppState>,
     ) -> Result<Self, Self::Rejection> {
+        let from = address(parts);
         if let Some(token) = bearer(&parts.headers) {
             let user = state.accounts.api_user(token).await?;
             return user
-                .map(|user| Caller { user })
+                .map(|user| Caller { user, from })
                 .ok_or(ApiError::Unauthenticated);
         }
         let token = cookie(&parts.headers, SESSION_COOKIE).ok_or(ApiError::Unauthenticated)?;
@@ -175,7 +215,7 @@ impl FromRequestParts<Arc<AppState>> for Caller {
             return Err(ApiError::CrossSite);
         }
         let user = state.accounts.session_user(&token).await?;
-        user.map(|user| Caller { user })
+        user.map(|user| Caller { user, from })
             .ok_or(ApiError::Unauthenticated)
     }
 }
@@ -187,11 +227,11 @@ impl FromRequestParts<Arc<AppState>> for Admin {
         parts: &mut Parts,
         state: &Arc<AppState>,
     ) -> Result<Self, Self::Rejection> {
-        let Caller { user } = Caller::from_request_parts(parts, state).await?;
-        if !user.admin {
+        let caller = Caller::from_request_parts(parts, state).await?;
+        if !caller.user.admin {
             return Err(Refused::Forbidden.into());
         }
-        Ok(Admin(user))
+        Ok(Admin(caller))
     }
 }
 
@@ -256,13 +296,25 @@ struct SetupRequest {
 
 async fn setup(
     State(state): State<Arc<AppState>>,
+    ConnectInfo(from): ConnectInfo<SocketAddr>,
     Json(request): Json<SetupRequest>,
 ) -> ApiResult<Json<User>> {
     let user = state
         .accounts
         .setup(&request.token, &request.name, &request.password)
         .await?;
-    tracing::info!(name = %user.name, "first administrator created");
+    let who = Caller {
+        user: user.clone(),
+        from: Some(from.ip().to_canonical()),
+    };
+    state
+        .record(
+            &who,
+            "setup",
+            &user.name,
+            Some("first administrator".into()),
+        )
+        .await;
     Ok(Json(user))
 }
 
@@ -278,15 +330,39 @@ async fn login(
     ConnectInfo(from): ConnectInfo<SocketAddr>,
     Json(request): Json<LoginRequest>,
 ) -> ApiResult<Response> {
-    let (token, user) = state
+    let from = from.ip().to_canonical();
+    let signed_in = state
         .accounts
         .sign_in(
             &request.name,
             &request.password,
             request.totp.as_deref(),
-            from.ip(),
+            from,
         )
-        .await?;
+        .await;
+    let (token, user) = match signed_in {
+        Ok(signed_in) => signed_in,
+        // Asked for the second factor: not a failure yet.
+        Err(Refused::TotpNeeded) => return Err(Refused::TotpNeeded.into()),
+        Err(refused) => {
+            state
+                .audit
+                .record(Event {
+                    actor: None,
+                    address: Some(from),
+                    action: "login.fail",
+                    target: Some(&request.name),
+                    detail: Some(refused.to_string()),
+                })
+                .await;
+            return Err(refused.into());
+        }
+    };
+    let who = Caller {
+        user: user.clone(),
+        from: Some(from),
+    };
+    state.record(&who, "login", &user.name, None).await;
     let mut response = Json(user).into_response();
     response
         .headers_mut()
@@ -324,6 +400,9 @@ async fn change_password(
         .accounts
         .change_password(&caller.user, &request.current, &request.new)
         .await?;
+    state
+        .record(&caller, "password.change", &caller.user.name, None)
+        .await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -349,6 +428,9 @@ async fn totp_confirm(
         .accounts
         .totp_confirm(&caller.user, &request.code)
         .await?;
+    state
+        .record(&caller, "totp.enable", &caller.user.name, None)
+        .await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -361,6 +443,9 @@ async fn totp_disable(
         .accounts
         .totp_disable(&caller.user, &request.code)
         .await?;
+    state
+        .record(&caller, "totp.disable", &caller.user.name, None)
+        .await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -388,6 +473,14 @@ async fn new_token(
         .accounts
         .new_api_token(&caller.user, &request.name, request.expires_in_days)
         .await?;
+    state
+        .record(
+            &caller,
+            "token.create",
+            &caller.user.name,
+            Some(listed.name.clone()),
+        )
+        .await;
     // The token itself is in this answer and nowhere else, ever.
     Ok((
         StatusCode::CREATED,
@@ -401,6 +494,14 @@ async fn delete_token(
     Path(id): Path<i64>,
 ) -> ApiResult<StatusCode> {
     state.accounts.delete_api_token(&caller.user, id).await?;
+    state
+        .record(
+            &caller,
+            "token.delete",
+            &caller.user.name,
+            Some(format!("#{id}")),
+        )
+        .await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -421,14 +522,17 @@ struct NewUserRequest {
 
 async fn create_user(
     State(state): State<Arc<AppState>>,
-    Admin(admin): Admin,
+    admin: Admin,
     Json(request): Json<NewUserRequest>,
 ) -> ApiResult<(StatusCode, Json<User>)> {
     let user = state
         .accounts
         .create_user(&request.name, &request.password, request.admin)
         .await?;
-    tracing::info!(by = %admin.name, name = %user.name, admin = user.admin, "user created");
+    let detail = user.admin.then(|| "administrator".to_owned());
+    state
+        .record(&admin, "user.create", &user.name, detail)
+        .await;
     Ok((StatusCode::CREATED, Json(user)))
 }
 
@@ -440,7 +544,7 @@ struct UpdateUserRequest {
 
 async fn update_user(
     State(state): State<Arc<AppState>>,
-    Admin(admin): Admin,
+    admin: Admin,
     Path(id): Path<i64>,
     Json(request): Json<UpdateUserRequest>,
 ) -> ApiResult<Json<User>> {
@@ -448,17 +552,35 @@ async fn update_user(
         .accounts
         .update_user(id, request.admin, request.disabled)
         .await?;
-    tracing::info!(by = %admin.name, name = %user.name, admin = user.admin, disabled = user.disabled, "user changed");
+    state
+        .record(
+            &admin,
+            "user.update",
+            &user.name,
+            Some(format!(
+                "admin: {}, disabled: {}",
+                user.admin, user.disabled
+            )),
+        )
+        .await;
     Ok(Json(user))
 }
 
 async fn delete_user(
     State(state): State<Arc<AppState>>,
-    Admin(admin): Admin,
+    admin: Admin,
     Path(id): Path<i64>,
 ) -> ApiResult<StatusCode> {
+    let name = state.accounts.user(id).await?.map(|u| u.name);
     state.accounts.delete_user(id).await?;
-    tracing::info!(by = %admin.name, id, "user deleted");
+    state
+        .record(
+            &admin,
+            "user.delete",
+            &name.unwrap_or_else(|| format!("#{id}")),
+            None,
+        )
+        .await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -559,7 +681,7 @@ struct UpdateDeviceRequest {
 
 async fn update_device(
     State(state): State<Arc<AppState>>,
-    Admin(admin): Admin,
+    admin: Admin,
     Path(id): Path<i64>,
     Json(request): Json<UpdateDeviceRequest>,
 ) -> ApiResult<Json<Device>> {
@@ -567,17 +689,35 @@ async fn update_device(
         .devices
         .update_device(id, request.name.as_deref(), request.group_id)
         .await?;
-    tracing::info!(by = %admin.name, id, name = %device.name, group = ?device.group, "device changed");
+    state
+        .record(
+            &admin,
+            "device.update",
+            &device.name,
+            Some(format!(
+                "group: {}",
+                device.group.as_deref().unwrap_or("none")
+            )),
+        )
+        .await;
     Ok(Json(state.with_presence(device)))
 }
 
 async fn delete_device(
     State(state): State<Arc<AppState>>,
-    Admin(admin): Admin,
+    admin: Admin,
     Path(id): Path<i64>,
 ) -> ApiResult<StatusCode> {
+    let device = state.devices.device(id).await?;
     state.devices.delete_device(id).await?;
-    tracing::info!(by = %admin.name, id, "device removed");
+    state
+        .record(
+            &admin,
+            "device.delete",
+            &device.name,
+            Some(device.device_id),
+        )
+        .await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -595,32 +735,45 @@ struct GroupRequest {
 
 async fn create_group(
     State(state): State<Arc<AppState>>,
-    Admin(admin): Admin,
+    admin: Admin,
     Json(request): Json<GroupRequest>,
 ) -> ApiResult<(StatusCode, Json<Group>)> {
     let group = state.devices.create_group(&request.name).await?;
-    tracing::info!(by = %admin.name, name = %group.name, "device group created");
+    state
+        .record(&admin, "device_group.create", &group.name, None)
+        .await;
     Ok((StatusCode::CREATED, Json(group)))
 }
 
 async fn rename_group(
     State(state): State<Arc<AppState>>,
-    Admin(admin): Admin,
+    admin: Admin,
     Path(id): Path<i64>,
     Json(request): Json<GroupRequest>,
 ) -> ApiResult<Json<Group>> {
+    let before = state.device_group_name(id).await?;
     let group = state.devices.rename_group(id, &request.name).await?;
-    tracing::info!(by = %admin.name, id, name = %group.name, "device group renamed");
+    state
+        .record(
+            &admin,
+            "device_group.rename",
+            &before,
+            Some(group.name.clone()),
+        )
+        .await;
     Ok(Json(group))
 }
 
 async fn delete_group(
     State(state): State<Arc<AppState>>,
-    Admin(admin): Admin,
+    admin: Admin,
     Path(id): Path<i64>,
 ) -> ApiResult<StatusCode> {
+    let name = state.device_group_name(id).await?;
     state.devices.delete_group(id).await?;
-    tracing::info!(by = %admin.name, id, "device group deleted");
+    state
+        .record(&admin, "device_group.delete", &name, None)
+        .await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -652,20 +805,32 @@ fn one_day() -> u32 {
 
 async fn new_enroll_token(
     State(state): State<Arc<AppState>>,
-    Admin(admin): Admin,
+    admin: Admin,
     Json(request): Json<NewEnrollTokenRequest>,
 ) -> ApiResult<(StatusCode, Json<serde_json::Value>)> {
     let (listed, token) = state
         .devices
         .new_enroll_token(
-            &admin,
+            &admin.user,
             &request.name,
             request.group_id,
             request.uses,
             request.expires_in_days,
         )
         .await?;
-    tracing::info!(by = %admin.name, name = %listed.name, uses = ?listed.uses_left, "enrollment token made");
+    state
+        .record(
+            &admin,
+            "enroll_token.create",
+            &listed.name,
+            Some(format!(
+                "uses: {}, days: {}, group: {}",
+                listed.uses_left.map_or("any".into(), |n| n.to_string()),
+                request.expires_in_days,
+                request.group_id.map_or("none".into(), |g| format!("#{g}"))
+            )),
+        )
+        .await;
     let server = &state.server;
     // The token is in this answer and nowhere else, ever; so are the
     // commands that use it.
@@ -679,7 +844,7 @@ async fn new_enroll_token(
                 server.address, server.fingerprint
             ),
             "msi": format!(
-                "msiexec /i nearhand-agent.msi SERVER={} SERVER_FINGERPRINT={} ENROLL_TOKEN={token} ACCESS_PASSWORD=…",
+                "msiexec /i nearhand-agent.msi SERVER={} SERVER_FINGERPRINT={} ENROLL_TOKEN={token}",
                 server.address, server.fingerprint
             ),
         })),
@@ -688,11 +853,20 @@ async fn new_enroll_token(
 
 async fn delete_enroll_token(
     State(state): State<Arc<AppState>>,
-    Admin(admin): Admin,
+    admin: Admin,
     Path(id): Path<i64>,
 ) -> ApiResult<StatusCode> {
+    let name = state
+        .devices
+        .enroll_tokens()
+        .await?
+        .into_iter()
+        .find(|t| t.id == id)
+        .map_or_else(|| format!("#{id}"), |t| t.name);
     state.devices.delete_enroll_token(id).await?;
-    tracing::info!(by = %admin.name, id, "enrollment token deleted");
+    state
+        .record(&admin, "enroll_token.delete", &name, None)
+        .await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -707,52 +881,69 @@ async fn list_user_groups(
 
 async fn create_user_group(
     State(state): State<Arc<AppState>>,
-    Admin(admin): Admin,
+    admin: Admin,
     Json(request): Json<GroupRequest>,
 ) -> ApiResult<(StatusCode, Json<UserGroup>)> {
     let group = state.grants.create_user_group(&request.name).await?;
-    tracing::info!(by = %admin.name, name = %group.name, "user group created");
+    state
+        .record(&admin, "user_group.create", &group.name, None)
+        .await;
     Ok((StatusCode::CREATED, Json(group)))
 }
 
 async fn rename_user_group(
     State(state): State<Arc<AppState>>,
-    Admin(admin): Admin,
+    admin: Admin,
     Path(id): Path<i64>,
     Json(request): Json<GroupRequest>,
 ) -> ApiResult<Json<UserGroup>> {
+    let before = state.grants.user_group(id).await?.name;
     let group = state.grants.rename_user_group(id, &request.name).await?;
-    tracing::info!(by = %admin.name, id, name = %group.name, "user group renamed");
+    state
+        .record(
+            &admin,
+            "user_group.rename",
+            &before,
+            Some(group.name.clone()),
+        )
+        .await;
     Ok(Json(group))
 }
 
 async fn delete_user_group(
     State(state): State<Arc<AppState>>,
-    Admin(admin): Admin,
+    admin: Admin,
     Path(id): Path<i64>,
 ) -> ApiResult<StatusCode> {
+    let name = state.grants.user_group(id).await?.name;
     state.grants.delete_user_group(id).await?;
-    tracing::info!(by = %admin.name, id, "user group deleted");
+    state.record(&admin, "user_group.delete", &name, None).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
 async fn add_member(
     State(state): State<Arc<AppState>>,
-    Admin(admin): Admin,
+    admin: Admin,
     Path((id, user)): Path<(i64, i64)>,
 ) -> ApiResult<Json<UserGroup>> {
     let group = state.grants.add_member(id, user).await?;
-    tracing::info!(by = %admin.name, group = %group.name, user, "user added to group");
+    let name = state.user_name(user).await?;
+    state
+        .record(&admin, "user_group.add", &group.name, Some(name))
+        .await;
     Ok(Json(group))
 }
 
 async fn remove_member(
     State(state): State<Arc<AppState>>,
-    Admin(admin): Admin,
+    admin: Admin,
     Path((id, user)): Path<(i64, i64)>,
 ) -> ApiResult<Json<UserGroup>> {
     let group = state.grants.remove_member(id, user).await?;
-    tracing::info!(by = %admin.name, group = %group.name, user, "user removed from group");
+    let name = state.user_name(user).await?;
+    state
+        .record(&admin, "user_group.remove", &group.name, Some(name))
+        .await;
     Ok(Json(group))
 }
 
@@ -772,7 +963,7 @@ struct GrantRequest {
 
 async fn set_grant(
     State(state): State<Arc<AppState>>,
-    Admin(admin): Admin,
+    admin: Admin,
     Json(request): Json<GrantRequest>,
 ) -> ApiResult<(StatusCode, Json<GrantRule>)> {
     let role: Role = request
@@ -783,24 +974,82 @@ async fn set_grant(
         .grants
         .set_grant(request.user_group_id, request.device_group_id, role)
         .await?;
-    tracing::info!(
-        by = %admin.name,
-        user_group = %rule.user_group,
-        device_group = %rule.device_group,
-        role = %rule.role,
-        "grant set"
-    );
+    state
+        .record(
+            &admin,
+            "grant.set",
+            &format!("{} → {}", rule.user_group, rule.device_group),
+            Some(rule.role.clone()),
+        )
+        .await;
     Ok((StatusCode::CREATED, Json(rule)))
 }
 
 async fn delete_grant(
     State(state): State<Arc<AppState>>,
-    Admin(admin): Admin,
+    admin: Admin,
     Path(id): Path<i64>,
 ) -> ApiResult<StatusCode> {
+    let rule = state
+        .grants
+        .grants()
+        .await?
+        .into_iter()
+        .find(|g| g.id == id)
+        .ok_or(Refused::NotFound)?;
     state.grants.delete_grant(id).await?;
-    tracing::info!(by = %admin.name, id, "grant deleted");
+    state
+        .record(
+            &admin,
+            "grant.delete",
+            &format!("{} → {}", rule.user_group, rule.device_group),
+            Some(rule.role),
+        )
+        .await;
     Ok(StatusCode::NO_CONTENT)
+}
+
+impl AppState {
+    async fn device_group_name(&self, id: i64) -> ApiResult<String> {
+        Ok(self
+            .devices
+            .groups()
+            .await?
+            .into_iter()
+            .find(|g| g.id == id)
+            .ok_or(Refused::NotFound)?
+            .name)
+    }
+
+    async fn user_name(&self, id: i64) -> ApiResult<String> {
+        Ok(self
+            .accounts
+            .user(id)
+            .await?
+            .map_or_else(|| format!("#{id}"), |u| u.name))
+    }
+}
+
+// --- Audit log ----------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct AuditQuery {
+    /// Entries older than this one: the last id of the page before.
+    before: Option<i64>,
+    #[serde(default = "page")]
+    limit: u32,
+}
+
+fn page() -> u32 {
+    100
+}
+
+async fn audit_log(
+    State(state): State<Arc<AppState>>,
+    _admin: Admin,
+    Query(query): Query<AuditQuery>,
+) -> ApiResult<Json<Vec<Entry>>> {
+    Ok(Json(state.audit.entries(query.before, query.limit).await?))
 }
 
 #[cfg(test)]
@@ -828,7 +1077,8 @@ mod tests {
             accounts: accounts.clone(),
             registry: Arc::new(Registry::new(devices.clone())),
             devices: devices.clone(),
-            grants: Arc::new(Grants::new(pool)),
+            grants: Arc::new(Grants::new(pool.clone())),
+            audit: Arc::new(Audit::new(pool)),
             server: ServerInfo {
                 address: "desk.example.com:443".into(),
                 fingerprint: "ab".repeat(32),
@@ -1343,6 +1593,111 @@ mod tests {
             .await;
         assert_eq!(server.status, StatusCode::OK);
         assert_eq!(server.body["address"], "desk.example.com:443");
+    }
+
+    #[tokio::test]
+    async fn the_console_is_served_locked_down() {
+        let api = api().await;
+        for (path, kind) in [
+            ("/", "text/html"),
+            ("/console.js", "text/javascript"),
+            ("/console.css", "text/css"),
+        ] {
+            let request = Request::builder()
+                .uri(path)
+                .body(Body::empty())
+                .expect("request");
+            let response = api.app.clone().oneshot(request).await.expect("response");
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+            let headers = response.headers();
+            assert!(
+                headers[axum::http::header::CONTENT_TYPE]
+                    .to_str()
+                    .expect("type")
+                    .starts_with(kind),
+                "{path}"
+            );
+            let policy = headers[axum::http::header::CONTENT_SECURITY_POLICY]
+                .to_str()
+                .expect("policy");
+            assert!(policy.contains("script-src 'self'") && !policy.contains("unsafe"));
+            assert!(policy.contains("frame-ancestors 'none'"));
+            assert_eq!(
+                headers[axum::http::header::X_CONTENT_TYPE_OPTIONS],
+                "nosniff"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn changes_and_sign_ins_go_in_the_audit_log() {
+        let api = api().await;
+        let admin = api.admin_cookie().await;
+        let auth = [("cookie", admin.as_str())];
+        api.call(
+            Method::POST,
+            "/api/v1/users",
+            &auth,
+            Some(json!({ "name": "bob", "password": "bobs long password" })),
+        )
+        .await;
+        api.call(
+            Method::POST,
+            "/api/v1/login",
+            &[],
+            Some(json!({ "name": "bob", "password": "not bobs password" })),
+        )
+        .await;
+        let bob = api.sign_in("bob", "bobs long password").await;
+        let forbidden = api
+            .call(Method::GET, "/api/v1/audit", &[("cookie", &bob)], None)
+            .await;
+        assert_eq!(forbidden.status, StatusCode::FORBIDDEN);
+
+        let log = api.call(Method::GET, "/api/v1/audit", &auth, None).await;
+        assert_eq!(log.status, StatusCode::OK);
+        let entries: Vec<(String, String, String)> = log
+            .body
+            .as_array()
+            .expect("entries")
+            .iter()
+            .rev()
+            .map(|e| {
+                (
+                    e["actor"].as_str().unwrap_or("-").to_owned(),
+                    e["action"].as_str().expect("action").to_owned(),
+                    e["target"].as_str().unwrap_or("-").to_owned(),
+                )
+            })
+            .collect();
+        let expected = [
+            ("ada", "setup", "ada"),
+            ("ada", "login", "ada"),
+            ("ada", "user.create", "bob"),
+            ("-", "login.fail", "bob"),
+            ("bob", "login", "bob"),
+        ];
+        let expected: Vec<(String, String, String)> = expected
+            .iter()
+            .map(|(a, b, c)| ((*a).to_owned(), (*b).to_owned(), (*c).to_owned()))
+            .collect();
+        assert_eq!(entries, expected);
+        assert_eq!(log.body[0]["address"], "192.0.2.1");
+
+        let page = api
+            .call(Method::GET, "/api/v1/audit?limit=2", &auth, None)
+            .await;
+        assert_eq!(page.body.as_array().expect("page").len(), 2);
+        let last = page.body[1]["id"].as_i64().expect("id");
+        let older = api
+            .call(
+                Method::GET,
+                &format!("/api/v1/audit?before={last}"),
+                &auth,
+                None,
+            )
+            .await;
+        assert_eq!(older.body.as_array().expect("older").len(), 3);
     }
 
     #[tokio::test]

@@ -1,7 +1,7 @@
 # REST API
 
-> **Status: M5, in progress.** Accounts, tokens, devices, groups,
-> enrollment and grants so far; the audit log follows.
+> **Status: M5.** Accounts, tokens, devices, groups, enrollment, grants and
+> the audit log. The web console at `/` is built on this API alone.
 
 Everything is under `/api/v1` on the server's HTTPS port, JSON in and out.
 Errors are `{"error": "..."}` with a fitting status code.
@@ -55,6 +55,7 @@ Errors are `{"error": "..."}` with a fitting status code.
 | `GET /grants` | administrators | `{id, user_group_id, user_group, device_group_id, device_group, role}` |
 | `POST /grants` | administrators | `{user_group_id, device_group_id, role}`, role `view`, `control` or `full`; sets the role if the two have a grant already |
 | `DELETE /grants/{id}` | administrators | deletes one |
+| `GET /audit?before=&limit=` | administrators | newest first, `limit` up to 500 (100 unless given); `before`, an entry's id, pages back: `{id, at, actor, address, action, target, detail}` |
 
 Connecting with a grant is not over this API: the viewer asks on the QUIC
 side, with an API token (`docs/protocol.md`).

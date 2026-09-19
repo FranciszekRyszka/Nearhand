@@ -7,7 +7,9 @@
 
 mod accounts;
 mod api;
+mod audit;
 mod config;
+mod console;
 mod db;
 mod devices;
 mod grants;
@@ -133,17 +135,20 @@ async fn serve(config: Config, key: PathBuf) -> Result<()> {
     };
     let devices = Arc::new(Devices::new(pool.clone()));
     let grants = Arc::new(Grants::new(pool.clone()));
+    let audit = Arc::new(audit::Audit::new(pool.clone()));
     let registry = Arc::new(rendezvous::Registry::new(devices.clone()).with_access(
         rendezvous::Access {
             accounts: accounts.clone(),
             grants: grants.clone(),
             identity: identity.clone(),
+            audit: audit.clone(),
         },
     ));
     let state = Arc::new(api::AppState {
         accounts,
         devices,
         grants,
+        audit,
         registry: registry.clone(),
         server: api::ServerInfo {
             address: config.public_address(),
@@ -207,12 +212,17 @@ fn prepare_data_dir(config: &Config) -> Result<()> {
         .with_context(|| format!("creating {}", config.data.dir.display()))
 }
 
-/// How to make the first administrator. Until the console arrives, that is
-/// one API call.
+/// How to make the first administrator: a link to the console, or one API
+/// call. The token is in the link's fragment, which browsers do not send to
+/// the server, so it stays out of any proxy's logs.
 fn print_setup(config: &Config, token: &str) {
     let url = config.public_url();
     println!();
-    println!("No users yet. Create the first administrator within 24 hours with:");
+    println!("No users yet. Within 24 hours, create the first administrator at:");
+    println!();
+    println!("  {url}/#setup={token}");
+    println!();
+    println!("or with the API:");
     println!();
     println!("  curl -k {url}/api/v1/setup -H 'content-type: application/json' \\");
     println!(
@@ -220,9 +230,8 @@ fn print_setup(config: &Config, token: &str) {
         accounts::MIN_PASSWORD
     );
     println!();
-    println!(
-        "(-k because the certificate is self-signed; `nearhand-server admin-link` makes a new token.)"
-    );
+    println!("(The certificate is self-signed unless configured: the browser warns,");
+    println!("and curl needs -k. `nearhand-server admin-link` makes a new link.)");
     println!();
 }
 

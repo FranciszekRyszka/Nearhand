@@ -2,9 +2,9 @@
 
 > **Status: early.** The server introduces agents to viewers by device ID,
 > relays sessions that cannot go direct, has user accounts behind a REST API,
-> enrolls installed agents into a device list with groups, and lets users at
-> them with grants. The audit log, the console and a Docker image are still
-> to come (M5, M6); the sections about them say so.
+> enrolls installed agents into a device list with groups, lets users at
+> them with grants, keeps an audit log, and has a web console for all of it.
+> A Docker image is still to come (M6).
 
 ## What works today
 
@@ -112,7 +112,7 @@ public_address = "desk.example.com:443"   # for install commands; default:
                                           # public_url's host, bind's port
 
 [http]
-bind = "0.0.0.0:443"           # TCP: the REST API (and the console, to come)
+bind = "0.0.0.0:443"           # TCP: the web console and the REST API
 tls = "self-signed"            # made on first start; browsers warn about it
 # tls = "files"                # a real certificate:
 # cert = "/etc/letsencrypt/live/desk.example.com/fullchain.pem"
@@ -135,10 +135,19 @@ The binary, as a service — a systemd unit, or a Windows service wrapper.
 nearhand-server serve                 # or: --config /etc/nearhand/nearhand.toml
 ```
 
-The first start, with no users, prints how to create the first
-administrator: one API call with a one-time token, valid for 24 hours.
-`nearhand-server admin-link` prints a new one. The console will turn this into
-a link to click.
+The first start, with no users, prints a link for creating the first
+administrator in the web console (or the API call that does the same),
+valid for 24 hours; `nearhand-server admin-link` prints a new one.
+
+### The web console
+
+`https://<public_url>/`: sign in, and administrators get the devices (with
+who is online), enrollment tokens, users, user and device groups, grants and
+the audit log; everyone gets the devices their grants reach, their password,
+two-step sign-in and API tokens. It is a page over the REST API below, so
+anything it does a script can do too. For the TOTP set-up, add the key it
+shows to the authenticator app by hand, or open the `otpauth://` link on the
+phone: the console draws no QR code.
 
 ### The REST API
 

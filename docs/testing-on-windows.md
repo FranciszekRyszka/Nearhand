@@ -202,6 +202,10 @@ nearhand-agent install --server ... --server-fingerprint ...
 
 ## 11. Enrollment (M5)
 
+Everything here can also be done in the web console: open
+`https://localhost/` on the host (the server prints a link for the first
+administrator), and afterwards check the *Audit log* page lists each step.
+
 On the host, with the server running (it serves the REST API on TCP 443
 too), create the first administrator with
 the command it printed, sign in, and make a token (`uses: 1`):
