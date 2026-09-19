@@ -4,9 +4,8 @@
 //!
 //! | OS      | Encode / decode                    |
 //! | ------- | ---------------------------------- |
-//! | Windows | Media Foundation                   |
+//! | Windows | Media Foundation: hardware, else Windows' software H.264 encoder |
 //! | macOS   | VideoToolbox                       |
-//! | any     | `openh264` software fallback       |
 //!
 //! Nothing here bundles a media stack — we use what the OS already ships. That
 //! is what keeps the agent under the size target and avoids codec licensing.
@@ -99,7 +98,8 @@ pub struct DecodedFrame {
     pub surface: DecodedSurface,
 }
 
-/// Open the platform's hardware encoder.
+/// Open the platform's encoder: hardware, or Windows' software one where
+/// there is none.
 ///
 /// Nothing is bound to a GPU yet: the encoder attaches to the device that owns
 /// the first frame's surface, so it always lands on the same adapter as capture.
@@ -125,11 +125,11 @@ pub fn encoder(_config: EncoderConfig) -> Result<Box<dyn Encoder>> {
 /// Codecs this machine can encode, best first.
 ///
 /// Reports only what [`encoder`] can actually open, so it is safe to advertise
-/// in `Caps`. Empty means no hardware encoder: the `openh264` fallback does not
-/// exist yet.
+/// in `Caps`: a hardware encoder, or Windows' software one. Empty only on a
+/// Windows "N" edition without the Media Feature Pack.
 #[cfg(windows)]
 pub fn supported_encoders() -> Vec<Codec> {
-    mediafoundation::hardware_encoders()
+    mediafoundation::encoders()
 }
 
 /// Codecs this machine can encode, best first.

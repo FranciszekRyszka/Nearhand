@@ -30,8 +30,10 @@
 //!   asks for a keyframe when it loses one. Intra refresh would spread that cost
 //!   across frames, but Media Foundation exposes it only through vendor-specific
 //!   properties — a later refinement.
-//! * **Hardware only.** Without a hardware encoder this returns
-//!   [`Error::NoHardwareEncoder`]; the `openh264` fallback is separate work.
+//! * **Hardware first.** Without a hardware encoder, or one that will not
+//!   open, the encoder falls back to Windows' software one (`software`), on
+//!   the CPU. `NEARHAND_ENCODER=software` in the environment forces that, for
+//!   testing it on a machine that has hardware.
 
 use std::collections::VecDeque;
 use std::mem::ManuallyDrop;
@@ -72,6 +74,7 @@ use windows::Win32::System::Variant::VARIANT;
 use windows::core::{GUID, Interface};
 
 use super::convert::{Conversion, VideoConverter, create_texture};
+use super::software::{SoftwareSession, same_device};
 use super::{
     Runtime, adapter_luid, backend, enumerate_encoders, friendly_name, pack, texture_device,
     variant_bool, variant_u32,
@@ -98,9 +101,21 @@ pub struct MfEncoder {
     width: u32,
     height: u32,
     force_keyframe: bool,
+    /// Hardware failed once, or software was asked for: do not try again.
+    software: bool,
     // Field order is drop order: the session must be gone before the runtime.
-    session: Option<Session>,
+    session: Option<Backend>,
     _runtime: Runtime,
+}
+
+enum Backend {
+    Hardware(Session),
+    Software(SoftwareSession),
+}
+
+/// Whether the environment asks for the software encoder.
+pub(crate) fn software_forced() -> bool {
+    std::env::var("NEARHAND_ENCODER").is_ok_and(|v| v.eq_ignore_ascii_case("software"))
 }
 
 impl MfEncoder {
@@ -128,6 +143,7 @@ impl MfEncoder {
             width,
             height,
             force_keyframe: false,
+            software: software_forced(),
             session: None,
             _runtime: Runtime::start()?,
         })
@@ -139,24 +155,26 @@ impl Encoder for MfEncoder {
         let device = texture_device(&frame.surface)?;
 
         // Bind to the device on first use, and rebind if capture recreated it.
-        let stale = self
-            .session
-            .as_ref()
-            .is_none_or(|s| s.device.as_raw() != device.as_raw());
+        let stale = match &self.session {
+            None => true,
+            Some(Backend::Hardware(s)) => s.device.as_raw() != device.as_raw(),
+            Some(Backend::Software(s)) => !same_device(s, frame)?,
+        };
         if stale {
             // Tear the old session down before building its replacement: two
             // live sessions would briefly hold two hardware encoder instances.
             self.session = None;
-            self.session = Some(Session::new(device, &self.config, self.width, self.height)?);
+            self.session = Some(self.open(device)?);
             // A fresh encoder starts with an IDR frame anyway.
             self.force_keyframe = false;
         }
 
-        let Some(session) = self.session.as_mut() else {
-            return Err(Error::Backend("encoder session missing".to_owned()));
-        };
         let force = std::mem::take(&mut self.force_keyframe);
-        session.encode(frame, force)
+        match self.session.as_mut() {
+            Some(Backend::Hardware(session)) => session.encode(frame, force),
+            Some(Backend::Software(session)) => session.encode(frame, force),
+            None => Err(Error::Backend("encoder session missing".to_owned())),
+        }
     }
 
     fn request_keyframe(&mut self) {
@@ -171,10 +189,29 @@ impl Encoder for MfEncoder {
         }
         self.config.bitrate_kbps = bitrate_kbps;
         self.config.max_fps = fps;
-        if let Some(session) = self.session.as_mut() {
-            session.set_quality(bitrate_kbps, fps)?;
+        match self.session.as_mut() {
+            Some(Backend::Hardware(session)) => session.set_quality(bitrate_kbps, fps)?,
+            Some(Backend::Software(session)) => session.set_quality(bitrate_kbps, fps)?,
+            None => {}
         }
         Ok(())
+    }
+}
+
+impl MfEncoder {
+    /// The hardware encoder on `device`'s adapter, or failing that the
+    /// software one.
+    fn open(&mut self, device: ID3D11Device) -> Result<Backend> {
+        if !self.software {
+            match Session::new(device.clone(), &self.config, self.width, self.height) {
+                Ok(session) => return Ok(Backend::Hardware(session)),
+                Err(e) => {
+                    tracing::warn!(error = %e, "no hardware H.264 encoder; encoding in software");
+                    self.software = true;
+                }
+            }
+        }
+        SoftwareSession::new(device, &self.config, self.width, self.height).map(Backend::Software)
     }
 }
 
@@ -526,7 +563,7 @@ impl Drop for Session {
 /// Settings that make a hardware encoder behave for interactive use. Each is
 /// best-effort: vendors support different subsets, and a missing one degrades
 /// quality or latency rather than breaking the stream.
-fn configure_low_latency(api: &ICodecAPI, config: &EncoderConfig, name: &str) {
+pub(crate) fn configure_low_latency(api: &ICodecAPI, config: &EncoderConfig, name: &str) {
     let gop = u32::from(config.max_fps).saturating_mul(3600);
     let settings: [(&str, GUID, VARIANT); 6] = [
         ("low latency", CODECAPI_AVLowLatencyMode, variant_bool(true)),
@@ -571,11 +608,11 @@ fn configure_low_latency(api: &ICodecAPI, config: &EncoderConfig, name: &str) {
 /// a keyframe starts a little soft and sharpens over the next frames.
 const VBV_WINDOW_MS: u32 = 250;
 
-fn vbv_bits(bitrate_kbps: u32) -> u32 {
+pub(crate) fn vbv_bits(bitrate_kbps: u32) -> u32 {
     bitrate_kbps.saturating_mul(VBV_WINDOW_MS)
 }
 
-fn h264_type(config: &EncoderConfig, width: u32, height: u32) -> Result<IMFMediaType> {
+pub(crate) fn h264_type(config: &EncoderConfig, width: u32, height: u32) -> Result<IMFMediaType> {
     let t = unsafe { MFCreateMediaType() }.map_err(|e| backend("MFCreateMediaType", e))?;
     unsafe {
         t.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
@@ -592,7 +629,7 @@ fn h264_type(config: &EncoderConfig, width: u32, height: u32) -> Result<IMFMedia
     Ok(t)
 }
 
-fn nv12_type(config: &EncoderConfig, width: u32, height: u32) -> Result<IMFMediaType> {
+pub(crate) fn nv12_type(config: &EncoderConfig, width: u32, height: u32) -> Result<IMFMediaType> {
     let t = unsafe { MFCreateMediaType() }.map_err(|e| backend("MFCreateMediaType", e))?;
     unsafe {
         t.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
@@ -672,7 +709,7 @@ fn spawn_event_pump(
     Ok((rx, handle))
 }
 
-fn frame_duration_100ns(fps: u8) -> i64 {
+pub(crate) fn frame_duration_100ns(fps: u8) -> i64 {
     10_000_000 / i64::from(fps.max(1))
 }
 

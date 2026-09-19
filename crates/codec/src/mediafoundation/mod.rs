@@ -1,16 +1,20 @@
-//! Media Foundation: hardware H.264 encode and decode on Windows.
+//! Media Foundation: H.264 encode and decode on Windows, in hardware.
 //!
-//! * [`encoder`] — capture texture in, H.264 out.
+//! * [`encoder`] — capture texture in, H.264 out; falls back to
+//!   [`software`], Windows' own encoder on the CPU, where there is no
+//!   hardware one.
 //! * [`decoder`] — H.264 in, NV12 texture out.
 //! * [`convert`] — colour conversion and scaling on the D3D11 video processor,
 //!   used by both directions.
 //!
-//! Everything here stays on the GPU. The only CPU copies in either direction
-//! are of compressed data, which has to cross the network anyway.
+//! On the hardware path everything stays on the GPU. The only CPU copies in
+//! either direction are of compressed data, which has to cross the network
+//! anyway.
 
 pub mod convert;
 pub mod decoder;
 pub mod encoder;
+pub mod software;
 
 pub use convert::VideoConverter;
 pub use decoder::MfDecoder;
@@ -48,6 +52,21 @@ pub fn hardware_encoders() -> Vec<Codec> {
         return Vec::new();
     };
     match enumerate_encoders(MFVideoFormat_H264, None) {
+        Ok(found) if !found.is_empty() => vec![Codec::H264],
+        _ => Vec::new(),
+    }
+}
+
+/// Codecs this machine can encode, in hardware or software, best first.
+pub fn encoders() -> Vec<Codec> {
+    let hardware = hardware_encoders();
+    if !hardware.is_empty() && !encoder::software_forced() {
+        return hardware;
+    }
+    let Ok(_runtime) = Runtime::start() else {
+        return Vec::new();
+    };
+    match software::software_encoders() {
         Ok(found) if !found.is_empty() => vec![Codec::H264],
         _ => Vec::new(),
     }
