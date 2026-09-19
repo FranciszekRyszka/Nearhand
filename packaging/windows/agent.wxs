@@ -7,8 +7,12 @@
   server, its fingerprint, access password — comes from properties, so the
   same MSI serves a silent rollout (GPO, Intune):
 
-    msiexec /i nearhand-agent.msi /qn SERVER=203.0.113.10:443
+    msiexec /i nearhand-agent.msi /qn SERVER=desk.example.com
             SERVER_FINGERPRINT=<hex> ACCESS_PASSWORD=<password>
+            [ENROLL_TOKEN=nhe_...] [DEVICE_NAME=<name>]
+
+  ENROLL_TOKEN, from the server's administrator, adds the machine to the
+  server's managed devices; the agent enrolls when the server can be reached.
 
   An upgrade or repair on a configured machine needs none of them: the
   configuration and key in %ProgramData%\Nearhand are kept, and so is the ID.
@@ -38,12 +42,14 @@
     <!-- Kept out of the installer's logs: the password, and the command
          line built from it below. -->
     <Property Id="ACCESS_PASSWORD" Hidden="yes" Secure="yes" />
+    <Property Id="ENROLL_TOKEN" Hidden="yes" Secure="yes" />
     <Property Id="Configure" Hidden="yes" />
     <Property Id="SERVER" Secure="yes" />
     <Property Id="SERVER_FINGERPRINT" Secure="yes" />
+    <Property Id="DEVICE_NAME" Secure="yes" />
 
     <Launch Condition="Installed OR CONFIGURED OR (SERVER AND SERVER_FINGERPRINT AND ACCESS_PASSWORD)"
-            Message="Install with SERVER, SERVER_FINGERPRINT and ACCESS_PASSWORD, for example: msiexec /i nearhand-agent.msi SERVER=203.0.113.10:443 SERVER_FINGERPRINT=... ACCESS_PASSWORD=..." />
+            Message="Install with SERVER, SERVER_FINGERPRINT and ACCESS_PASSWORD, for example: msiexec /i nearhand-agent.msi SERVER=desk.example.com SERVER_FINGERPRINT=... ACCESS_PASSWORD=..." />
 
     <StandardDirectory Id="ProgramFiles64Folder">
       <Directory Id="INSTALLFOLDER" Name="Nearhand">
@@ -76,11 +82,12 @@
     </StandardDirectory>
 
     <!-- `nearhand-agent configure`, as SYSTEM, before the service starts:
-         the configuration, the key, and the Ctrl+Alt+Del policy. Only when
-         the properties are given; the command line, which holds the
-         password, is kept out of the logs. -->
+         the configuration, the key, the Ctrl+Alt+Del policy, and enrolling
+         if there is a token. Only when the properties are given; the command
+         line, which holds the password and token, is kept out of the logs.
+         Empty ENROLL_TOKEN and DEVICE_NAME mean none. -->
     <SetProperty Id="Configure"
-                 Value="&quot;[#AgentExe]&quot; configure --server &quot;[SERVER]&quot; --server-fingerprint &quot;[SERVER_FINGERPRINT]&quot; --password &quot;[ACCESS_PASSWORD]&quot;"
+                 Value="&quot;[#AgentExe]&quot; configure --server &quot;[SERVER]&quot; --server-fingerprint &quot;[SERVER_FINGERPRINT]&quot; --password &quot;[ACCESS_PASSWORD]&quot; --token &quot;[ENROLL_TOKEN]&quot; --name &quot;[DEVICE_NAME]&quot;"
                  Before="Configure"
                  Sequence="execute"
                  Condition="ACCESS_PASSWORD AND NOT REMOVE" />

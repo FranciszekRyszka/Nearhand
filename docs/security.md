@@ -2,9 +2,9 @@
 
 > **Status: partly implemented.** Device keys, pinning, the relay, the
 > portable agent's one-time password and accept prompt, the installed
-> agent's access password, session indicators for both, and server accounts
-> (Argon2id, TOTP, API tokens) exist; enrollment, grants and signed releases
-> do not yet.
+> agent's access password, session indicators for both, server accounts
+> (Argon2id, TOTP, API tokens) and enrollment exist; grants and signed
+> releases do not yet.
 > Track the gap against the roadmap in the README.
 
 Nearhand hands one machine full control of another. The threat model is built in
@@ -18,7 +18,8 @@ changing the wire format.
 - Viewer ↔ agent is **TLS 1.3 with both sides pinning** the key delivered
   through the server. A changed key blocks the connection and raises an alert,
   the way SSH does — it is not a warning the user can click through.
-- The agent pins the **server key** at enrollment.
+- The agent pins the **server key** at install; enrolling does not change
+  it.
 
 ### What the device ID is, and is not
 
@@ -29,6 +30,26 @@ ID in minutes. What the viewer pins is the full fingerprint the server reports,
 so for an attended session the viewer trusts the server to report it
 honestly. The one-time password then decides who gets in, and only the agent
 checks it.
+
+Someone could also register a key of their own under a device's ID first,
+to keep the device from being found: first come, first served, and the
+device is refused (M2). An **enrolled** device outranks such a stranger — it
+takes its ID over when it registers — so this works only against devices
+that are not enrolled.
+
+## Enrollment
+
+- Enrollment tokens are random 256-bit values, shown once and stored as
+  their SHA-256, for a number of devices and at most 90 days. Only
+  administrators make them.
+- The agent enrolls on a connection that presents its own certificate, so a
+  token enrolls the key that uses it and no other; tries are limited per
+  address like introductions.
+- A token not yet used waits in the agent's configuration, readable only by
+  SYSTEM and administrators, and is deleted once used or refused. The MSI
+  keeps `ENROLL_TOKEN` out of its logs.
+- Enrolling puts a device in the list and nothing more, for now: who may
+  connect is still the access password, until grants (M5).
 
 ## Accounts
 

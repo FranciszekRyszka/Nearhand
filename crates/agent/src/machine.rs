@@ -6,12 +6,13 @@
 //!
 //! ```text
 //! %ProgramData%\Nearhand\          (Windows)
-//!     agent.toml                   server, its fingerprint, access password hash
+//!     agent.toml                   server, its fingerprint, access password hash,
+//!                                  an enrollment token not yet used
 //!     device.key                   the device's Ed25519 key: its ID
 //!     logs\                        the service's and the agent's logs
 //! ```
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -21,6 +22,8 @@ use serde::{Deserialize, Serialize};
 use crate::access::Stored;
 
 pub const DEFAULT_BITRATE_KBPS: u32 = 10_000;
+/// The server's port when its address does not say.
+pub const DEFAULT_SERVER_PORT: u16 = 443;
 
 /// Where an installed agent keeps its files.
 pub fn dir() -> PathBuf {
@@ -61,13 +64,54 @@ pub struct Config {
     pub bitrate_kbps: u32,
     /// Who may connect: anyone with this password.
     pub access: Stored,
+    /// Enrolling with the server, when installing could not reach it: the
+    /// agent does it when it can, and then forgets the token.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enrollment: Option<Enrollment>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Server {
-    pub address: SocketAddr,
+    /// `host:port`, `host` alone for port 443, or an IP address.
+    pub address: String,
     /// Hex, as the server prints it.
     pub fingerprint: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Enrollment {
+    pub token: String,
+    /// The name to list this computer under; its computer name if none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+/// Where the server at `address` is now: `host:port`, `host` alone for port
+/// 443, or an IP address, with or without a port. The agent looks names
+/// up as it starts, so a server that moves is followed after a restart.
+pub fn resolve(address: &str) -> Result<SocketAddr> {
+    let address = address.trim();
+    if let Ok(addr) = address.parse::<SocketAddr>() {
+        return Ok(addr);
+    }
+    if let Ok(ip) = address.trim_matches(['[', ']']).parse::<IpAddr>() {
+        return Ok(SocketAddr::new(ip, DEFAULT_SERVER_PORT));
+    }
+    let with_port = match address.rsplit_once(':') {
+        Some((_, port)) if port.parse::<u16>().is_ok() => address.to_owned(),
+        _ => format!("{address}:{DEFAULT_SERVER_PORT}"),
+    };
+    let mut found: Vec<SocketAddr> = with_port
+        .to_socket_addrs()
+        .with_context(|| format!("looking up {address}"))?
+        .collect();
+    // IPv4 first: more networks route it, and the agent listens on one
+    // family, the one it reaches the server over.
+    found.sort_by_key(|a| a.is_ipv6());
+    found
+        .into_iter()
+        .next()
+        .with_context(|| format!("{address} has no address"))
 }
 
 fn default_bitrate() -> u32 {
@@ -190,7 +234,7 @@ mod tests {
     fn config() -> Config {
         Config {
             server: Server {
-                address: "203.0.113.10:443".parse().expect("addr"),
+                address: "desk.example.com:443".into(),
                 fingerprint: "ab".repeat(32),
             },
             bitrate_kbps: 8000,
@@ -199,7 +243,46 @@ mod tests {
                 salt: "00".repeat(16),
                 hash: "11".repeat(32),
             },
+            enrollment: Some(Enrollment {
+                token: "nhe_00ff".into(),
+                name: None,
+            }),
         }
+    }
+
+    #[test]
+    fn server_addresses_take_many_forms() {
+        let port = |a: &str| resolve(a).expect(a).port();
+        assert_eq!(
+            resolve("203.0.113.10:4433").expect("ip"),
+            "203.0.113.10:4433".parse().expect("addr")
+        );
+        assert_eq!(port("203.0.113.10"), 443);
+        assert_eq!(
+            resolve("[2001:db8::1]:8443").expect("v6"),
+            "[2001:db8::1]:8443".parse().expect("addr")
+        );
+        assert_eq!(port("2001:db8::1"), 443);
+        assert_eq!(port("localhost"), 443);
+        assert_eq!(port("localhost:4433"), 4433);
+        assert!(resolve("localhost").expect("name").ip().is_loopback());
+        assert!(resolve("no-such-host.invalid").is_err());
+    }
+
+    #[test]
+    fn an_earlier_configuration_still_loads() {
+        // As written before servers could be named and devices enrolled.
+        let old = "[server]\naddress = \"203.0.113.10:443\"\nfingerprint = \"{fp}\"\n\
+                   [access]\niterations = 600000\nsalt = \"00\"\nhash = \"11\"\n"
+            .replace("{fp}", &"ab".repeat(32));
+        let parsed: Config = toml::from_str(&old).expect("parse");
+        assert_eq!(parsed.server.address, "203.0.113.10:443");
+        assert_eq!(parsed.enrollment, None);
+        assert!(
+            !toml::to_string(&parsed)
+                .expect("write")
+                .contains("enrollment")
+        );
     }
 
     #[test]

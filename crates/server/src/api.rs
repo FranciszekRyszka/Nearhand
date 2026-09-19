@@ -22,15 +22,30 @@ use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, patch, post};
 use axum::{Json, Router};
-use serde::Deserialize;
+use nearhand_transport::Fingerprint;
+use serde::{Deserialize, Deserializer};
 use serde_json::json;
 
 use crate::accounts::{Accounts, Refused, User};
+use crate::devices::{Device, Devices, EnrollToken, Group};
+use crate::rendezvous::Registry;
 
 pub const SESSION_COOKIE: &str = "nearhand_session";
 
 pub struct AppState {
     pub accounts: Accounts,
+    pub devices: Arc<Devices>,
+    /// Who is connected now.
+    pub registry: Arc<Registry>,
+    pub server: ServerInfo,
+}
+
+/// What agents and viewers need to reach and pin this server.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ServerInfo {
+    /// `host:port` of the QUIC side.
+    pub address: String,
+    pub fingerprint: String,
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
@@ -48,6 +63,22 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/me/tokens/{id}", delete(delete_token))
         .route("/api/v1/users", get(list_users).post(create_user))
         .route("/api/v1/users/{id}", patch(update_user).delete(delete_user))
+        .route("/api/v1/server", get(server))
+        .route("/api/v1/devices", get(list_devices))
+        .route(
+            "/api/v1/devices/{id}",
+            get(get_device).patch(update_device).delete(delete_device),
+        )
+        .route("/api/v1/device-groups", get(list_groups).post(create_group))
+        .route(
+            "/api/v1/device-groups/{id}",
+            patch(rename_group).delete(delete_group),
+        )
+        .route(
+            "/api/v1/enroll-tokens",
+            get(list_enroll_tokens).post(new_enroll_token),
+        )
+        .route("/api/v1/enroll-tokens/{id}", delete(delete_enroll_token))
         .with_state(state)
 }
 
@@ -413,6 +444,205 @@ async fn delete_user(
     Ok(StatusCode::NO_CONTENT)
 }
 
+async fn server(State(state): State<Arc<AppState>>, _caller: Caller) -> Json<ServerInfo> {
+    Json(state.server.clone())
+}
+
+// --- Devices ---------------------------------------------------------------------
+//
+// Administrators only, until grants (the next step) say who else may see
+// which devices.
+
+impl AppState {
+    fn with_presence(&self, mut device: Device) -> Device {
+        device.online = device
+            .fingerprint
+            .parse::<Fingerprint>()
+            .ok()
+            .and_then(|fingerprint| self.registry.online(&fingerprint))
+            .is_some();
+        device
+    }
+}
+
+async fn list_devices(
+    State(state): State<Arc<AppState>>,
+    _admin: Admin,
+) -> ApiResult<Json<Vec<Device>>> {
+    let devices = state.devices.devices().await?;
+    Ok(Json(
+        devices
+            .into_iter()
+            .map(|d| state.with_presence(d))
+            .collect(),
+    ))
+}
+
+async fn get_device(
+    State(state): State<Arc<AppState>>,
+    _admin: Admin,
+    Path(id): Path<i64>,
+) -> ApiResult<Json<Device>> {
+    let device = state.devices.device(id).await?;
+    Ok(Json(state.with_presence(device)))
+}
+
+/// A field that may be absent (leave it), null (clear it) or a value.
+fn present<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
+}
+
+#[derive(Deserialize)]
+struct UpdateDeviceRequest {
+    name: Option<String>,
+    /// A group's id, or null for none.
+    #[serde(default, deserialize_with = "present")]
+    group_id: Option<Option<i64>>,
+}
+
+async fn update_device(
+    State(state): State<Arc<AppState>>,
+    Admin(admin): Admin,
+    Path(id): Path<i64>,
+    Json(request): Json<UpdateDeviceRequest>,
+) -> ApiResult<Json<Device>> {
+    let device = state
+        .devices
+        .update_device(id, request.name.as_deref(), request.group_id)
+        .await?;
+    tracing::info!(by = %admin.name, id, name = %device.name, group = ?device.group, "device changed");
+    Ok(Json(state.with_presence(device)))
+}
+
+async fn delete_device(
+    State(state): State<Arc<AppState>>,
+    Admin(admin): Admin,
+    Path(id): Path<i64>,
+) -> ApiResult<StatusCode> {
+    state.devices.delete_device(id).await?;
+    tracing::info!(by = %admin.name, id, "device removed");
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn list_groups(
+    State(state): State<Arc<AppState>>,
+    _admin: Admin,
+) -> ApiResult<Json<Vec<Group>>> {
+    Ok(Json(state.devices.groups().await?))
+}
+
+#[derive(Deserialize)]
+struct GroupRequest {
+    name: String,
+}
+
+async fn create_group(
+    State(state): State<Arc<AppState>>,
+    Admin(admin): Admin,
+    Json(request): Json<GroupRequest>,
+) -> ApiResult<(StatusCode, Json<Group>)> {
+    let group = state.devices.create_group(&request.name).await?;
+    tracing::info!(by = %admin.name, name = %group.name, "device group created");
+    Ok((StatusCode::CREATED, Json(group)))
+}
+
+async fn rename_group(
+    State(state): State<Arc<AppState>>,
+    Admin(admin): Admin,
+    Path(id): Path<i64>,
+    Json(request): Json<GroupRequest>,
+) -> ApiResult<Json<Group>> {
+    let group = state.devices.rename_group(id, &request.name).await?;
+    tracing::info!(by = %admin.name, id, name = %group.name, "device group renamed");
+    Ok(Json(group))
+}
+
+async fn delete_group(
+    State(state): State<Arc<AppState>>,
+    Admin(admin): Admin,
+    Path(id): Path<i64>,
+) -> ApiResult<StatusCode> {
+    state.devices.delete_group(id).await?;
+    tracing::info!(by = %admin.name, id, "device group deleted");
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn list_enroll_tokens(
+    State(state): State<Arc<AppState>>,
+    _admin: Admin,
+) -> ApiResult<Json<Vec<EnrollToken>>> {
+    Ok(Json(state.devices.enroll_tokens().await?))
+}
+
+#[derive(Deserialize)]
+struct NewEnrollTokenRequest {
+    name: String,
+    group_id: Option<i64>,
+    /// How many devices it enrolls; none for any number.
+    #[serde(default = "one")]
+    uses: Option<u32>,
+    #[serde(default = "one_day")]
+    expires_in_days: u32,
+}
+
+fn one() -> Option<u32> {
+    Some(1)
+}
+
+fn one_day() -> u32 {
+    1
+}
+
+async fn new_enroll_token(
+    State(state): State<Arc<AppState>>,
+    Admin(admin): Admin,
+    Json(request): Json<NewEnrollTokenRequest>,
+) -> ApiResult<(StatusCode, Json<serde_json::Value>)> {
+    let (listed, token) = state
+        .devices
+        .new_enroll_token(
+            &admin,
+            &request.name,
+            request.group_id,
+            request.uses,
+            request.expires_in_days,
+        )
+        .await?;
+    tracing::info!(by = %admin.name, name = %listed.name, uses = ?listed.uses_left, "enrollment token made");
+    let server = &state.server;
+    // The token is in this answer and nowhere else, ever; so are the
+    // commands that use it.
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({
+            "token": token,
+            "details": listed,
+            "install": format!(
+                "nearhand-agent install --server {} --server-fingerprint {} --token {token}",
+                server.address, server.fingerprint
+            ),
+            "msi": format!(
+                "msiexec /i nearhand-agent.msi SERVER={} SERVER_FINGERPRINT={} ENROLL_TOKEN={token} ACCESS_PASSWORD=…",
+                server.address, server.fingerprint
+            ),
+        })),
+    ))
+}
+
+async fn delete_enroll_token(
+    State(state): State<Arc<AppState>>,
+    Admin(admin): Admin,
+    Path(id): Path<i64>,
+) -> ApiResult<StatusCode> {
+    state.devices.delete_enroll_token(id).await?;
+    tracing::info!(by = %admin.name, id, "enrollment token deleted");
+    Ok(StatusCode::NO_CONTENT)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -425,14 +655,30 @@ mod tests {
     struct Api {
         app: Router,
         setup_token: String,
+        devices: Arc<Devices>,
     }
 
     async fn api() -> Api {
-        let accounts = Accounts::new(crate::db::in_memory().await);
+        let pool = crate::db::in_memory().await;
+        let accounts = Accounts::new(pool.clone());
         let setup_token = accounts.new_setup_token().await.expect("token");
-        let app = router(Arc::new(AppState { accounts }))
+        let devices = Arc::new(Devices::new(pool));
+        let state = AppState {
+            accounts,
+            registry: Arc::new(Registry::new(devices.clone())),
+            devices: devices.clone(),
+            server: ServerInfo {
+                address: "desk.example.com:443".into(),
+                fingerprint: "ab".repeat(32),
+            },
+        };
+        let app = router(Arc::new(state))
             .layer(MockConnectInfo(SocketAddr::from(([192, 0, 2, 1], 50000))));
-        Api { app, setup_token }
+        Api {
+            app,
+            setup_token,
+            devices,
+        }
     }
 
     struct Answer {
@@ -673,6 +919,131 @@ mod tests {
             )
             .await;
         assert_eq!(from_here.status, StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn enrolling_and_managing_devices() {
+        let api = api().await;
+        let admin = api.admin_cookie().await;
+        let auth = [("cookie", admin.as_str())];
+        let group = api
+            .call(
+                Method::POST,
+                "/api/v1/device-groups",
+                &auth,
+                Some(json!({ "name": "Front office" })),
+            )
+            .await;
+        assert_eq!(group.status, StatusCode::CREATED, "{}", group.body);
+        let group_id = group.body["id"].as_i64().expect("id");
+
+        let made = api
+            .call(
+                Method::POST,
+                "/api/v1/enroll-tokens",
+                &auth,
+                Some(json!({ "name": "rollout", "group_id": group_id, "uses": null, "expires_in_days": 7 })),
+            )
+            .await;
+        assert_eq!(made.status, StatusCode::CREATED, "{}", made.body);
+        let token = made.body["token"].as_str().expect("token").to_owned();
+        assert_eq!(made.body["details"]["uses_left"], serde_json::Value::Null);
+        let install = made.body["install"].as_str().expect("command");
+        assert!(
+            install.contains("--server desk.example.com:443"),
+            "{install}"
+        );
+        assert!(install.contains(&token));
+        let listed = api
+            .call(Method::GET, "/api/v1/enroll-tokens", &auth, None)
+            .await;
+        assert!(listed.body[0].get("token").is_none(), "never shown again");
+
+        // An agent enrolls (on the QUIC side; here, straight in).
+        let key = Fingerprint::from_bytes([7; 32]);
+        api.devices
+            .enroll(
+                &key,
+                &nearhand_core::rendezvous::Enrollment {
+                    token,
+                    name: "RECEPTION".into(),
+                    os: "windows x86_64".into(),
+                    version: "0.1.0".into(),
+                },
+                SocketAddr::from(([198, 51, 100, 7], 50000)),
+            )
+            .await
+            .expect("enroll");
+
+        let devices = api.call(Method::GET, "/api/v1/devices", &auth, None).await;
+        assert_eq!(devices.status, StatusCode::OK);
+        let device = &devices.body[0];
+        assert_eq!(device["name"], "RECEPTION");
+        assert_eq!(device["group"], "Front office");
+        assert_eq!(device["online"], false, "enrolled, but not connected");
+        assert_eq!(device["fingerprint"], key.to_string());
+        let id = device["id"].as_i64().expect("id");
+
+        let renamed = api
+            .call(
+                Method::PATCH,
+                &format!("/api/v1/devices/{id}"),
+                &auth,
+                Some(json!({ "name": "Front desk" })),
+            )
+            .await;
+        assert_eq!(renamed.body["name"], "Front desk");
+        assert_eq!(renamed.body["group_id"], group_id, "absent: unchanged");
+        let ungrouped = api
+            .call(
+                Method::PATCH,
+                &format!("/api/v1/devices/{id}"),
+                &auth,
+                Some(json!({ "group_id": null })),
+            )
+            .await;
+        assert_eq!(ungrouped.body["group_id"], serde_json::Value::Null);
+
+        let removed = api
+            .call(
+                Method::DELETE,
+                &format!("/api/v1/devices/{id}"),
+                &auth,
+                None,
+            )
+            .await;
+        assert_eq!(removed.status, StatusCode::NO_CONTENT);
+        let gone = api
+            .call(Method::GET, &format!("/api/v1/devices/{id}"), &auth, None)
+            .await;
+        assert_eq!(gone.status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn only_administrators_see_devices_for_now() {
+        let api = api().await;
+        let admin = api.admin_cookie().await;
+        api.call(
+            Method::POST,
+            "/api/v1/users",
+            &[("cookie", &admin)],
+            Some(json!({ "name": "bob", "password": "bobs long password" })),
+        )
+        .await;
+        let bob = api.sign_in("bob", "bobs long password").await;
+        for path in [
+            "/api/v1/devices",
+            "/api/v1/device-groups",
+            "/api/v1/enroll-tokens",
+        ] {
+            let answer = api.call(Method::GET, path, &[("cookie", &bob)], None).await;
+            assert_eq!(answer.status, StatusCode::FORBIDDEN, "{path}");
+        }
+        let server = api
+            .call(Method::GET, "/api/v1/server", &[("cookie", &bob)], None)
+            .await;
+        assert_eq!(server.status, StatusCode::OK);
+        assert_eq!(server.body["address"], "desk.example.com:443");
     }
 
     #[tokio::test]

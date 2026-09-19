@@ -200,6 +200,36 @@ nearhand-agent install --server ... --server-fingerprint ...
 * `nearhand-agent uninstall --purge` also removes `C:\ProgramData\Nearhand`;
   the next install gets a new ID.
 
+## 11. Enrollment (M5)
+
+On the host, with the server running (it serves the REST API on TCP 443
+too), create the first administrator with
+the command it printed, sign in, and make a token (`uses: 1`):
+
+```bash
+curl -k -c jar https://localhost/api/v1/login -H 'content-type: application/json' \
+    -d '{"name": "admin", "password": "..."}'
+curl -k -b jar https://localhost/api/v1/enroll-tokens -H 'content-type: application/json' \
+    -d '{"name": "vm"}'
+```
+
+In the VM, reinstall with the token (and the server by name, if the VM can
+resolve the host's):
+
+```bat
+nearhand-agent install --server <host address>:4433 --server-fingerprint <fingerprint> --token nhe_...
+```
+
+* It prints `Enrolled with the server.`; `GET /api/v1/devices` lists the VM
+  under its computer name, `online: true`.
+* `sc stop Nearhand`: within 15 seconds the device shows `online: false`
+  and a fresh `last_seen_at`.
+* Installing again with the same token fails: it was for one device.
+* With the host's server stopped, install with a new token: it says it will
+  enroll later. Start the server: within a few minutes the device is listed, and
+  `C:\ProgramData\Nearhand\agent.toml` no longer has an `[enrollment]`
+  section.
+
 ## Also worth checking while the VM is up
 
 M2 has not yet been tested across two real networks. With the VM on a NAT

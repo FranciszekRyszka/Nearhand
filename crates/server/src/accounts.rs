@@ -558,12 +558,7 @@ impl Accounts {
     }
 
     fn random_token(&self, prefix: &str) -> Result<String> {
-        let mut bytes = [0u8; 32];
-        self.random
-            .fill(&mut bytes)
-            .map_err(|_| anyhow::anyhow!("the system random number generator failed"))?;
-        let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
-        Ok(format!("{prefix}{hex}"))
+        random_token(&self.random, prefix)
     }
 
     fn may_try(&self, key: &str) -> bool {
@@ -593,7 +588,7 @@ impl Accounts {
     }
 }
 
-fn check_name(name: &str) -> Result<(), Refused> {
+pub(crate) fn check_name(name: &str) -> Result<(), Refused> {
     let length = name.chars().count();
     if length == 0 || length > MAX_NAME || name.chars().any(char::is_control) || name.trim() != name
     {
@@ -611,6 +606,16 @@ fn check_password(password: &str) -> Result<(), Refused> {
         )));
     }
     Ok(())
+}
+
+/// 256 random bits in hex, after `prefix`.
+pub(crate) fn random_token(random: &SystemRandom, prefix: &str) -> Result<String> {
+    let mut bytes = [0u8; 32];
+    random
+        .fill(&mut bytes)
+        .map_err(|_| anyhow::anyhow!("the system random number generator failed"))?;
+    let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    Ok(format!("{prefix}{hex}"))
 }
 
 pub fn hash(token: &str) -> Vec<u8> {
@@ -653,7 +658,7 @@ fn dummy_hash() -> &'static str {
     })
 }
 
-fn internal(e: impl std::fmt::Display) -> Refused {
+pub(crate) fn internal(e: impl std::fmt::Display) -> Refused {
     tracing::error!(error = %e, "accounts");
     Refused::Invalid("the server failed; see its log".into())
 }

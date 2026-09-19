@@ -8,6 +8,7 @@
 //!
 //! [quic]
 //! bind = "0.0.0.0:443"           # UDP: agents, viewers, relay
+//! public_address = "desk.example.com:443"   # how agents reach it
 //!
 //! [http]
 //! bind = "0.0.0.0:443"           # TCP: REST API and console
@@ -42,6 +43,10 @@ pub struct Data {
 #[serde(default, deny_unknown_fields)]
 pub struct Quic {
     pub bind: SocketAddr,
+    /// How agents and viewers reach this server, `host:port`, for the
+    /// install commands it hands out. By default the host of
+    /// `http.public_url` and the port of `bind`.
+    pub public_address: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -79,6 +84,7 @@ impl Default for Quic {
     fn default() -> Self {
         Self {
             bind: ([0, 0, 0, 0], 443).into(),
+            public_address: None,
         }
     }
 }
@@ -161,6 +167,21 @@ impl Config {
         self.data.dir.join("nearhand.db")
     }
 
+    /// How agents reach the QUIC side, for the install commands the server
+    /// hands out.
+    pub fn public_address(&self) -> String {
+        if let Some(address) = &self.quic.public_address {
+            return address.clone();
+        }
+        let host = crate::https::host_of(&self.public_url()).unwrap_or_else(|| "localhost".into());
+        let host = if host.contains(':') {
+            format!("[{host}]")
+        } else {
+            host
+        };
+        format!("{host}:{}", self.quic.bind.port())
+    }
+
     /// How people reach the console, for links the server prints.
     pub fn public_url(&self) -> String {
         match &self.http.public_url {
@@ -203,6 +224,7 @@ mod tests {
         assert_eq!(config.quic.bind.port(), 443);
         assert_eq!(config.http.tls, Tls::SelfSigned);
         assert_eq!(config.public_url(), "https://localhost");
+        assert_eq!(config.public_address(), "localhost:443");
     }
 
     #[test]
@@ -229,6 +251,13 @@ mod tests {
         assert_eq!(config.quic.bind.port(), 4433);
         assert_eq!(config.http.tls, Tls::None);
         assert_eq!(config.public_url(), "https://desk.example.com");
+        assert_eq!(config.public_address(), "desk.example.com:4433");
+        let set = Config::parse(
+            "",
+            env(&[("NEARHAND_QUIC_PUBLIC_ADDRESS", "203.0.113.5:443")]),
+        )
+        .expect("parse");
+        assert_eq!(set.public_address(), "203.0.113.5:443");
     }
 
     #[test]

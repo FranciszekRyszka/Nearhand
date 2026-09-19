@@ -35,7 +35,7 @@ use std::time::Duration;
 
 use nearhand_core::ALPN;
 use nearhand_core::proto::close;
-use nearhand_core::rendezvous::{DeviceId, FromServer, ToServer};
+use nearhand_core::rendezvous::{DeviceId, Enrollment, FromServer, ToServer};
 use quinn::{Connection, Endpoint};
 
 use crate::relay::{self, is_relayed, relayed_address};
@@ -158,6 +158,31 @@ async fn serve_registration(
         }
     }
     Ok(())
+}
+
+/// Enroll this agent with the server's managed devices, once, with a token
+/// an administrator made. The server learns the device's key from the
+/// certificate it connects with, as when registering.
+pub async fn enroll(
+    endpoint: &Endpoint,
+    server: SocketAddr,
+    server_fingerprint: Fingerprint,
+    identity: &Identity,
+    enrollment: Enrollment,
+) -> Result<DeviceId> {
+    let conn = connect_server(endpoint, server, server_fingerprint, Some(identity)).await?;
+    let answer = async {
+        let (mut send, mut recv) = conn.open_bi().await?;
+        send_message(&mut send, &ToServer::Enroll(enrollment)).await?;
+        match recv_message::<FromServer>(&mut recv).await? {
+            Some(FromServer::Enrolled { id }) => Ok(id),
+            Some(FromServer::Refused(refusal)) => Err(Error::Refused(refusal)),
+            other => Err(Error::Unexpected(format!("{other:?}"))),
+        }
+    }
+    .await;
+    conn.close(close::NORMAL.into(), b"enrolled");
+    answer
 }
 
 /// Ask the server to introduce this viewer to device `id`, then connect to it

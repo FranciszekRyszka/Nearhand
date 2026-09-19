@@ -7,37 +7,43 @@
 //! access password is the only way in, and the server never sees it. But
 //! whoever is at the machine sees that a session is on, for as long as it
 //! lasts (`indicator`).
+//!
+//! An enrollment token that installing could not use yet is used here, once
+//! the server can be reached (`enroll`).
 
-use std::sync::Arc;
+use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use nearhand_core::proto::close;
 use nearhand_transport::{Identity, server_endpoint};
+use quinn::Endpoint;
 use tokio::sync::watch;
 
 use crate::access::AccessPassword;
-use crate::host::Host;
+use crate::host::{Host, Server};
 use crate::machine;
 use crate::session::SessionConfig;
 
+/// Looking the server's name up again after failing: from this, doubling,
+/// to the max.
+const LOOKUP_RETRY_FIRST: Duration = Duration::from_secs(2);
+const LOOKUP_RETRY_MAX: Duration = Duration::from_secs(60);
+
 /// Run from the installation in `dir` until stopped: by the service's
 /// `stop_event`, or by Ctrl+C.
-pub fn run(dir: std::path::PathBuf, stop_event: Option<String>) -> Result<()> {
+pub fn run(dir: PathBuf, stop_event: Option<String>) -> Result<()> {
     let config = machine::Config::load(&dir)
         .context("not installed: set this machine up with `nearhand-agent install` first")?;
-    let identity =
-        Identity::load_or_create(&machine::key_path(&dir)).context("loading the device key")?;
-    let server = config.server.address;
+    let key = machine::key_path(&dir);
+    let identity = Identity::load_or_create(&key).context("loading the device key")?;
     let server_fingerprint = config.server_fingerprint()?;
-    tracing::info!(id = %identity.device_id(), %server, "unattended agent starting");
+    let address = config.server.address.clone();
+    tracing::info!(id = %identity.device_id(), server = %address, "unattended agent starting");
 
     let runtime = tokio::runtime::Runtime::new().context("starting the runtime")?;
-    let endpoint = {
-        let _inside = runtime.enter();
-        server_endpoint(crate::portable::unspecified_like(server), &identity)
-            .context("opening the socket")?
-    };
     // No window, so no one to ask: the access password decides.
     let host = Host::new(false);
     let session_config = Arc::new(SessionConfig {
@@ -45,14 +51,59 @@ pub fn run(dir: std::path::PathBuf, stop_event: Option<String>) -> Result<()> {
         gate: Some(Arc::new(AccessPassword::new(config.access))),
         host: Some(host.clone()),
     });
-    runtime.spawn(crate::portable::serve(
-        endpoint.clone(),
-        server,
-        server_fingerprint,
-        identity,
-        session_config,
-        host.clone(),
-    ));
+    let pending = match config.enrollment {
+        // A second copy of the key, for enrolling alongside.
+        Some(pending) => Some((
+            pending,
+            Identity::load_or_create(&key).context("loading the device key")?,
+        )),
+        None => None,
+    };
+    // Made once the server's address is known: the socket's address family
+    // follows it.
+    let opened: Arc<Mutex<Option<Endpoint>>> = Arc::default();
+    {
+        let opened = opened.clone();
+        let host = host.clone();
+        runtime.spawn(async move {
+            let server = look_up(&address, &host).await;
+            let endpoint =
+                match server_endpoint(crate::portable::unspecified_like(server), &identity) {
+                    Ok(endpoint) => endpoint,
+                    Err(e) => {
+                        tracing::error!(error = %e, "cannot open the socket");
+                        host.set_server(Server::Unreachable {
+                            error: e.to_string(),
+                        });
+                        return;
+                    }
+                };
+            *opened.lock().unwrap_or_else(|p| p.into_inner()) = Some(endpoint.clone());
+            if let Some((pending, identity)) = pending {
+                let endpoint = endpoint.clone();
+                tokio::spawn(async move {
+                    crate::enroll::when_possible(
+                        &dir,
+                        endpoint,
+                        server,
+                        server_fingerprint,
+                        &identity,
+                        pending,
+                    )
+                    .await
+                });
+            }
+            crate::portable::serve(
+                endpoint,
+                server,
+                server_fingerprint,
+                identity,
+                session_config,
+                host,
+            )
+            .await
+        });
+    }
 
     let (stop, mut stopping) = watch::channel(false);
     let waker = host.clone();
@@ -71,10 +122,38 @@ pub fn run(dir: std::path::PathBuf, stop_event: Option<String>) -> Result<()> {
     }
     runtime.block_on(async {
         let _ = stopping.wait_for(|stop| *stop).await;
-        endpoint.close(close::NORMAL.into(), b"agent stopping");
-        let _ = tokio::time::timeout(Duration::from_secs(2), endpoint.wait_idle()).await;
+        let endpoint = opened.lock().unwrap_or_else(|p| p.into_inner()).take();
+        if let Some(endpoint) = endpoint {
+            endpoint.close(close::NORMAL.into(), b"agent stopping");
+            let _ = tokio::time::timeout(Duration::from_secs(2), endpoint.wait_idle()).await;
+        }
     });
     Ok(())
+}
+
+/// The server's address, looked up until found: a service may start before
+/// the network, or its name server, is up.
+async fn look_up(address: &str, host: &Host) -> SocketAddr {
+    let mut wait = LOOKUP_RETRY_FIRST;
+    loop {
+        let name = address.to_owned();
+        let found = tokio::task::spawn_blocking(move || machine::resolve(&name))
+            .await
+            .unwrap_or_else(|e| Err(anyhow::anyhow!("the lookup task: {e}")));
+        match found {
+            Ok(server) => {
+                tracing::info!(%address, %server, "found the server");
+                return server;
+            }
+            Err(e) => {
+                let error = format!("{e:#}");
+                tracing::warn!(%error, retry_in = ?wait, "cannot find the server");
+                host.set_server(Server::Unreachable { error });
+                tokio::time::sleep(wait).await;
+                wait = (wait * 2).min(LOOKUP_RETRY_MAX);
+            }
+        }
+    }
 }
 
 /// Until the service asks the agent to stop through `stop_event`, or Ctrl+C.

@@ -63,6 +63,11 @@ agent            server             viewer
 * The server reports the address it sees the agent at when the viewer asks,
   not when the agent registered: a NAT may have moved it since.
 * The server allows each viewer address 10 introductions a minute.
+* An installed agent may also enroll, once, on a connection of its own with
+  its certificate: `Enroll { token, name, os, version }` ──▶, answered by
+  `Enrolled { id }` or `Refused(Enrollment)`. That records the device in the
+  server's list; it registers as above either way. An enrolled device takes
+  its ID from another key holding it.
 
 ### Through NATs
 

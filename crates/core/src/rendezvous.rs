@@ -13,6 +13,10 @@
 //!   ◀════════════ QUIC, viewer to agent, pinned to the fingerprint ════════════
 //! ```
 //!
+//! A managed agent also enrolls, once, with a token an administrator made:
+//! on a connection of its own, `Enroll` ──▶ and ◀── `Enrolled`. That puts it
+//! in the server's device list; it registers as above either way.
+//!
 //! The server vouches for which key belongs to an ID, and nothing else: it
 //! never sees a session's contents or its password. Everything after `Peer`
 //! runs between viewer and agent on the peer protocol, [`crate::ALPN`].
@@ -109,6 +113,23 @@ pub enum ToServer {
     Ready { session: u64 },
     /// From an agent: it will not take `session`.
     Decline { session: u64 },
+    /// First message from an agent joining the server's managed devices.
+    /// Like `Register`, only with the agent's certificate.
+    Enroll(Enrollment),
+}
+
+/// What an agent sends to enroll.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Enrollment {
+    /// The enrollment token an administrator made.
+    pub token: String,
+    /// The name to list the device under: its computer name, unless the
+    /// installer gave another.
+    pub name: String,
+    /// What it runs on, such as `windows x86_64`.
+    pub os: String,
+    /// The agent's version.
+    pub version: String,
 }
 
 /// From the server.
@@ -131,6 +152,10 @@ pub enum FromServer {
         addresses: Vec<SocketAddr>,
     },
     Refused(Refusal),
+    /// To an agent: enrolled, as the device with this ID.
+    Enrolled {
+        id: DeviceId,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -149,6 +174,8 @@ pub enum Refusal {
     TooManyAttempts,
     /// The first message was not one this server expects.
     Protocol,
+    /// The enrollment token is unknown, expired or used up.
+    Enrollment,
 }
 
 impl fmt::Display for Refusal {
@@ -160,6 +187,7 @@ impl fmt::Display for Refusal {
             Refusal::Declined => "the device did not accept the connection",
             Refusal::TooManyAttempts => "too many attempts; try again in a minute",
             Refusal::Protocol => "unexpected message",
+            Refusal::Enrollment => "the enrollment token is wrong, expired or used up",
         })
     }
 }
@@ -223,5 +251,15 @@ mod tests {
             addresses: vec![here],
         });
         roundtrip(&FromServer::Refused(Refusal::Offline));
+        roundtrip(&ToServer::Enroll(Enrollment {
+            token: "nhe_00ff".into(),
+            name: "RECEPTION-PC".into(),
+            os: "windows x86_64".into(),
+            version: "0.1.0".into(),
+        }));
+        roundtrip(&FromServer::Enrolled {
+            id: DeviceId(1_234_567_890),
+        });
+        roundtrip(&FromServer::Refused(Refusal::Enrollment));
     }
 }

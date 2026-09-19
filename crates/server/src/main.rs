@@ -9,6 +9,7 @@ mod accounts;
 mod api;
 mod config;
 mod db;
+mod devices;
 mod https;
 #[cfg(test)]
 mod netsim;
@@ -26,6 +27,7 @@ use nearhand_transport::{Identity, rendezvous_endpoint};
 
 use crate::accounts::Accounts;
 use crate::config::Config;
+use crate::devices::Devices;
 
 #[derive(Parser, Debug)]
 #[command(name = "nearhand-server", version, about, long_about = None)]
@@ -125,7 +127,17 @@ async fn serve(config: Config, key: PathBuf) -> Result<()> {
     } else {
         None
     };
-    let state = Arc::new(api::AppState { accounts });
+    let devices = Arc::new(Devices::new(pool.clone()));
+    let registry = Arc::new(rendezvous::Registry::new(devices.clone()));
+    let state = Arc::new(api::AppState {
+        accounts,
+        devices,
+        registry: registry.clone(),
+        server: api::ServerInfo {
+            address: config.public_address(),
+            fingerprint: identity.fingerprint().to_string(),
+        },
+    });
     let tls = https::server_config(&config)?;
     let handle = axum_server::Handle::new();
     let app = api::router(state).into_make_service_with_connect_info::<SocketAddr>();
@@ -163,7 +175,6 @@ async fn serve(config: Config, key: PathBuf) -> Result<()> {
         print_setup(&config, &token);
     }
 
-    let registry = Arc::new(rendezvous::Registry::default());
     tokio::select! {
         () = rendezvous::serve(endpoint.clone(), registry) => {}
         result = http => {

@@ -12,8 +12,14 @@
 //!
 //! The registry is in memory. A device's ID comes from its key, so nothing
 //! about it needs to outlive the process: an agent that reconnects after a
-//! restart registers under the same ID again. Accounts, groups and grants —
-//! state worth keeping — arrive with SQLite in M5.
+//! restart registers under the same ID again. What is kept is about managed
+//! devices (`devices`): the registry enrolls agents that bring a token, and
+//! notes when an enrolled one comes and goes.
+//!
+//! An enrolled device also outranks a stranger for its ID. Ten digits are
+//! easily matched on purpose, so someone could register a key with a managed
+//! device's ID first, to keep the device from being found; the device, when
+//! it comes, takes the ID over.
 
 use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
@@ -22,11 +28,13 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use nearhand_core::rendezvous::{DeviceId, FromServer, Refusal, ToServer};
+use nearhand_core::rendezvous::{DeviceId, Enrollment, FromServer, Refusal, ToServer};
 use nearhand_transport::relay::{tag, untag};
 use nearhand_transport::{Fingerprint, peer_fingerprint, recv_message, send_message};
 use quinn::{Connection, Endpoint, SendStream};
 use tokio::sync::{mpsc, oneshot};
+
+use crate::devices::Devices;
 
 /// How long a client has to say what it wants.
 const FIRST_MESSAGE: Duration = Duration::from_secs(10);
@@ -53,6 +61,8 @@ pub struct Registry {
     agents: Mutex<HashMap<DeviceId, Agent>>,
     attempts: Mutex<HashMap<IpAddr, VecDeque<Instant>>>,
     next: AtomicU64,
+    /// The managed devices; without them, agents can only register.
+    devices: Option<Arc<Devices>>,
 }
 
 #[derive(Clone)]
@@ -71,6 +81,8 @@ struct Agent {
     /// Which registration this is, so a stale connection going away does not
     /// remove the one that replaced it.
     registration: u64,
+    /// Whether it is a managed device, which may take its ID from a stranger.
+    enrolled: bool,
 }
 
 /// Accept clients until the endpoint closes.
@@ -105,18 +117,20 @@ async fn handle(conn: Connection, registry: &Registry) -> Result<()> {
             let registered = register(&conn, send, registry, addresses).await?;
             // An agent's stream carries its answers until it goes away.
             let result = serve_agent(&mut recv, &registered).await;
-            registry.remove(&registered);
+            registry.remove(&registered, &conn).await;
             result
         }
         Some(ToServer::Connect { id, addresses }) => {
             introduce(&conn, &mut send, registry, id, addresses).await
         }
+        Some(ToServer::Enroll(enrollment)) => enroll(&conn, &mut send, registry, enrollment).await,
         _ => refuse(&conn, &mut send, Refusal::Protocol).await,
     }
 }
 
 struct Registered {
     id: DeviceId,
+    fingerprint: Fingerprint,
     registration: u64,
     waiting: Arc<Mutex<HashMap<u64, oneshot::Sender<bool>>>>,
 }
@@ -133,6 +147,7 @@ async fn register(
     };
     let id = fingerprint.device_id();
     let observed = conn.remote_address();
+    let enrolled = registry.is_enrolled(&fingerprint).await;
     let (to_agent, mut from_server) = mpsc::unbounded_channel();
     let waiting = Arc::new(Mutex::new(HashMap::new()));
     let relays = Relays::default();
@@ -145,23 +160,40 @@ async fn register(
         waiting: waiting.clone(),
         relays: relays.clone(),
         registration,
+        enrolled,
     };
-    let taken = {
+    let (taken, displaced) = {
         let mut agents = lock(&registry.agents);
-        let taken = agents
-            .get(&id)
-            .is_some_and(|a| a.fingerprint != fingerprint);
-        if !taken {
-            // The same device again — a reconnect — replaces its old entry.
-            agents.insert(id, agent);
+        let holder = agents.get(&id);
+        match claim(
+            holder.map(|a| (&a.fingerprint, a.enrolled)),
+            &fingerprint,
+            enrolled,
+        ) {
+            Claim::Refuse => (true, None),
+            claim => {
+                let displaced = (claim == Claim::Displace)
+                    .then(|| holder.map(|a| a.conn.clone()))
+                    .flatten();
+                agents.insert(id, agent);
+                (false, displaced)
+            }
         }
-        taken
     };
     if taken {
         refuse(conn, &mut send, Refusal::IdTaken).await?;
         bail!("ID {id} is held by another key");
     }
-    tracing::info!(%id, %observed, "agent registered");
+    if let Some(stranger) = displaced {
+        tracing::warn!(
+            %id,
+            stranger = %stranger.remote_address(),
+            "another key held a managed device's ID; the device takes it over"
+        );
+        stranger.close(0u32.into(), b"ID taken over by its managed device");
+    }
+    tracing::info!(%id, %observed, enrolled, "agent registered");
+    registry.seen(&fingerprint, observed).await;
     send_message(&mut send, &FromServer::Registered { id, observed }).await?;
 
     // The agent's relayed packets, each to its session's viewer. Ends when
@@ -195,6 +227,7 @@ async fn register(
     });
     Ok(Registered {
         id,
+        fingerprint,
         registration,
         waiting,
     })
@@ -286,6 +319,66 @@ async fn relay(viewer: &Connection, agent: &Agent, session: u64) {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum Claim {
+    /// The ID is free, or held by this same key — a reconnect.
+    Take,
+    /// A managed device takes its ID from a stranger's key.
+    Displace,
+    /// Another key holds it, and this one does not outrank it.
+    Refuse,
+}
+
+/// Whether a key may register under an ID that `holder` — its key, and
+/// whether it is enrolled — may hold now.
+fn claim(holder: Option<(&Fingerprint, bool)>, key: &Fingerprint, enrolled: bool) -> Claim {
+    match holder {
+        None => Claim::Take,
+        Some((held, _)) if held == key => Claim::Take,
+        Some((_, false)) if enrolled => Claim::Displace,
+        Some(_) => Claim::Refuse,
+    }
+}
+
+/// An agent with a token joins the managed devices.
+async fn enroll(
+    conn: &Connection,
+    send: &mut SendStream,
+    registry: &Registry,
+    enrollment: Enrollment,
+) -> Result<()> {
+    let Some(fingerprint) = peer_fingerprint(conn) else {
+        return refuse(conn, send, Refusal::NoCertificate).await;
+    };
+    let from = conn.remote_address();
+    // Tokens cannot be guessed, but each try costs a database write.
+    if !registry.attempt(from.ip()) {
+        return refuse(conn, send, Refusal::TooManyAttempts).await;
+    }
+    let Some(devices) = &registry.devices else {
+        return refuse(conn, send, Refusal::Enrollment).await;
+    };
+    let id = fingerprint.device_id();
+    match devices.enroll(&fingerprint, &enrollment, from).await {
+        Ok(device) => {
+            tracing::info!(%id, name = %device.name, %from, "device enrolled");
+            // Registered already, under this key: managed from now on.
+            if let Some(agent) = lock(&registry.agents).get_mut(&id)
+                && agent.fingerprint == fingerprint
+            {
+                agent.enrolled = true;
+            }
+            send_message(send, &FromServer::Enrolled { id }).await?;
+            goodbye(conn, send).await;
+            Ok(())
+        }
+        Err(refused) => {
+            tracing::info!(%id, %from, error = %refused, "enrollment refused");
+            refuse(conn, send, Refusal::Enrollment).await
+        }
+    }
+}
+
 async fn refuse(conn: &Connection, send: &mut SendStream, refusal: Refusal) -> Result<()> {
     tracing::debug!(remote = %conn.remote_address(), ?refusal, "refused");
     send_message(send, &FromServer::Refused(refusal)).await?;
@@ -302,14 +395,57 @@ async fn goodbye(conn: &Connection, send: &mut SendStream) {
 }
 
 impl Registry {
-    fn remove(&self, registered: &Registered) {
-        let mut agents = lock(&self.agents);
-        if agents
-            .get(&registered.id)
-            .is_some_and(|a| a.registration == registered.registration)
+    /// A registry that enrolls devices into `devices`, and keeps their
+    /// presence there.
+    pub fn new(devices: Arc<Devices>) -> Self {
+        Self {
+            devices: Some(devices),
+            ..Self::default()
+        }
+    }
+
+    /// Where the device with this key is connected from, if it is.
+    pub fn online(&self, fingerprint: &Fingerprint) -> Option<SocketAddr> {
+        lock(&self.agents)
+            .get(&fingerprint.device_id())
+            .filter(|a| a.fingerprint == *fingerprint)
+            .map(|a| a.conn.remote_address())
+    }
+
+    async fn is_enrolled(&self, fingerprint: &Fingerprint) -> bool {
+        let Some(devices) = &self.devices else {
+            return false;
+        };
+        devices.is_enrolled(fingerprint).await.unwrap_or_else(|e| {
+            tracing::error!(error = %e, "looking up a device");
+            false
+        })
+    }
+
+    async fn seen(&self, fingerprint: &Fingerprint, from: SocketAddr) {
+        if let Some(devices) = &self.devices
+            && let Err(e) = devices.seen(fingerprint, from).await
         {
-            agents.remove(&registered.id);
+            tracing::error!(error = %e, "noting a device's presence");
+        }
+    }
+
+    async fn remove(&self, registered: &Registered, conn: &Connection) {
+        let removed = {
+            let mut agents = lock(&self.agents);
+            let current = agents
+                .get(&registered.id)
+                .is_some_and(|a| a.registration == registered.registration);
+            if current {
+                agents.remove(&registered.id);
+            }
+            current
+        };
+        if removed {
             tracing::info!(id = %registered.id, "agent left");
+            // Last seen as it goes.
+            self.seen(&registered.fingerprint, conn.remote_address())
+                .await;
         }
     }
 
@@ -339,7 +475,7 @@ impl Registry {
     }
 
     #[cfg(test)]
-    fn online(&self) -> usize {
+    fn registered(&self) -> usize {
         lock(&self.agents).len()
     }
 }
@@ -389,6 +525,105 @@ mod tests {
     }
 
     #[test]
+    fn a_managed_device_outranks_a_stranger_for_its_id() {
+        let device = Fingerprint::from_bytes([1; 32]);
+        let stranger = Fingerprint::from_bytes([2; 32]);
+        assert_eq!(claim(None, &stranger, false), Claim::Take);
+        assert_eq!(claim(Some((&device, true)), &device, true), Claim::Take);
+        assert_eq!(
+            claim(Some((&device, false)), &stranger, false),
+            Claim::Refuse
+        );
+        assert_eq!(
+            claim(Some((&stranger, false)), &device, true),
+            Claim::Displace
+        );
+        assert_eq!(
+            claim(Some((&device, true)), &stranger, false),
+            Claim::Refuse,
+            "a stranger never displaces a managed device"
+        );
+        assert_eq!(
+            claim(Some((&device, true)), &stranger, true),
+            Claim::Refuse,
+            "nor one managed device another: first come keeps it"
+        );
+    }
+
+    #[tokio::test]
+    async fn agents_enroll_with_a_token_and_are_seen_when_they_register() {
+        use crate::accounts::Accounts;
+        use nearhand_core::rendezvous::Enrollment;
+        use nearhand_transport::rendezvous::enroll;
+        use nearhand_transport::{Error, rendezvous_endpoint, server_endpoint};
+
+        let pool = crate::db::in_memory().await;
+        let accounts = Accounts::new(pool.clone());
+        let setup = accounts.new_setup_token().await.expect("setup token");
+        let admin = accounts
+            .setup(&setup, "ada", "correct horse battery")
+            .await
+            .expect("admin");
+        let devices = Arc::new(Devices::new(pool));
+        let (_, token) = devices
+            .new_enroll_token(&admin, "rollout", None, Some(1), 1)
+            .await
+            .expect("token");
+
+        let server_identity = Identity::generate().expect("server key");
+        let server = rendezvous_endpoint(([127, 0, 0, 1], 0).into(), &server_identity)
+            .expect("server endpoint");
+        let server_addr = server.local_addr().expect("addr");
+        let registry = Arc::new(Registry::new(devices.clone()));
+        tokio::spawn(serve(server.clone(), registry.clone()));
+
+        let identity = Arc::new(Identity::generate().expect("agent key"));
+        let agent = server_endpoint(([127, 0, 0, 1], 0).into(), &identity).expect("agent");
+        let asking = |token: &str| Enrollment {
+            token: token.into(),
+            name: "RECEPTION".into(),
+            os: "windows x86_64".into(),
+            version: "0.1.0".into(),
+        };
+        let fp = server_identity.fingerprint();
+        let wrong = enroll(&agent, server_addr, fp, &identity, asking("nhe_guess")).await;
+        assert!(
+            matches!(wrong, Err(Error::Refused(Refusal::Enrollment))),
+            "{wrong:?}"
+        );
+        let id = enroll(&agent, server_addr, fp, &identity, asking(&token))
+            .await
+            .expect("enrolled");
+        assert_eq!(id, identity.device_id());
+        let again = enroll(&agent, server_addr, fp, &identity, asking(&token)).await;
+        assert!(again.is_err(), "the token was for one device");
+
+        let listed = devices.devices().await.expect("devices");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].name, "RECEPTION");
+        assert_eq!(listed[0].fingerprint, identity.fingerprint().to_string());
+        assert!(registry.online(&identity.fingerprint()).is_none());
+
+        let registering = {
+            let agent = agent.clone();
+            let identity = identity.clone();
+            tokio::spawn(async move {
+                stay_registered(&agent, server_addr, fp, &identity, |_| {}).await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while registry.online(&identity.fingerprint()).is_none() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the agent registers");
+        assert!(lock(&registry.agents)[&id].enrolled);
+        registering.abort();
+        server.close(0u32.into(), b"done");
+    }
+
+    #[test]
     fn attempts_are_limited_per_address() {
         let registry = Registry::default();
         let a: IpAddr = "198.51.100.1".parse().expect("ip");
@@ -398,7 +633,7 @@ mod tests {
         }
         assert!(!registry.attempt(a));
         assert!(registry.attempt(b), "others are unaffected");
-        assert_eq!(registry.online(), 0);
+        assert_eq!(registry.registered(), 0);
     }
 
     // --- Whole introductions, across simulated NATs -------------------------
@@ -537,7 +772,7 @@ mod tests {
                 ));
             }
             tokio::time::timeout(Duration::from_secs(5), async {
-                while registry.online() == 0 {
+                while registry.registered() == 0 {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
             })

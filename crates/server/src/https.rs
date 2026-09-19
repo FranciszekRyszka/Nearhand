@@ -62,7 +62,7 @@ fn self_signed(config: &Config) -> Result<(PathBuf, PathBuf)> {
 }
 
 /// `desk.example.com` from `https://desk.example.com:8443/path`.
-fn host_of(url: &str) -> Option<String> {
+pub(crate) fn host_of(url: &str) -> Option<String> {
     let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
     let authority = rest.split('/').next()?;
     let host = match authority.rsplit_once(':') {

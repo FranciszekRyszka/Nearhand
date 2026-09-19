@@ -1,9 +1,10 @@
 # Self-hosting
 
 > **Status: early.** The server introduces agents to viewers by device ID,
-> relays sessions that cannot go direct, and has user accounts behind a REST
-> API. Enrollment, groups and grants, the console and a Docker image are still
-> to come (M5, M6); the sections about them say so.
+> relays sessions that cannot go direct, has user accounts behind a REST API,
+> and enrolls installed agents into a device list with groups. Grants, the
+> console and a Docker image are still to come (M5, M6); the sections about
+> them say so.
 
 ## What works today
 
@@ -35,8 +36,12 @@ On a machine that should be reachable with no one at it, install the agent
 as a service, from an administrator terminal:
 
 ```bat
-nearhand-agent install --server 203.0.113.10:443 --server-fingerprint <fingerprint>
+nearhand-agent install --server desk.example.com --server-fingerprint <fingerprint>
 ```
+
+`--server` is a name or an IP address, with `:port` when it is not 443; the
+agent looks a name up each time it starts. Add `--token` to enroll the
+machine in the server's device list ([Enrollment](#enrollment)).
 
 It asks for an access password (at least 10 characters), prints the
 machine's ID, and starts the `Nearhand` service, which keeps the agent
@@ -54,9 +59,13 @@ Or install the MSI (built by `packaging/windows/build-msi.ps1`, and by CI on
 every push), which does the same and suits a silent rollout:
 
 ```bat
-msiexec /i nearhand-agent-0.1.0-x64.msi /qn SERVER=203.0.113.10:443 ^
-    SERVER_FINGERPRINT=<fingerprint> ACCESS_PASSWORD=<password>
+msiexec /i nearhand-agent-0.1.0-x64.msi /qn SERVER=desk.example.com ^
+    SERVER_FINGERPRINT=<fingerprint> ACCESS_PASSWORD=<password> ^
+    ENROLL_TOKEN=<token>
 ```
+
+`ENROLL_TOKEN` is optional, and so is `DEVICE_NAME`, the name to list the
+machine under instead of its computer name.
 
 An MSI installation is removed from *Installed apps* (or `msiexec /x`), not
 with `nearhand-agent uninstall`; both keep the key, and so the ID. The MSI is
@@ -96,6 +105,8 @@ dir = "/var/lib/nearhand"      # server.key, nearhand.db, https.crt/.key
 
 [quic]
 bind = "0.0.0.0:443"           # UDP: agents, viewers, the relay
+public_address = "desk.example.com:443"   # for install commands; default:
+                                          # public_url's host, bind's port
 
 [http]
 bind = "0.0.0.0:443"           # TCP: the REST API (and the console, to come)
@@ -136,17 +147,40 @@ turned on per user; wrong passwords are limited per address and per name.
 
 ## Enrollment
 
-> Not yet: this is the next step of M5.
-
-An admin creates a token — single-use or multi-use, with an expiry and a target
-group — and the agent registers against it:
+Enrolled machines make up the server's device list: their names, groups,
+operating system and agent version, whether they are online now, and when
+and from where they were last seen. An administrator makes an enrollment
+token — for one device or any number, lasting 1 to 90 days, optionally
+putting devices into a group:
 
 ```bash
-nearhand-agent install --server desk.example.com --token <token>
+curl https://desk.example.com/api/v1/enroll-tokens -H "authorization: Bearer nht_..." \
+    -H 'content-type: application/json' \
+    -d '{"name": "front office", "uses": null, "expires_in_days": 7, "group_id": 1}'
 ```
 
-The server can also generate **pre-configured installers** (MSI or PKG with the
-address and token baked in) for rollout through GPO, Intune or MDM.
+The answer holds the token, shown this once, and the commands that use it:
+
+```bat
+nearhand-agent install --server desk.example.com --server-fingerprint <fingerprint> --token nhe_...
+```
+
+or the MSI with `ENROLL_TOKEN=nhe_...`. Installing enrolls straight away; if
+the server cannot be reached then, the agent keeps the token (readable by
+administrators only) and enrolls as soon as it can, then forgets it. A
+wrong, expired or used-up token makes installing fail, with the reason.
+
+Enrolling is on top of registering, not instead: an enrolled agent is found
+by its ID as before, and still lets in only whoever has its access password
+until grants arrive. Removing a device from the list does not stop it; a new
+token enrolls it again. An enrolled device also keeps its ID against any
+other key that claims it ([security](security.md#what-the-device-id-is-and-is-not)).
+
+A killed agent, or one whose network vanished, shows as offline within 15
+seconds.
+
+Still to come: the server generating **pre-configured installers** (MSI or
+PKG with the address and token baked in) for GPO, Intune or MDM.
 
 ## Backup
 

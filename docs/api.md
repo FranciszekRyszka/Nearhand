@@ -1,7 +1,7 @@
 # REST API
 
-> **Status: M5, in progress.** Accounts and tokens so far; devices, groups,
-> grants and the audit log follow.
+> **Status: M5, in progress.** Accounts, tokens, devices, groups and
+> enrollment so far; grants and the audit log follow.
 
 Everything is under `/api/v1` on the server's HTTPS port, JSON in and out.
 Errors are `{"error": "..."}` with a fitting status code.
@@ -34,6 +34,23 @@ Errors are `{"error": "..."}` with a fitting status code.
 | `POST /users` | administrators | `{name, password, admin?}` |
 | `PATCH /users/{id}` | administrators | `{admin?, disabled?}`; disabling ends their sign-ins |
 | `DELETE /users/{id}` | administrators | deletes a user; not the last active administrator |
+| `GET /server` | signed in | `{address, fingerprint}`: what agents and viewers need to reach and pin this server |
+| `GET /devices` | administrators | enrolled devices: `{id, device_id, fingerprint, name, group_id, group, os, version, enrolled_at, last_seen_at, last_address, online}` |
+| `GET /devices/{id}` | administrators | one device |
+| `PATCH /devices/{id}` | administrators | `{name?, group_id?}`; `group_id: null` takes it out of its group |
+| `DELETE /devices/{id}` | administrators | removes it from the list; a new token enrolls it again |
+| `GET /device-groups` | administrators | `{id, name, devices}`, `devices` being how many |
+| `POST /device-groups` | administrators | `{name}` |
+| `PATCH /device-groups/{id}` | administrators | `{name}` |
+| `DELETE /device-groups/{id}` | administrators | its devices stay, in no group; tokens into it are deleted |
+| `GET /enroll-tokens` | administrators | tokens that still enroll (never the tokens themselves) |
+| `POST /enroll-tokens` | administrators | `{name, group_id?, uses?, expires_in_days?}`: `uses` is 1 unless given, `null` for any number; 1 day unless given, at most 90. Answers `{token, details, install, msi}`: the token and the commands that use it, shown this once |
+| `DELETE /enroll-tokens/{id}` | administrators | deletes one |
+
+Devices, groups and tokens are for administrators until grants say who else
+may see which devices.
+
+Times are Unix seconds.
 
 ## Example
 

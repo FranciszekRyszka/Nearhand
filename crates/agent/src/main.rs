@@ -9,6 +9,7 @@
 
 mod access;
 mod elevation;
+mod enroll;
 mod gate;
 mod host;
 mod indicator;
@@ -60,9 +61,10 @@ enum Command {
     /// key and ID, its server, an access password, and the Windows service
     /// that keeps the agent running.
     Install {
-        /// The server's address, for example `203.0.113.10:443`.
+        /// The server's address: `desk.example.com`, `desk.example.com:4433`
+        /// or `203.0.113.10:443`. The port is 443 unless given.
         #[arg(long)]
-        server: SocketAddr,
+        server: String,
         /// The fingerprint the server printed when it started.
         #[arg(long)]
         server_fingerprint: Fingerprint,
@@ -73,18 +75,30 @@ enum Command {
         /// The most video bitrate to use.
         #[arg(long, default_value_t = machine::DEFAULT_BITRATE_KBPS)]
         bitrate_kbps: u32,
+        /// An enrollment token from the server's administrator, to join its
+        /// managed devices.
+        #[arg(long)]
+        token: Option<String>,
+        /// The name to enroll this computer under; its computer name if not
+        /// given.
+        #[arg(long, requires = "token")]
+        name: Option<String>,
     },
     /// `install` without the service, which the MSI registers itself.
     #[command(hide = true)]
     Configure {
         #[arg(long)]
-        server: SocketAddr,
+        server: String,
         #[arg(long)]
         server_fingerprint: Fingerprint,
         #[arg(long)]
         password: Option<String>,
         #[arg(long, default_value_t = machine::DEFAULT_BITRATE_KBPS)]
         bitrate_kbps: u32,
+        #[arg(long)]
+        token: Option<String>,
+        #[arg(long)]
+        name: Option<String>,
     },
     /// Remove the service, as administrator.
     Uninstall {
@@ -184,22 +198,30 @@ fn main() -> Result<()> {
             server_fingerprint,
             password,
             bitrate_kbps,
+            token,
+            name,
         } => setup::install(setup::Install {
             server,
             server_fingerprint,
             password,
             bitrate_kbps,
+            token,
+            name,
         }),
         Command::Configure {
             server,
             server_fingerprint,
             password,
             bitrate_kbps,
+            token,
+            name,
         } => setup::configure(setup::Install {
             server,
             server_fingerprint,
             password,
             bitrate_kbps,
+            token,
+            name,
         })
         .map(|identity| {
             println!(
