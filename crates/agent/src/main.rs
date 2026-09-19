@@ -11,6 +11,7 @@ mod access;
 mod elevation;
 mod enroll;
 mod gate;
+mod grants;
 mod host;
 mod indicator;
 mod input;
@@ -69,14 +70,17 @@ enum Command {
         #[arg(long)]
         server_fingerprint: Fingerprint,
         /// The access password. Asked for, without showing it, if not given
-        /// here — where it would stay in the shell's history.
+        /// here — where it would stay in the shell's history — unless the
+        /// machine enrolls with `--token`: then people reach it with grants
+        /// from the server, and a password is only a second way in.
         #[arg(long)]
         password: Option<String>,
         /// The most video bitrate to use.
         #[arg(long, default_value_t = machine::DEFAULT_BITRATE_KBPS)]
         bitrate_kbps: u32,
         /// An enrollment token from the server's administrator, to join its
-        /// managed devices.
+        /// managed devices: users the server grants access reach it without
+        /// the access password.
         #[arg(long)]
         token: Option<String>,
         /// The name to enroll this computer under; its computer name if not
@@ -112,6 +116,10 @@ enum Command {
         /// The new password; asked for if not given.
         #[arg(long)]
         password: Option<String>,
+        /// Remove the password instead: only grants from the server let
+        /// anyone in.
+        #[arg(long, conflicts_with = "password")]
+        none: bool,
     },
     /// Show whether the service runs, and this computer's ID.
     Status,
@@ -176,6 +184,7 @@ fn main() -> Result<()> {
             let config = SessionConfig {
                 bitrate_kbps,
                 gate: None,
+                grants: None,
                 host: None,
             };
             runtime.block_on(listen(bind, config))
@@ -230,7 +239,7 @@ fn main() -> Result<()> {
             )
         }),
         Command::Uninstall { purge } => setup::uninstall(purge),
-        Command::SetPassword { password } => setup::set_password(password),
+        Command::SetPassword { password, none } => setup::set_password(password, none),
         Command::Status => setup::status(),
         Command::Run { stop_event, dir } => {
             unattended::run(dir.unwrap_or_else(machine::dir), stop_event)

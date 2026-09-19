@@ -2,9 +2,9 @@
 
 > **Status: early.** The server introduces agents to viewers by device ID,
 > relays sessions that cannot go direct, has user accounts behind a REST API,
-> and enrolls installed agents into a device list with groups. Grants, the
-> console and a Docker image are still to come (M5, M6); the sections about
-> them say so.
+> enrolls installed agents into a device list with groups, and lets users at
+> them with grants. The audit log, the console and a Docker image are still
+> to come (M5, M6); the sections about them say so.
 
 ## What works today
 
@@ -41,7 +41,9 @@ nearhand-agent install --server desk.example.com --server-fingerprint <fingerpri
 
 `--server` is a name or an IP address, with `:port` when it is not 443; the
 agent looks a name up each time it starts. Add `--token` to enroll the
-machine in the server's device list ([Enrollment](#enrollment)).
+machine in the server's device list ([Enrollment](#enrollment)): then the
+server's users reach it with [grants](#grants), and the access password is
+optional (`set-password --none` removes one).
 
 It asks for an access password (at least 10 characters), prints the
 machine's ID, and starts the `Nearhand` service, which keeps the agent
@@ -65,7 +67,8 @@ msiexec /i nearhand-agent-0.1.0-x64.msi /qn SERVER=desk.example.com ^
 ```
 
 `ENROLL_TOKEN` is optional, and so is `DEVICE_NAME`, the name to list the
-machine under instead of its computer name.
+machine under instead of its computer name. With `ENROLL_TOKEN`,
+`ACCESS_PASSWORD` may be left out.
 
 An MSI installation is removed from *Installed apps* (or `msiexec /x`), not
 with `nearhand-agent uninstall`; both keep the key, and so the ID. The MSI is
@@ -171,9 +174,8 @@ administrators only) and enrolls as soon as it can, then forgets it. A
 wrong, expired or used-up token makes installing fail, with the reason.
 
 Enrolling is on top of registering, not instead: an enrolled agent is found
-by its ID as before, and still lets in only whoever has its access password
-until grants arrive. Removing a device from the list does not stop it; a new
-token enrolls it again. An enrolled device also keeps its ID against any
+by its ID as before. Removing a device from the list does not stop it, and
+it still takes grants; a new token enrolls it again. An enrolled device also keeps its ID against any
 other key that claims it ([security](security.md#what-the-device-id-is-and-is-not)).
 
 A killed agent, or one whose network vanished, shows as offline within 15
@@ -181,6 +183,36 @@ seconds.
 
 Still to come: the server generating **pre-configured installers** (MSI or
 PKG with the address and token baked in) for GPO, Intune or MDM.
+
+## Grants
+
+Who may connect to which enrolled machines. Users go in user groups, devices
+in device groups, and a grant lets a user group at a device group with a
+role: `view` (watch only), `control` (keyboard, mouse, clipboard) or `full`.
+A user's role on a device is the highest their grants give. Administrators
+set it all up, and need a grant themselves to connect:
+
+```bash
+api() { curl -s "https://desk.example.com/api/v1$1" -H "authorization: Bearer $ADMIN" "${@:2}"; }
+api /user-groups -H 'content-type: application/json' -d '{"name": "Helpdesk"}'       # → id 1
+api /user-groups/1/members/2 -X PUT                                                  # user 2 joins
+api /grants -H 'content-type: application/json' \
+    -d '{"user_group_id": 1, "device_group_id": 1, "role": "control"}'
+```
+
+Users see the devices they may reach, with their role, at `GET /devices`,
+and connect with an API token of their own instead of a password:
+
+```bash
+NEARHAND_TOKEN=nht_... nearhand-viewer connect "123 456 7890" \
+    --server desk.example.com:443 --server-fingerprint <fingerprint>
+```
+
+The server hands the viewer a grant for that device, signed with its key and
+good for five minutes; the agent checks it against the server key it pinned
+and lets the viewer in with the grant's role, without asking the server. See
+[security](security.md#authorisation) for what that trusts the server
+with.
 
 ## Backup
 

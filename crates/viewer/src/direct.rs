@@ -109,6 +109,8 @@ pub enum Target {
         server_fingerprint: Fingerprint,
         id: DeviceId,
         route: rendezvous::Route,
+        /// An API token of a user of the server, to connect with a grant.
+        token: Option<String>,
     },
 }
 
@@ -148,7 +150,7 @@ pub struct Options {
 }
 
 pub async fn run(options: Options) -> Result<()> {
-    let (endpoint, conn) = match &options.target {
+    let (endpoint, conn, grant) = match &options.target {
         Target::Direct {
             address,
             fingerprint,
@@ -157,21 +159,43 @@ pub async fn run(options: Options) -> Result<()> {
             let conn = connect(&endpoint, *address, *fingerprint)
                 .await
                 .with_context(|| format!("connecting to {address}"))?;
-            (endpoint, conn)
+            (endpoint, conn, None)
         }
         Target::Server {
             server,
             server_fingerprint,
             id,
             route,
+            token,
         } => {
             let endpoint = client_endpoint(*server)?;
-            let conn = rendezvous::find(&endpoint, *server, *server_fingerprint, *id, *route)
-                .await
-                .with_context(|| format!("reaching {id} through {server}"))?;
-            (endpoint, conn)
+            let (conn, grant) = match token {
+                Some(token) => {
+                    let (conn, grant) = rendezvous::find_granted(
+                        &endpoint,
+                        *server,
+                        *server_fingerprint,
+                        *id,
+                        *route,
+                        token,
+                    )
+                    .await
+                    .with_context(|| format!("reaching {id} through {server}"))?;
+                    (conn, Some(grant))
+                }
+                None => (
+                    rendezvous::find(&endpoint, *server, *server_fingerprint, *id, *route)
+                        .await
+                        .with_context(|| format!("reaching {id} through {server}"))?,
+                    None,
+                ),
+            };
+            (endpoint, conn, grant)
         }
     };
+    if let Some(Ok(claims)) = grant.as_ref().map(|g| g.claims()) {
+        println!("granted: {} as {}", claims.role, claims.user);
+    }
     let path = rendezvous::path_of(conn.remote_address());
     println!(
         "connected to {} at {}, {path} (rtt {:?})",
@@ -205,11 +229,16 @@ pub async fn run(options: Options) -> Result<()> {
     };
     let mut next = recv_message::<Control>(&mut recv).await;
     if let Ok(Some(Control::AuthRequired)) = next {
-        let password = match options.password.clone() {
-            Some(password) => password,
-            None => ask_password().await?,
+        let answer = match grant {
+            Some(grant) => Control::Present { grant },
+            None => Control::Authenticate {
+                password: match options.password.clone() {
+                    Some(password) => password,
+                    None => ask_password().await?,
+                },
+            },
         };
-        send_message(&mut send, &Control::Authenticate { password }).await?;
+        send_message(&mut send, &answer).await?;
         next = recv_message::<Control>(&mut recv).await;
     }
     if let Ok(Some(Control::AwaitingApproval)) = next {

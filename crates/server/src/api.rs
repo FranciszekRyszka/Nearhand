@@ -12,6 +12,7 @@
 //! Errors are `{"error": "…"}` with a fitting status; signing in without a
 //! needed TOTP code also says `"totp_needed": true`.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -20,7 +21,7 @@ use axum::http::header::{AUTHORIZATION, COOKIE, HOST, ORIGIN, SET_COOKIE};
 use axum::http::request::Parts;
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, patch, post};
+use axum::routing::{delete, get, patch, post, put};
 use axum::{Json, Router};
 use nearhand_transport::Fingerprint;
 use serde::{Deserialize, Deserializer};
@@ -28,13 +29,16 @@ use serde_json::json;
 
 use crate::accounts::{Accounts, Refused, User};
 use crate::devices::{Device, Devices, EnrollToken, Group};
+use crate::grants::{GrantRule, Grants, UserGroup};
 use crate::rendezvous::Registry;
+use nearhand_core::grant::Role;
 
 pub const SESSION_COOKIE: &str = "nearhand_session";
 
 pub struct AppState {
-    pub accounts: Accounts,
+    pub accounts: Arc<Accounts>,
     pub devices: Arc<Devices>,
+    pub grants: Arc<Grants>,
     /// Who is connected now.
     pub registry: Arc<Registry>,
     pub server: ServerInfo,
@@ -79,6 +83,20 @@ pub fn router(state: Arc<AppState>) -> Router {
             get(list_enroll_tokens).post(new_enroll_token),
         )
         .route("/api/v1/enroll-tokens/{id}", delete(delete_enroll_token))
+        .route(
+            "/api/v1/user-groups",
+            get(list_user_groups).post(create_user_group),
+        )
+        .route(
+            "/api/v1/user-groups/{id}",
+            patch(rename_user_group).delete(delete_user_group),
+        )
+        .route(
+            "/api/v1/user-groups/{id}/members/{user}",
+            put(add_member).delete(remove_member),
+        )
+        .route("/api/v1/grants", get(list_grants).post(set_grant))
+        .route("/api/v1/grants/{id}", delete(delete_grant))
         .with_state(state)
 }
 
@@ -450,8 +468,8 @@ async fn server(State(state): State<Arc<AppState>>, _caller: Caller) -> Json<Ser
 
 // --- Devices ---------------------------------------------------------------------
 //
-// Administrators only, until grants (the next step) say who else may see
-// which devices.
+// Administrators see every device and manage them; everyone sees the devices
+// their grants let them at, with their role on each.
 
 impl AppState {
     fn with_presence(&self, mut device: Device) -> Device {
@@ -467,24 +485,59 @@ impl AppState {
 
 async fn list_devices(
     State(state): State<Arc<AppState>>,
-    _admin: Admin,
+    caller: Caller,
 ) -> ApiResult<Json<Vec<Device>>> {
+    let roles = state.roles(&caller.user).await?;
     let devices = state.devices.devices().await?;
     Ok(Json(
         devices
             .into_iter()
-            .map(|d| state.with_presence(d))
+            .filter_map(|d| state.as_seen_by(&caller.user, &roles, d))
             .collect(),
     ))
 }
 
 async fn get_device(
     State(state): State<Arc<AppState>>,
-    _admin: Admin,
+    caller: Caller,
     Path(id): Path<i64>,
 ) -> ApiResult<Json<Device>> {
+    let roles = state.roles(&caller.user).await?;
     let device = state.devices.device(id).await?;
-    Ok(Json(state.with_presence(device)))
+    // Not there, as far as someone without a grant can tell.
+    state
+        .as_seen_by(&caller.user, &roles, device)
+        .map(Json)
+        .ok_or(ApiError::Refused(Refused::NotFound))
+}
+
+impl AppState {
+    /// `user`'s role on each device they may reach, by device row.
+    async fn roles(&self, user: &User) -> ApiResult<HashMap<i64, Role>> {
+        Ok(self
+            .grants
+            .reachable(user.id)
+            .await?
+            .into_iter()
+            .map(|r| (r.id, r.role))
+            .collect())
+    }
+
+    /// `device` as `user` sees it, if they may see it at all.
+    fn as_seen_by(
+        &self,
+        user: &User,
+        roles: &HashMap<i64, Role>,
+        device: Device,
+    ) -> Option<Device> {
+        let role = roles.get(&device.id).copied();
+        if role.is_none() && !user.admin {
+            return None;
+        }
+        let mut device = self.with_presence(device);
+        device.role = role.map(|r| r.as_str().to_owned());
+        Some(device)
+    }
 }
 
 /// A field that may be absent (leave it), null (clear it) or a value.
@@ -643,6 +696,113 @@ async fn delete_enroll_token(
     Ok(StatusCode::NO_CONTENT)
 }
 
+// --- User groups and grants ------------------------------------------------------------
+
+async fn list_user_groups(
+    State(state): State<Arc<AppState>>,
+    _admin: Admin,
+) -> ApiResult<Json<Vec<UserGroup>>> {
+    Ok(Json(state.grants.user_groups().await?))
+}
+
+async fn create_user_group(
+    State(state): State<Arc<AppState>>,
+    Admin(admin): Admin,
+    Json(request): Json<GroupRequest>,
+) -> ApiResult<(StatusCode, Json<UserGroup>)> {
+    let group = state.grants.create_user_group(&request.name).await?;
+    tracing::info!(by = %admin.name, name = %group.name, "user group created");
+    Ok((StatusCode::CREATED, Json(group)))
+}
+
+async fn rename_user_group(
+    State(state): State<Arc<AppState>>,
+    Admin(admin): Admin,
+    Path(id): Path<i64>,
+    Json(request): Json<GroupRequest>,
+) -> ApiResult<Json<UserGroup>> {
+    let group = state.grants.rename_user_group(id, &request.name).await?;
+    tracing::info!(by = %admin.name, id, name = %group.name, "user group renamed");
+    Ok(Json(group))
+}
+
+async fn delete_user_group(
+    State(state): State<Arc<AppState>>,
+    Admin(admin): Admin,
+    Path(id): Path<i64>,
+) -> ApiResult<StatusCode> {
+    state.grants.delete_user_group(id).await?;
+    tracing::info!(by = %admin.name, id, "user group deleted");
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn add_member(
+    State(state): State<Arc<AppState>>,
+    Admin(admin): Admin,
+    Path((id, user)): Path<(i64, i64)>,
+) -> ApiResult<Json<UserGroup>> {
+    let group = state.grants.add_member(id, user).await?;
+    tracing::info!(by = %admin.name, group = %group.name, user, "user added to group");
+    Ok(Json(group))
+}
+
+async fn remove_member(
+    State(state): State<Arc<AppState>>,
+    Admin(admin): Admin,
+    Path((id, user)): Path<(i64, i64)>,
+) -> ApiResult<Json<UserGroup>> {
+    let group = state.grants.remove_member(id, user).await?;
+    tracing::info!(by = %admin.name, group = %group.name, user, "user removed from group");
+    Ok(Json(group))
+}
+
+async fn list_grants(
+    State(state): State<Arc<AppState>>,
+    _admin: Admin,
+) -> ApiResult<Json<Vec<GrantRule>>> {
+    Ok(Json(state.grants.grants().await?))
+}
+
+#[derive(Deserialize)]
+struct GrantRequest {
+    user_group_id: i64,
+    device_group_id: i64,
+    role: String,
+}
+
+async fn set_grant(
+    State(state): State<Arc<AppState>>,
+    Admin(admin): Admin,
+    Json(request): Json<GrantRequest>,
+) -> ApiResult<(StatusCode, Json<GrantRule>)> {
+    let role: Role = request
+        .role
+        .parse()
+        .map_err(|e: String| ApiError::Refused(Refused::Invalid(e)))?;
+    let rule = state
+        .grants
+        .set_grant(request.user_group_id, request.device_group_id, role)
+        .await?;
+    tracing::info!(
+        by = %admin.name,
+        user_group = %rule.user_group,
+        device_group = %rule.device_group,
+        role = %rule.role,
+        "grant set"
+    );
+    Ok((StatusCode::CREATED, Json(rule)))
+}
+
+async fn delete_grant(
+    State(state): State<Arc<AppState>>,
+    Admin(admin): Admin,
+    Path(id): Path<i64>,
+) -> ApiResult<StatusCode> {
+    state.grants.delete_grant(id).await?;
+    tracing::info!(by = %admin.name, id, "grant deleted");
+    Ok(StatusCode::NO_CONTENT)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -656,17 +816,19 @@ mod tests {
         app: Router,
         setup_token: String,
         devices: Arc<Devices>,
+        accounts: Arc<Accounts>,
     }
 
     async fn api() -> Api {
         let pool = crate::db::in_memory().await;
-        let accounts = Accounts::new(pool.clone());
+        let accounts = Arc::new(Accounts::new(pool.clone()));
         let setup_token = accounts.new_setup_token().await.expect("token");
-        let devices = Arc::new(Devices::new(pool));
+        let devices = Arc::new(Devices::new(pool.clone()));
         let state = AppState {
-            accounts,
+            accounts: accounts.clone(),
             registry: Arc::new(Registry::new(devices.clone())),
             devices: devices.clone(),
+            grants: Arc::new(Grants::new(pool)),
             server: ServerInfo {
                 address: "desk.example.com:443".into(),
                 fingerprint: "ab".repeat(32),
@@ -678,6 +840,7 @@ mod tests {
             app,
             setup_token,
             devices,
+            accounts,
         }
     }
 
@@ -742,6 +905,16 @@ mod tests {
                 .await;
             assert_eq!(answer.status, StatusCode::OK, "{}", answer.body);
             self.sign_in("ada", "correct horse battery").await
+        }
+
+        async fn accounts_user(&self, name: &str) -> User {
+            self.accounts
+                .users()
+                .await
+                .expect("users")
+                .into_iter()
+                .find(|u| u.name == name)
+                .expect("user")
         }
 
         async fn sign_in(&self, name: &str, password: &str) -> String {
@@ -1020,25 +1193,151 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn only_administrators_see_devices_for_now() {
+    async fn users_see_the_devices_their_grants_let_them_at() {
         let api = api().await;
         let admin = api.admin_cookie().await;
-        api.call(
-            Method::POST,
-            "/api/v1/users",
-            &[("cookie", &admin)],
-            Some(json!({ "name": "bob", "password": "bobs long password" })),
-        )
-        .await;
+        let auth = [("cookie", admin.as_str())];
+        let bob_id = api
+            .call(
+                Method::POST,
+                "/api/v1/users",
+                &auth,
+                Some(json!({ "name": "bob", "password": "bobs long password" })),
+            )
+            .await
+            .body["id"]
+            .as_i64()
+            .expect("bob");
         let bob = api.sign_in("bob", "bobs long password").await;
         for path in [
-            "/api/v1/devices",
             "/api/v1/device-groups",
             "/api/v1/enroll-tokens",
+            "/api/v1/user-groups",
+            "/api/v1/grants",
         ] {
             let answer = api.call(Method::GET, path, &[("cookie", &bob)], None).await;
             assert_eq!(answer.status, StatusCode::FORBIDDEN, "{path}");
         }
+
+        // Two devices, one in a group bob's group has a grant for.
+        let office = api
+            .call(
+                Method::POST,
+                "/api/v1/device-groups",
+                &auth,
+                Some(json!({ "name": "Office" })),
+            )
+            .await
+            .body["id"]
+            .as_i64()
+            .expect("group");
+        let mut ids = Vec::new();
+        for (n, group) in [(1u8, Some(office)), (2, None)] {
+            let (_, token) = api
+                .devices
+                .new_enroll_token(&api.accounts_user("ada").await, "t", group, Some(1), 1)
+                .await
+                .expect("token");
+            let device = api
+                .devices
+                .enroll(
+                    &Fingerprint::from_bytes([n; 32]),
+                    &nearhand_core::rendezvous::Enrollment {
+                        token,
+                        name: format!("PC-{n}"),
+                        os: "windows".into(),
+                        version: "0.1.0".into(),
+                    },
+                    SocketAddr::from(([198, 51, 100, 7], 50000)),
+                )
+                .await
+                .expect("enroll");
+            ids.push(device.id);
+        }
+        let staff = api
+            .call(
+                Method::POST,
+                "/api/v1/user-groups",
+                &auth,
+                Some(json!({ "name": "Staff" })),
+            )
+            .await;
+        assert_eq!(staff.status, StatusCode::CREATED, "{}", staff.body);
+        let staff = staff.body["id"].as_i64().expect("id");
+        let joined = api
+            .call(
+                Method::PUT,
+                &format!("/api/v1/user-groups/{staff}/members/{bob_id}"),
+                &auth,
+                None,
+            )
+            .await;
+        assert_eq!(joined.body["members"][0]["name"], "bob");
+        let bad = api
+            .call(
+                Method::POST,
+                "/api/v1/grants",
+                &auth,
+                Some(json!({ "user_group_id": staff, "device_group_id": office, "role": "admin" })),
+            )
+            .await;
+        assert_eq!(bad.status, StatusCode::BAD_REQUEST);
+        let rule = api
+            .call(
+                Method::POST,
+                "/api/v1/grants",
+                &auth,
+                Some(
+                    json!({ "user_group_id": staff, "device_group_id": office, "role": "control" }),
+                ),
+            )
+            .await;
+        assert_eq!(rule.status, StatusCode::CREATED, "{}", rule.body);
+        assert_eq!(rule.body["device_group"], "Office");
+
+        let seen = api
+            .call(Method::GET, "/api/v1/devices", &[("cookie", &bob)], None)
+            .await;
+        assert_eq!(seen.status, StatusCode::OK);
+        let seen = seen.body.as_array().expect("list").clone();
+        assert_eq!(seen.len(), 1, "only the granted one");
+        assert_eq!(seen[0]["name"], "PC-1");
+        assert_eq!(seen[0]["role"], "control");
+        let hidden = api
+            .call(
+                Method::GET,
+                &format!("/api/v1/devices/{}", ids[1]),
+                &[("cookie", &bob)],
+                None,
+            )
+            .await;
+        assert_eq!(hidden.status, StatusCode::NOT_FOUND);
+        let renamed = api
+            .call(
+                Method::PATCH,
+                &format!("/api/v1/devices/{}", ids[0]),
+                &[("cookie", &bob)],
+                Some(json!({ "name": "mine" })),
+            )
+            .await;
+        assert_eq!(
+            renamed.status,
+            StatusCode::FORBIDDEN,
+            "seeing is not managing"
+        );
+
+        let all = api.call(Method::GET, "/api/v1/devices", &auth, None).await;
+        assert_eq!(
+            all.body.as_array().expect("list").len(),
+            2,
+            "admins see all"
+        );
+        assert_eq!(
+            all.body[0]["role"],
+            serde_json::Value::Null,
+            "but reach none"
+        );
+
         let server = api
             .call(Method::GET, "/api/v1/server", &[("cookie", &bob)], None)
             .await;

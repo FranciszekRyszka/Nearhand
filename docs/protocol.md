@@ -63,6 +63,11 @@ agent            server             viewer
 * The server reports the address it sees the agent at when the viewer asks,
   not when the agent registered: a NAT may have moved it since.
 * The server allows each viewer address 10 introductions a minute.
+* A viewer with an account sends `ConnectAs { id, addresses, token }`,
+  `token` being an API token, instead of `Connect`. The server answers
+  `Granted(signed grant)` before `Peer` if the user has a grant for the
+  device, and `Refused(NotSignedIn)` or `Refused(NotAllowed)` if not —
+  saying nothing about whether the device is online.
 * An installed agent may also enroll, once, on a connection of its own with
   its certificate: `Enroll { token, name, os, version }` ──▶, answered by
   `Enrolled { id }` or `Refused(Enrollment)`. That records the device in the
@@ -126,7 +131,7 @@ added about 0.2 ms to the round trip, with the frame rate unchanged.
 
 ## Session
 
-The TLS handshake negotiates ALPN `nearhand/4`, so a peer on a different
+The TLS handshake negotiates ALPN `nearhand/5`, so a peer on a different
 protocol version fails there rather than mid-stream. The viewer then opens one
 bidirectional stream for control and speaks first:
 
@@ -134,8 +139,9 @@ bidirectional stream for control and speaks first:
 viewer                         agent
   Hello { version, caps }  ──▶
                            ◀──  Hello { version, caps }
-                           ◀──  AuthRequired           (portable agents only)
+                           ◀──  AuthRequired           (portable and installed agents)
   Authenticate { password } ──▶
+    or Present { grant }                                (installed with a token)
                            ◀──  AwaitingApproval       (when someone at the host decides)
                            ◀──  MonitorList
   StartVideo               ──▶
@@ -146,6 +152,10 @@ viewer                         agent
                            ◀──  Cursor …  (own stream)
   (own stream) Clipboard … ◀─▶  Clipboard …  (own stream)
 ```
+
+`Present` carries a grant the server signed (`core::grant`): the agent checks
+it against the server key it pinned, and the grant's role limits the session
+(`docs/security.md`).
 
 Messages on streams carry a 4-byte little-endian length prefix, then the
 postcard body; bodies over 320 KiB are refused before anything is allocated
@@ -162,7 +172,7 @@ itself. Close codes (`core::proto::close`) travel with a readable reason:
 | 2 | Protocol version mismatch |
 | 3 | Agent busy with another viewer |
 | 4 | Capture or encoding failed; the reason says which |
-| 5 | Wrong password |
+| 5 | Wrong password, or a grant refused; the reason says why |
 | 6 | The person at the host declined, or did not answer |
 | 7 | The person at the host ended the session |
 

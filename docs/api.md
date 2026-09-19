@@ -1,7 +1,7 @@
 # REST API
 
-> **Status: M5, in progress.** Accounts, tokens, devices, groups and
-> enrollment so far; grants and the audit log follow.
+> **Status: M5, in progress.** Accounts, tokens, devices, groups,
+> enrollment and grants so far; the audit log follows.
 
 Everything is under `/api/v1` on the server's HTTPS port, JSON in and out.
 Errors are `{"error": "..."}` with a fitting status code.
@@ -35,8 +35,8 @@ Errors are `{"error": "..."}` with a fitting status code.
 | `PATCH /users/{id}` | administrators | `{admin?, disabled?}`; disabling ends their sign-ins |
 | `DELETE /users/{id}` | administrators | deletes a user; not the last active administrator |
 | `GET /server` | signed in | `{address, fingerprint}`: what agents and viewers need to reach and pin this server |
-| `GET /devices` | administrators | enrolled devices: `{id, device_id, fingerprint, name, group_id, group, os, version, enrolled_at, last_seen_at, last_address, online}` |
-| `GET /devices/{id}` | administrators | one device |
+| `GET /devices` | signed in | enrolled devices — all of them for administrators, else those the user's grants reach: `{id, device_id, fingerprint, name, group_id, group, os, version, enrolled_at, last_seen_at, last_address, online, role}`, `role` being the caller's (`null` if none) |
+| `GET /devices/{id}` | signed in | one device, likewise; 404 for one the caller may not see |
 | `PATCH /devices/{id}` | administrators | `{name?, group_id?}`; `group_id: null` takes it out of its group |
 | `DELETE /devices/{id}` | administrators | removes it from the list; a new token enrolls it again |
 | `GET /device-groups` | administrators | `{id, name, devices}`, `devices` being how many |
@@ -46,9 +46,18 @@ Errors are `{"error": "..."}` with a fitting status code.
 | `GET /enroll-tokens` | administrators | tokens that still enroll (never the tokens themselves) |
 | `POST /enroll-tokens` | administrators | `{name, group_id?, uses?, expires_in_days?}`: `uses` is 1 unless given, `null` for any number; 1 day unless given, at most 90. Answers `{token, details, install, msi}`: the token and the commands that use it, shown this once |
 | `DELETE /enroll-tokens/{id}` | administrators | deletes one |
+| `GET /user-groups` | administrators | `{id, name, members: [{id, name}]}` |
+| `POST /user-groups` | administrators | `{name}` |
+| `PATCH /user-groups/{id}` | administrators | `{name}` |
+| `DELETE /user-groups/{id}` | administrators | deletes it and its grants; its members stay |
+| `PUT /user-groups/{id}/members/{user}` | administrators | adds a user |
+| `DELETE /user-groups/{id}/members/{user}` | administrators | removes one |
+| `GET /grants` | administrators | `{id, user_group_id, user_group, device_group_id, device_group, role}` |
+| `POST /grants` | administrators | `{user_group_id, device_group_id, role}`, role `view`, `control` or `full`; sets the role if the two have a grant already |
+| `DELETE /grants/{id}` | administrators | deletes one |
 
-Devices, groups and tokens are for administrators until grants say who else
-may see which devices.
+Connecting with a grant is not over this API: the viewer asks on the QUIC
+side, with an API token (`docs/protocol.md`).
 
 Times are Unix seconds.
 

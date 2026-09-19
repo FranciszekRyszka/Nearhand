@@ -20,6 +20,12 @@
 //!
 //! A protocol violation closes the connection with a code from
 //! [`nearhand_core::proto::close`] and a reason the viewer can show.
+//!
+//! An agent that wants proof answers `Hello` with `AuthRequired` first: the
+//! viewer gives a password, or presents a grant from the agent's server
+//! (`grants`). A grant's role limits the session: with `view`, the viewer's
+//! keyboard, mouse and clipboard are not taken, and this machine's
+//! clipboard is not sent.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -28,6 +34,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 use nearhand_clipboard::ClipboardSync;
+use nearhand_core::grant::Role;
 use nearhand_core::proto::close;
 use nearhand_core::video::{encode_chunk, packetize};
 use nearhand_core::{
@@ -40,7 +47,8 @@ use serde::Serialize;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
-use crate::gate::{Gate, Verdict};
+use crate::gate::Verdict;
+use crate::grants::Grants;
 use crate::host::{Host, InSession};
 use crate::input::Injection;
 use crate::pipeline::{Pipeline, QualityControl, Settings};
@@ -67,8 +75,11 @@ const CLIPBOARD_PRIORITY: i32 = -1;
 pub struct SessionConfig {
     /// The most video bitrate to use; rate control picks what the link takes.
     pub bitrate_kbps: u32,
-    /// What viewers must give before anything else, when set.
-    pub gate: Option<Arc<dyn Gate>>,
+    /// A password viewers may give to be let in, when set.
+    pub gate: Option<Arc<dyn crate::gate::Gate>>,
+    /// Grants from this agent's server viewers may present instead, when
+    /// set. With neither, anyone who reaches the agent is let in.
+    pub grants: Option<Arc<Grants>>,
     /// The person at this machine, who allows each session and sees it for
     /// as long as it lasts, when there is one to ask.
     pub host: Option<Arc<Host>>,
@@ -159,12 +170,18 @@ pub async fn serve(
         },
     )
     .await?;
-    if let Some(gate) = &config.gate {
-        authenticate(&conn, &mut send, &mut recv, gate).await?;
-    }
+    let admitted = if config.gate.is_some() || config.grants.is_some() {
+        authenticate(&conn, &mut send, &mut recv, config).await?
+    } else {
+        Admitted {
+            user: None,
+            role: Role::Full,
+        }
+    };
+    tracing::info!(user = ?admitted.user, role = %admitted.role, "viewer admitted");
     // Shown to the person at this machine from here until the session ends.
     let _shown = match &config.host {
-        Some(host) => Some(approve(&conn, &mut send, host).await?),
+        Some(host) => Some(approve(&conn, &mut send, host, &admitted).await?),
         None => None,
     };
     send_message(&mut send, &Control::MonitorList(monitors.clone())).await?;
@@ -174,6 +191,7 @@ pub async fn serve(
         .iter()
         .find(|m| m.primary)
         .or(monitors.first())
+        .filter(|_| admitted.role.controls())
         .map(|m| Injection::start(target(m)))
     {
         Some(Ok(input)) => Some(input),
@@ -184,14 +202,18 @@ pub async fn serve(
         None => None,
     };
     let (clipboard_tx, clipboard_rx) = mpsc::unbounded_channel();
-    let clipboard = match ClipboardSync::start(move |text| {
-        let _ = clipboard_tx.send(Clipboard::Text(text));
-    }) {
-        Ok(sync) => Some(Arc::new(sync)),
-        Err(e) => {
-            tracing::warn!(error = %e, "clipboard sync unavailable");
-            None
+    let clipboard = if admitted.role.controls() {
+        match ClipboardSync::start(move |text| {
+            let _ = clipboard_tx.send(Clipboard::Text(text));
+        }) {
+            Ok(sync) => Some(Arc::new(sync)),
+            Err(e) => {
+                tracing::warn!(error = %e, "clipboard sync unavailable");
+                None
+            }
         }
+    } else {
+        None
     };
     let streams = tokio::spawn(accept_streams(conn.clone(), input.clone(), clipboard));
     let (cursor, cursor_rx) = mpsc::unbounded_channel();
@@ -332,7 +354,8 @@ pub async fn serve(
                 | Control::Pong { .. }
                 | Control::AuthRequired
                 | Control::AwaitingApproval
-                | Control::Authenticate { .. }),
+                | Control::Authenticate { .. }
+                | Control::Present { .. }),
             ) => {
                 conn.close(close::PROTOCOL.into(), b"unexpected message");
                 break Err(anyhow::anyhow!("unexpected {other:?}"));
@@ -352,19 +375,47 @@ pub async fn serve(
 
 /// Ask for the password and check it. A wrong one ends the connection: each
 /// guess costs a whole handshake, and a few wrong ones replace the password.
+/// Who was let in, and what they may do.
+struct Admitted {
+    /// The server's name for them, when they came with a grant.
+    user: Option<String>,
+    role: Role,
+}
+
 async fn authenticate(
     conn: &Connection,
     send: &mut quinn::SendStream,
     recv: &mut RecvStream,
-    gate: &Arc<dyn Gate>,
-) -> Result<()> {
+    config: &SessionConfig,
+) -> Result<Admitted> {
     send_message(send, &Control::AuthRequired).await?;
+    let refuse = |reason: &str| {
+        conn.close(close::AUTH_FAILED.into(), reason.as_bytes());
+        anyhow::anyhow!("{reason}")
+    };
     let attempt = match recv_message::<Control>(recv).await? {
         Some(Control::Authenticate { password }) => password,
+        Some(Control::Present { grant }) => {
+            let Some(grants) = &config.grants else {
+                return Err(refuse("this device takes a password, not a grant"));
+            };
+            return match grants.check(&grant) {
+                Ok(grant) => Ok(Admitted {
+                    user: Some(grant.user),
+                    role: grant.role,
+                }),
+                Err(reason) => Err(refuse(reason)),
+            };
+        }
         other => {
             conn.close(close::PROTOCOL.into(), b"expected Authenticate");
             bail!("expected Authenticate, got {other:?}");
         }
+    };
+    let Some(gate) = &config.gate else {
+        return Err(refuse(
+            "this device has no access password; sign in to its server instead",
+        ));
     };
     let verdict = if gate.is_slow() {
         let gate = gate.clone();
@@ -373,7 +424,11 @@ async fn authenticate(
         gate.check(&attempt)
     };
     match verdict {
-        Verdict::Accepted => Ok(()),
+        // A password is the device's own say-so: everything a session can do.
+        Verdict::Accepted => Ok(Admitted {
+            user: None,
+            role: Role::Full,
+        }),
         Verdict::Rejected(reason) => {
             conn.close(close::AUTH_FAILED.into(), reason.as_bytes());
             bail!("{reason}");
@@ -393,8 +448,16 @@ async fn approve(
     conn: &Connection,
     send: &mut quinn::SendStream,
     host: &Arc<Host>,
+    admitted: &Admitted,
 ) -> Result<InSession> {
-    let viewer = describe(conn.remote_address());
+    let viewer = match &admitted.user {
+        Some(user) => format!(
+            "{user} ({}), {}",
+            admitted.role,
+            describe(conn.remote_address())
+        ),
+        None => describe(conn.remote_address()),
+    };
     if host.asks() {
         send_message(send, &Control::AwaitingApproval).await?;
     }

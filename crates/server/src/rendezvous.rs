@@ -16,6 +16,11 @@
 //! devices (`devices`): the registry enrolls agents that bring a token, and
 //! notes when an enrolled one comes and goes.
 //!
+//! A viewer that brings an API token (`ConnectAs`) is introduced only to a
+//! device its user has a grant for, and gets that grant signed with the
+//! server's key to present to the agent (`grants`). Without a grant, the
+//! viewer is told nothing — not even whether the device is online.
+//!
 //! An enrolled device also outranks a stranger for its ID. Ten digits are
 //! easily matched on purpose, so someone could register a key with a managed
 //! device's ID first, to keep the device from being found; the device, when
@@ -28,13 +33,17 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
+use nearhand_core::grant::{Grant, LIFETIME_SECS, SignedGrant};
 use nearhand_core::rendezvous::{DeviceId, Enrollment, FromServer, Refusal, ToServer};
 use nearhand_transport::relay::{tag, untag};
-use nearhand_transport::{Fingerprint, peer_fingerprint, recv_message, send_message};
+use nearhand_transport::{Fingerprint, Identity, peer_fingerprint, recv_message, send_message};
 use quinn::{Connection, Endpoint, SendStream};
+use ring::rand::{SecureRandom, SystemRandom};
 use tokio::sync::{mpsc, oneshot};
 
+use crate::accounts::Accounts;
 use crate::devices::Devices;
+use crate::grants::Grants;
 
 /// How long a client has to say what it wants.
 const FIRST_MESSAGE: Duration = Duration::from_secs(10);
@@ -63,6 +72,17 @@ pub struct Registry {
     next: AtomicU64,
     /// The managed devices; without them, agents can only register.
     devices: Option<Arc<Devices>>,
+    /// Who may connect to what; without it, viewers with an account are
+    /// refused.
+    access: Option<Access>,
+}
+
+/// What it takes to hand out grants.
+pub struct Access {
+    pub accounts: Arc<Accounts>,
+    pub grants: Arc<Grants>,
+    /// The server's own key, which signs them.
+    pub identity: Arc<Identity>,
 }
 
 #[derive(Clone)]
@@ -121,8 +141,13 @@ async fn handle(conn: Connection, registry: &Registry) -> Result<()> {
             result
         }
         Some(ToServer::Connect { id, addresses }) => {
-            introduce(&conn, &mut send, registry, id, addresses).await
+            introduce(&conn, &mut send, registry, id, addresses, None).await
         }
+        Some(ToServer::ConnectAs {
+            id,
+            addresses,
+            token,
+        }) => introduce(&conn, &mut send, registry, id, addresses, Some(token)).await,
         Some(ToServer::Enroll(enrollment)) => enroll(&conn, &mut send, registry, enrollment).await,
         _ => refuse(&conn, &mut send, Refusal::Protocol).await,
     }
@@ -253,13 +278,24 @@ async fn introduce(
     registry: &Registry,
     id: DeviceId,
     addresses: Vec<SocketAddr>,
+    token: Option<String>,
 ) -> Result<()> {
     let observed = conn.remote_address();
     if !registry.attempt(observed.ip()) {
         return refuse(conn, send, Refusal::TooManyAttempts).await;
     }
-    let Some(agent) = lock(&registry.agents).get(&id).cloned() else {
-        return refuse(conn, send, Refusal::Offline).await;
+    let (agent, grant) = match token {
+        None => {
+            let agent = lock(&registry.agents).get(&id).cloned();
+            match agent {
+                Some(agent) => (agent, None),
+                None => return refuse(conn, send, Refusal::Offline).await,
+            }
+        }
+        Some(token) => match authorize(registry, &token, id).await {
+            Ok((agent, grant)) => (agent, Some(grant)),
+            Err(refusal) => return refuse(conn, send, refusal).await,
+        },
     };
 
     let session = registry.next.fetch_add(1, Ordering::Relaxed);
@@ -279,7 +315,10 @@ async fn introduce(
         return refuse(conn, send, Refusal::Declined).await;
     }
 
-    tracing::info!(%id, viewer = %observed, "introduced");
+    tracing::info!(%id, viewer = %observed, user = ?grant.as_ref().map(|(user, _)| user), "introduced");
+    if let Some((_, grant)) = grant {
+        send_message(send, &FromServer::Granted(grant)).await?;
+    }
     let peer = FromServer::Peer {
         fingerprint: *agent.fingerprint.as_bytes(),
         addresses: candidates(agent.reported.clone(), agent.conn.remote_address()),
@@ -338,6 +377,61 @@ fn claim(holder: Option<(&Fingerprint, bool)>, key: &Fingerprint, enrolled: bool
         Some((_, false)) if enrolled => Claim::Displace,
         Some(_) => Claim::Refuse,
     }
+}
+
+/// The device with ID `id` that the user whose API token this is may reach,
+/// if it is online, and a grant for it signed by this server.
+async fn authorize(
+    registry: &Registry,
+    token: &str,
+    id: DeviceId,
+) -> std::result::Result<(Agent, (String, SignedGrant)), Refusal> {
+    let Some(access) = &registry.access else {
+        return Err(Refusal::NotAllowed);
+    };
+    let user = match access.accounts.api_user(token).await {
+        Ok(Some(user)) => user,
+        Ok(None) => return Err(Refusal::NotSignedIn),
+        Err(e) => {
+            tracing::error!(error = %e, "checking an API token");
+            return Err(Refusal::NotSignedIn);
+        }
+    };
+    let reachable = access.grants.reachable(user.id).await.map_err(|e| {
+        tracing::error!(error = %e, "looking up grants");
+        Refusal::NotAllowed
+    })?;
+    let Some(device) = reachable
+        .into_iter()
+        .find(|r| r.fingerprint.device_id() == id)
+    else {
+        tracing::info!(%id, user = %user.name, "no grant for that device");
+        return Err(Refusal::NotAllowed);
+    };
+    let agent = lock(&registry.agents)
+        .get(&id)
+        .filter(|a| a.fingerprint == device.fingerprint)
+        .cloned()
+        .ok_or(Refusal::Offline)?;
+    let mut nonce = [0u8; 16];
+    SystemRandom::new().fill(&mut nonce).map_err(|_| {
+        tracing::error!("the system random number generator failed");
+        Refusal::NotAllowed
+    })?;
+    let issued_at = crate::db::now().max(0) as u64;
+    let grant = Grant {
+        device: *device.fingerprint.as_bytes(),
+        user: user.name.clone(),
+        role: device.role,
+        issued_at,
+        expires_at: issued_at + LIFETIME_SECS,
+        nonce,
+    };
+    let signed = access.identity.sign_grant(&grant).map_err(|e| {
+        tracing::error!(error = %e, "signing a grant");
+        Refusal::NotAllowed
+    })?;
+    Ok((agent, (user.name, signed)))
 }
 
 /// An agent with a token joins the managed devices.
@@ -401,6 +495,14 @@ impl Registry {
         Self {
             devices: Some(devices),
             ..Self::default()
+        }
+    }
+
+    /// And that introduces users to the devices they have grants for.
+    pub fn with_access(self, access: Access) -> Self {
+        Self {
+            access: Some(access),
+            ..self
         }
     }
 
@@ -548,6 +650,135 @@ mod tests {
             Claim::Refuse,
             "nor one managed device another: first come keeps it"
         );
+    }
+
+    #[tokio::test]
+    async fn users_get_a_signed_grant_for_devices_they_may_reach_and_nothing_else() {
+        use crate::accounts::Accounts;
+        use crate::grants::Grants;
+        use nearhand_core::grant::Role;
+        use nearhand_core::rendezvous::Enrollment;
+        use nearhand_transport::rendezvous::{enroll, find_granted};
+        use nearhand_transport::{Error, client_endpoint, rendezvous_endpoint, server_endpoint};
+
+        let pool = crate::db::in_memory().await;
+        let accounts = Arc::new(Accounts::new(pool.clone()));
+        let setup = accounts.new_setup_token().await.expect("setup token");
+        let admin = accounts
+            .setup(&setup, "ada", "correct horse battery")
+            .await
+            .expect("admin");
+        let bob = accounts
+            .create_user("bob", "bobs long password", false)
+            .await
+            .expect("bob");
+        let (_, ada_token) = accounts
+            .new_api_token(&admin, "viewer", None)
+            .await
+            .expect("token");
+        let (_, bob_token) = accounts
+            .new_api_token(&bob, "viewer", None)
+            .await
+            .expect("token");
+        let devices = Arc::new(Devices::new(pool.clone()));
+        let grants = Arc::new(Grants::new(pool));
+        let office = devices.create_group("Office").await.expect("group");
+        let staff = grants.create_user_group("Staff").await.expect("group");
+        grants.add_member(staff.id, bob.id).await.expect("member");
+        grants
+            .set_grant(staff.id, office.id, Role::Control)
+            .await
+            .expect("grant");
+        let (_, enroll_token) = devices
+            .new_enroll_token(&admin, "office", Some(office.id), None, 1)
+            .await
+            .expect("token");
+
+        let server_identity = Arc::new(Identity::generate().expect("server key"));
+        let server = rendezvous_endpoint(([127, 0, 0, 1], 0).into(), &server_identity)
+            .expect("server endpoint");
+        let server_addr = server.local_addr().expect("addr");
+        let fp = server_identity.fingerprint();
+        let registry = Arc::new(Registry::new(devices.clone()).with_access(Access {
+            accounts,
+            grants,
+            identity: server_identity.clone(),
+        }));
+        tokio::spawn(serve(server.clone(), registry.clone()));
+
+        // An enrolled agent in the office group, registered and accepting.
+        let identity = Arc::new(Identity::generate().expect("agent key"));
+        let agent = server_endpoint(([127, 0, 0, 1], 0).into(), &identity).expect("agent");
+        enroll(
+            &agent,
+            server_addr,
+            fp,
+            &identity,
+            Enrollment {
+                token: enroll_token,
+                name: "PC".into(),
+                os: "test".into(),
+                version: "0".into(),
+            },
+        )
+        .await
+        .expect("enroll");
+        {
+            let agent = agent.clone();
+            let identity = identity.clone();
+            tokio::spawn(async move {
+                stay_registered(&agent, server_addr, fp, &identity, |_| {}).await
+            });
+        }
+        {
+            let agent = agent.clone();
+            tokio::spawn(async move {
+                while let Some(incoming) = agent.accept().await {
+                    tokio::spawn(async move {
+                        if let Ok(conn) = incoming.await {
+                            conn.closed().await;
+                        }
+                    });
+                }
+            });
+        }
+        let id = identity.device_id();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while registry.online(&identity.fingerprint()).is_none() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the agent registers");
+
+        let viewer = client_endpoint(server_addr).expect("viewer");
+        let (conn, signed) = find_granted(&viewer, server_addr, fp, id, Route::Best, &bob_token)
+            .await
+            .expect("bob has a grant");
+        let grant = nearhand_transport::grant::verify(&signed, fp).expect("signed by the server");
+        assert_eq!(grant.device, *identity.fingerprint().as_bytes());
+        assert_eq!(grant.user, "bob");
+        assert_eq!(grant.role, Role::Control);
+        assert_eq!(
+            grant.expires_at - grant.issued_at,
+            nearhand_core::grant::LIFETIME_SECS
+        );
+        conn.close(0u32.into(), b"done");
+
+        let refused = |result: nearhand_transport::Result<_>| match result {
+            Err(Error::Refused(refusal)) => Some(refusal),
+            _ => None,
+        };
+        assert_eq!(
+            refused(find_granted(&viewer, server_addr, fp, id, Route::Best, &ada_token).await),
+            Some(Refusal::NotAllowed),
+            "administrators need a grant too"
+        );
+        assert_eq!(
+            refused(find_granted(&viewer, server_addr, fp, id, Route::Best, "nht_guess").await),
+            Some(Refusal::NotSignedIn)
+        );
+        server.close(0u32.into(), b"done");
     }
 
     #[tokio::test]

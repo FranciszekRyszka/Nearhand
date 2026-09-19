@@ -7,7 +7,7 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
 /// Bumped on any incompatible change while we are pre-1.0.
-pub const PROTOCOL_VERSION: u16 = 4;
+pub const PROTOCOL_VERSION: u16 = 5;
 
 /// Video codec negotiated between viewer and agent.
 ///
@@ -61,13 +61,21 @@ pub enum Control {
     },
     MonitorList(Vec<Monitor>),
     /// Agent to viewer, in place of [`Control::MonitorList`] after `Hello`:
-    /// this agent takes viewers only with its current one-time password.
+    /// this agent takes viewers only with a password — its one-time or
+    /// access password — or, if installed with a server, a grant from it.
     AuthRequired,
     /// Viewer to agent, answering [`Control::AuthRequired`]. A wrong one
     /// closes the connection with [`close::AUTH_FAILED`]; right, and the agent
     /// goes on with `MonitorList`. The agent checks it, never the server.
     Authenticate {
         password: String,
+    },
+    /// Viewer to agent, answering [`Control::AuthRequired`] instead of a
+    /// password: a grant the server signed for this device
+    /// ([`crate::grant`]). The agent checks it against the server key it
+    /// pinned; a bad one closes with [`close::AUTH_FAILED`].
+    Present {
+        grant: crate::grant::SignedGrant,
     },
     /// Agent to viewer, after a right password: the person at the host has
     /// been asked to allow the session. `MonitorList` follows if they do; a
@@ -296,6 +304,13 @@ mod tests {
             Control::AuthRequired,
             Control::Authenticate {
                 password: "482913".to_owned(),
+            },
+            Control::Present {
+                grant: crate::grant::SignedGrant {
+                    grant: vec![1, 2, 3],
+                    signature: vec![4; 64],
+                    server_certificate: vec![5; 300],
+                },
             },
             Control::AwaitingApproval,
             Control::Ping { viewer_us: 17 },

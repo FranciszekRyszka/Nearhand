@@ -62,8 +62,14 @@ pub struct Config {
     /// The most video bitrate to use.
     #[serde(default = "default_bitrate")]
     pub bitrate_kbps: u32,
-    /// Who may connect: anyone with this password.
-    pub access: Stored,
+    /// Anyone with this password may connect. None: grants only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access: Option<Stored>,
+    /// Installed with an enrollment token: grants signed by the server let
+    /// people in. A machine installed with only a password never takes
+    /// them, so the server alone cannot open it.
+    #[serde(default)]
+    pub managed: bool,
     /// Enrolling with the server, when installing could not reach it: the
     /// agent does it when it can, and then forgets the token.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -238,15 +244,16 @@ mod tests {
                 fingerprint: "ab".repeat(32),
             },
             bitrate_kbps: 8000,
-            access: Stored {
+            access: Some(Stored {
                 iterations: 600_000,
                 salt: "00".repeat(16),
                 hash: "11".repeat(32),
-            },
+            }),
             enrollment: Some(Enrollment {
                 token: "nhe_00ff".into(),
                 name: None,
             }),
+            managed: true,
         }
     }
 
@@ -278,6 +285,10 @@ mod tests {
         let parsed: Config = toml::from_str(&old).expect("parse");
         assert_eq!(parsed.server.address, "203.0.113.10:443");
         assert_eq!(parsed.enrollment, None);
+        assert!(
+            !parsed.managed,
+            "no grants for a machine installed before them"
+        );
         assert!(
             !toml::to_string(&parsed)
                 .expect("write")

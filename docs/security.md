@@ -3,8 +3,8 @@
 > **Status: partly implemented.** Device keys, pinning, the relay, the
 > portable agent's one-time password and accept prompt, the installed
 > agent's access password, session indicators for both, server accounts
-> (Argon2id, TOTP, API tokens) and enrollment exist; grants and signed
-> releases do not yet.
+> (Argon2id, TOTP, API tokens), enrollment and signed grants exist; the
+> audit log and signed releases do not yet.
 > Track the gap against the roadmap in the README.
 
 Nearhand hands one machine full control of another. The threat model is built in
@@ -48,8 +48,8 @@ that are not enrolled.
 - A token not yet used waits in the agent's configuration, readable only by
   SYSTEM and administrators, and is deleted once used or refused. The MSI
   keeps `ENROLL_TOKEN` out of its logs.
-- Enrolling puts a device in the list and nothing more, for now: who may
-  connect is still the access password, until grants (M5).
+- Installing with a token also makes the machine take grants from its
+  server (below); installing without one never does.
 
 ## Accounts
 
@@ -77,20 +77,43 @@ account (M5).
 ## Authorisation
 
 - **Unattended** sessions require a grant signed by the pinned server key.
+  - *Implemented:* users are put in user groups and devices in device
+    groups; a grant lets a user group at a device group as `view` (watch
+    only), `control` (keyboard, mouse, clipboard) or `full` (control, plus
+    privacy mode and file transfer when they come). Administrators manage
+    grants and are no exception to them.
+  - A viewer signed in with an API token asks the server for a device; the
+    server checks the user's grants and, if one covers the device, signs a
+    grant for that one device and user, with the role, valid for five
+    minutes and marked with a random nonce. A user with no grant learns
+    nothing about the device, not even whether it is online.
+  - The agent checks the grant itself: signed by the key of the server it
+    pinned at install (the certificate is sent along and must hash to the
+    pinned fingerprint), for this device, within its five minutes (two
+    minutes' clock difference forgiven), and not presented before. It
+    never asks the server. The role then limits the session: with `view`,
+    the viewer's keyboard, mouse and clipboard are ignored and this
+    machine's clipboard is not sent.
+  - Only machines installed with an enrollment token take grants. One
+    installed with only an access password never does, so its server
+    alone cannot open it, as before.
+  - A grant is for connecting, not a lease: removing someone's grant stops
+    their next connection, not a session they already have. The person at
+    the machine sees whose session it is and can end it.
 - An optional **per-device access password** is verified by the agent itself, so
   a compromised server alone is not enough to take over a machine.
-  - *Implemented, in place of grants until accounts arrive (M5):* an
-    installed agent lets in anyone with its access password, and nobody
-    else. The password is set at install, at least 10 characters, and kept
+  - *Implemented:* an installed agent lets in anyone with its access
+    password. On a machine installed with a token the password is optional,
+    and is a second way in beside grants, not a second factor. The
+    password is set at install, at least 10 characters, and kept
     only as a salted PBKDF2-HMAC-SHA256 hash (600,000 rounds) in a folder
     only SYSTEM and administrators can read, beside the device key. Each
     check takes a noticeable fraction of a second. After five wrong
     passwords in a row the agent refuses every attempt for 30 seconds,
     doubling up to 15 minutes, so guessing online is hopeless. The server
     never sees the password.
-  - Until then the password is the *only* check: there is no grant, and no
-    one at the machine is asked. It should be treated like an
-    administrator's password.
+  - No one at the machine is asked, with a password or a grant. The password
+    should be treated like an administrator's password.
 - **Attended** sessions require the person at the host to accept, or a one-time
   password. Attempts are rate-limited.
   - *Implemented:* the portable agent shows six random digits. The agent
@@ -157,10 +180,13 @@ portable one: the access password lasts, so a server that captured it once
 could use it again later. A password-authenticated key exchange (PAKE) would
 close this gap, and is worth adding before 1.0.
 
-A **fully compromised management server** could issue itself a grant. The
-mitigations are the per-device access password, which the server never learns,
-and the audit log. This is stated rather than solved; a server you do not trust
-is a server you should not enroll against.
+A **fully compromised management server** could issue itself a grant, and
+open every machine enrolled with it. Machines installed with only an access
+password, which the server never learns, are out of its reach; the audit log
+(to come) will show what happened. Requiring a grant *and* the password on
+the same machine is a possible later option. This is stated rather than
+solved; a server you do not trust is a server you should not enroll
+against.
 
 ## Reporting a vulnerability
 

@@ -3,10 +3,11 @@
 //! starts it in the console session (`service`); an administrator can also
 //! run it in the foreground, to watch what it does.
 //!
-//! No one is asked to allow a session: that is what unattended means. The
-//! access password is the only way in, and the server never sees it. But
-//! whoever is at the machine sees that a session is on, for as long as it
-//! lasts (`indicator`).
+//! No one is asked to allow a session: that is what unattended means. Two
+//! ways in: a grant signed by the server the machine was installed with
+//! (`grants`), and the access password if one is set, which the server never
+//! sees. Whoever is at the machine sees that a session is on, and whose, for
+//! as long as it lasts (`indicator`).
 //!
 //! An enrollment token that installing could not use yet is used here, once
 //! the server can be reached (`enroll`).
@@ -23,6 +24,7 @@ use quinn::Endpoint;
 use tokio::sync::watch;
 
 use crate::access::AccessPassword;
+use crate::grants::Grants;
 use crate::host::{Host, Server};
 use crate::machine;
 use crate::session::SessionConfig;
@@ -40,15 +42,24 @@ pub fn run(dir: PathBuf, stop_event: Option<String>) -> Result<()> {
     let key = machine::key_path(&dir);
     let identity = Identity::load_or_create(&key).context("loading the device key")?;
     let server_fingerprint = config.server_fingerprint()?;
+    // Neither a password nor grants would let anyone at all in.
+    if config.access.is_none() && !config.managed {
+        anyhow::bail!("agent.toml sets no access password and takes no grants: set a password");
+    }
     let address = config.server.address.clone();
     tracing::info!(id = %identity.device_id(), server = %address, "unattended agent starting");
 
     let runtime = tokio::runtime::Runtime::new().context("starting the runtime")?;
-    // No window, so no one to ask: the access password decides.
+    // No window, so no one to ask: grants and the access password decide.
     let host = Host::new(false);
     let session_config = Arc::new(SessionConfig {
         bitrate_kbps: config.bitrate_kbps,
-        gate: Some(Arc::new(AccessPassword::new(config.access))),
+        gate: config
+            .access
+            .map(|access| Arc::new(AccessPassword::new(access)) as Arc<dyn crate::gate::Gate>),
+        grants: config
+            .managed
+            .then(|| Arc::new(Grants::new(server_fingerprint, identity.fingerprint()))),
         host: Some(host.clone()),
     });
     let pending = match config.enrollment {

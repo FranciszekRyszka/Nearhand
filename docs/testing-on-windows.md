@@ -230,6 +230,21 @@ nearhand-agent install --server <host address>:4433 --server-fingerprint <finger
   `C:\ProgramData\Nearhand\agent.toml` no longer has an `[enrollment]`
   section.
 
+Then grants, with the VM enrolled into a device group (make the token with
+`"group_id"`, or move the device with `PATCH /api/v1/devices/{id}`):
+
+* Create a second user, a user group with them in it, and a grant from that
+  group to the device group with role `view` (`docs/self-hosting.md#grants`).
+  Sign in as that user and make an API token.
+* `nearhand-viewer connect <ID> --server ... --server-fingerprint ... --token nht_...`
+  prints `granted: view as <user>` and shows the screen; the indicator in
+  the VM names the user. Typing and clicking do nothing in the VM.
+* Change the grant to `control`: the next connection can type and click.
+* Remove the user from the group: the next connection is refused by the
+  server ("you have no grant for that device").
+* `nearhand-agent set-password --none` in the VM: the access password no
+  longer works, and grants still do. `nearhand-agent status` says so.
+
 ## Also worth checking while the VM is up
 
 M2 has not yet been tested across two real networks. With the VM on a NAT

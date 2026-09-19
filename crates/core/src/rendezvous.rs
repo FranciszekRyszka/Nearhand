@@ -13,6 +13,11 @@
 //!   ◀════════════ QUIC, viewer to agent, pinned to the fingerprint ════════════
 //! ```
 //!
+//! A viewer signed in to the server asks with `ConnectAs`, carrying an API
+//! token; the server answers `Granted` — a grant signed for that device,
+//! for the viewer to present to the agent (`crate::grant`) — before `Peer`,
+//! or refuses if the user has no grant for it.
+//!
 //! A managed agent also enrolls, once, with a token an administrator made:
 //! on a connection of its own, `Enroll` ──▶ and ◀── `Enrolled`. That puts it
 //! in the server's device list; it registers as above either way.
@@ -26,6 +31,8 @@ use std::net::SocketAddr;
 use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
+
+use crate::grant::SignedGrant;
 
 /// Application-layer protocol name for connections to the server.
 pub const SERVER_ALPN: &[u8] = b"nearhand-server/1";
@@ -116,6 +123,13 @@ pub enum ToServer {
     /// First message from an agent joining the server's managed devices.
     /// Like `Register`, only with the agent's certificate.
     Enroll(Enrollment),
+    /// First message from a viewer with an account: `Connect`, as the user
+    /// whose API token this is.
+    ConnectAs {
+        id: DeviceId,
+        addresses: Vec<SocketAddr>,
+        token: String,
+    },
 }
 
 /// What an agent sends to enroll.
@@ -156,6 +170,9 @@ pub enum FromServer {
     Enrolled {
         id: DeviceId,
     },
+    /// To a viewer that sent `ConnectAs`, before `Peer`: the grant to
+    /// present to the device.
+    Granted(SignedGrant),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -176,6 +193,10 @@ pub enum Refusal {
     Protocol,
     /// The enrollment token is unknown, expired or used up.
     Enrollment,
+    /// The API token is unknown, expired, or its user disabled.
+    NotSignedIn,
+    /// The user has no grant for that device.
+    NotAllowed,
 }
 
 impl fmt::Display for Refusal {
@@ -188,6 +209,8 @@ impl fmt::Display for Refusal {
             Refusal::TooManyAttempts => "too many attempts; try again in a minute",
             Refusal::Protocol => "unexpected message",
             Refusal::Enrollment => "the enrollment token is wrong, expired or used up",
+            Refusal::NotSignedIn => "the server does not know that API token",
+            Refusal::NotAllowed => "you have no grant for that device",
         })
     }
 }
@@ -261,5 +284,16 @@ mod tests {
             id: DeviceId(1_234_567_890),
         });
         roundtrip(&FromServer::Refused(Refusal::Enrollment));
+        roundtrip(&ToServer::ConnectAs {
+            id: DeviceId(1_234_567_890),
+            addresses: vec![here],
+            token: "nht_00ff".into(),
+        });
+        roundtrip(&FromServer::Granted(SignedGrant {
+            grant: vec![1, 2, 3],
+            signature: vec![4; 64],
+            server_certificate: vec![5; 10],
+        }));
+        roundtrip(&FromServer::Refused(Refusal::NotAllowed));
     }
 }

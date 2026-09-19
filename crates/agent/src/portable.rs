@@ -49,6 +49,7 @@ pub fn run(options: Options) -> Result<()> {
     let config = Arc::new(SessionConfig {
         bitrate_kbps: options.bitrate_kbps,
         gate: Some(password.clone()),
+        grants: None,
         host: Some(host.clone()),
     });
     let id = identity.device_id();

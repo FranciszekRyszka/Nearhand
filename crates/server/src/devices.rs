@@ -46,6 +46,9 @@ pub struct Device {
     pub last_address: Option<String>,
     /// Filled in by whoever knows: the registry.
     pub online: bool,
+    /// What the user asking may do on it — `view`, `control` or `full` —
+    /// if their grants let them at it.
+    pub role: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -114,6 +117,7 @@ fn device_of(
         last_seen_at,
         last_address,
         online: false,
+        role: None,
     }
 }
 

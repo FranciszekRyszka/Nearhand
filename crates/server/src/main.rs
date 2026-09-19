@@ -10,6 +10,7 @@ mod api;
 mod config;
 mod db;
 mod devices;
+mod grants;
 mod https;
 #[cfg(test)]
 mod netsim;
@@ -28,6 +29,7 @@ use nearhand_transport::{Identity, rendezvous_endpoint};
 use crate::accounts::Accounts;
 use crate::config::Config;
 use crate::devices::Devices;
+use crate::grants::Grants;
 
 #[derive(Parser, Debug)]
 #[command(name = "nearhand-server", version, about, long_about = None)]
@@ -115,12 +117,14 @@ fn main() -> Result<()> {
 
 async fn serve(config: Config, key: PathBuf) -> Result<()> {
     prepare_data_dir(&config)?;
-    let identity = Identity::load_or_create(&key)
-        .with_context(|| format!("loading the server key from {}", key.display()))?;
+    let identity = Arc::new(
+        Identity::load_or_create(&key)
+            .with_context(|| format!("loading the server key from {}", key.display()))?,
+    );
     let endpoint = rendezvous_endpoint(config.quic.bind, &identity)
         .with_context(|| format!("listening on UDP {}", config.quic.bind))?;
     let pool = db::open(&config.database_path()).await?;
-    let accounts = Accounts::new(pool.clone());
+    let accounts = Arc::new(Accounts::new(pool.clone()));
     let first_start = !accounts.has_users().await?;
     let setup_token = if first_start {
         Some(accounts.new_setup_token().await?)
@@ -128,10 +132,18 @@ async fn serve(config: Config, key: PathBuf) -> Result<()> {
         None
     };
     let devices = Arc::new(Devices::new(pool.clone()));
-    let registry = Arc::new(rendezvous::Registry::new(devices.clone()));
+    let grants = Arc::new(Grants::new(pool.clone()));
+    let registry = Arc::new(rendezvous::Registry::new(devices.clone()).with_access(
+        rendezvous::Access {
+            accounts: accounts.clone(),
+            grants: grants.clone(),
+            identity: identity.clone(),
+        },
+    ));
     let state = Arc::new(api::AppState {
         accounts,
         devices,
+        grants,
         registry: registry.clone(),
         server: api::ServerInfo {
             address: config.public_address(),

@@ -34,6 +34,7 @@ use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::time::Duration;
 
 use nearhand_core::ALPN;
+use nearhand_core::grant::SignedGrant;
 use nearhand_core::proto::close;
 use nearhand_core::rendezvous::{DeviceId, Enrollment, FromServer, ToServer};
 use quinn::{Connection, Endpoint};
@@ -199,12 +200,55 @@ pub async fn find(
     id: DeviceId,
     route: Route,
 ) -> Result<Connection> {
+    let (conn, _) = introduce(endpoint, server, server_fingerprint, id, route, None).await?;
+    Ok(conn)
+}
+
+/// [`find`], as the user whose API token `token` is: the server hands back a
+/// grant for the device, to present to it, if the user has one.
+pub async fn find_granted(
+    endpoint: &Endpoint,
+    server: SocketAddr,
+    server_fingerprint: Fingerprint,
+    id: DeviceId,
+    route: Route,
+    token: &str,
+) -> Result<(Connection, SignedGrant)> {
+    let (conn, grant) =
+        introduce(endpoint, server, server_fingerprint, id, route, Some(token)).await?;
+    match grant {
+        Some(grant) => Ok((conn, grant)),
+        None => Err(Error::Unexpected("the server sent no grant".into())),
+    }
+}
+
+async fn introduce(
+    endpoint: &Endpoint,
+    server: SocketAddr,
+    server_fingerprint: Fingerprint,
+    id: DeviceId,
+    route: Route,
+    token: Option<&str>,
+) -> Result<(Connection, Option<SignedGrant>)> {
     let introducer = connect_server(endpoint, server, server_fingerprint, None).await?;
     let (mut send, mut recv) = introducer.open_bi().await?;
     let addresses = own_addresses(endpoint, server);
-    send_message(&mut send, &ToServer::Connect { id, addresses }).await?;
-    let answer = recv_message::<FromServer>(&mut recv).await;
-    let (fingerprint, addresses) = match answer? {
+    let request = match token {
+        Some(token) => ToServer::ConnectAs {
+            id,
+            addresses,
+            token: token.to_owned(),
+        },
+        None => ToServer::Connect { id, addresses },
+    };
+    send_message(&mut send, &request).await?;
+    let mut answer = recv_message::<FromServer>(&mut recv).await?;
+    let mut grant = None;
+    if let Some(FromServer::Granted(granted)) = answer {
+        grant = Some(granted);
+        answer = recv_message::<FromServer>(&mut recv).await?;
+    }
+    let (fingerprint, addresses) = match answer {
         Some(FromServer::Peer {
             fingerprint,
             addresses,
@@ -245,7 +289,7 @@ pub async fn find(
         .await
         .unwrap_or_else(|_| Err(Error::Unreachable("no answer through the relay".into())))
     };
-    match prefer_direct(direct, through_relay, DIRECT_GRACE).await {
+    let conn = match prefer_direct(direct, through_relay, DIRECT_GRACE).await {
         Ok(conn) if is_relayed(conn.remote_address()) => {
             // Done with the tunnel once the session is: after its last
             // packets have left, close what carries them.
@@ -255,13 +299,14 @@ pub async fn find(
                 tunnel.wait_idle().await;
                 introducer.close(close::NORMAL.into(), b"session over");
             });
-            Ok(conn)
+            conn
         }
         result => {
             introducer.close(close::NORMAL.into(), b"introduced");
-            result
+            result?
         }
-    }
+    };
+    Ok((conn, grant))
 }
 
 /// The direct connection if it is made within `grace` of the relayed one

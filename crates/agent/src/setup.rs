@@ -44,12 +44,7 @@ pub fn configure(options: Install) -> Result<Identity> {
     if server.is_empty() {
         bail!("--server is needed: the server's address");
     }
-    let password = match options.password {
-        Some(password) => password,
-        None => new_password()?,
-    };
-    let access = Stored::new(&password)?;
-    // The MSI passes an empty token when it was given none.
+    // The MSI passes an empty token, and password, when it was given none.
     let enrollment = options
         .token
         .map(|token| token.trim().to_owned())
@@ -58,6 +53,14 @@ pub fn configure(options: Install) -> Result<Identity> {
             token,
             name: options.name.filter(|name| !name.trim().is_empty()),
         });
+    let password = options.password.filter(|password| !password.is_empty());
+    // Enrolled, the server's grants let people in; a password is optional.
+    // Otherwise it is the only way in.
+    let access = match (password, &enrollment) {
+        (Some(password), _) => Some(Stored::new(&password)?),
+        (None, Some(_)) => None,
+        (None, None) => Some(Stored::new(&new_password()?)?),
+    };
 
     let dir = machine::dir();
     machine::prepare_dir(&dir)?;
@@ -68,6 +71,7 @@ pub fn configure(options: Install) -> Result<Identity> {
         },
         bitrate_kbps: options.bitrate_kbps,
         access,
+        managed: enrollment.is_some(),
         enrollment,
     };
     config.save(&dir)?;
@@ -123,19 +127,32 @@ pub fn uninstall(purge: bool) -> Result<()> {
     Ok(())
 }
 
-pub fn set_password(password: Option<String>) -> Result<()> {
+pub fn set_password(password: Option<String>, none: bool) -> Result<()> {
     supported()?;
     let dir = machine::dir();
     let mut config = machine::Config::load(&dir)?;
-    let password = match password {
-        Some(password) => password,
-        None => new_password()?,
+    if none && !config.managed {
+        bail!(
+            "this machine takes no grants from its server: without a password, no one could connect"
+        );
+    }
+    config.access = if none {
+        None
+    } else {
+        let password = match password {
+            Some(password) => password,
+            None => new_password()?,
+        };
+        Some(Stored::new(&password)?)
     };
-    config.access = Stored::new(&password)?;
     config.save(&dir)?;
     #[cfg(windows)]
     crate::service::restart()?;
-    println!("Access password changed.");
+    if none {
+        println!("Access password removed: only grants from the server let anyone in.");
+    } else {
+        println!("Access password changed.");
+    }
     Ok(())
 }
 
@@ -155,6 +172,14 @@ pub fn status() -> Result<()> {
                 if config.enrollment.is_some() {
                     println!("         enrolling when it can be reached");
                 }
+                println!(
+                    "access:  {}",
+                    match (config.managed, config.access.is_some()) {
+                        (true, true) => "grants from the server, or the access password",
+                        (true, false) => "grants from the server only",
+                        _ => "the access password only",
+                    }
+                );
             }
             Err(e) => println!("server:  unknown ({e:#})"),
         }

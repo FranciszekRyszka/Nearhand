@@ -53,8 +53,14 @@ enum Command {
         server_fingerprint: Fingerprint,
         /// The password the agent shows. Asked for if the agent wants one
         /// and it is not given here.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "token")]
         password: Option<String>,
+        /// Connect as a user of the server, with an API token of theirs
+        /// (`nht_…`): the server hands out a grant for the device if the
+        /// user has one. `NEARHAND_TOKEN` in the environment works too, and
+        /// stays out of the shell's history.
+        #[arg(long)]
+        token: Option<String>,
         /// Go through the server's relay even where a direct connection
         /// would work: for testing the relay and measuring what it costs.
         #[arg(long)]
@@ -109,9 +115,15 @@ fn main() -> Result<()> {
             server,
             server_fingerprint,
             password,
+            token,
             relay_only,
             watch,
         }) => {
+            let token = token.or_else(|| {
+                std::env::var("NEARHAND_TOKEN")
+                    .ok()
+                    .filter(|t| !t.is_empty() && password.is_none())
+            });
             let route = if relay_only {
                 rendezvous::Route::RelayOnly
             } else {
@@ -122,6 +134,7 @@ fn main() -> Result<()> {
                 server_fingerprint,
                 id,
                 route,
+                token,
             };
             watch_target(target, password, watch)
         }
