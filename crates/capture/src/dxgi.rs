@@ -33,6 +33,7 @@ use windows::Win32::Graphics::Direct3D::{
 };
 use windows::Win32::Graphics::Direct3D11::{
     D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+    D3D11_CREATE_DEVICE_FLAG,
     D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC,
     D3D11_USAGE_DEFAULT, D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Multithread,
     ID3D11Texture2D,
@@ -507,39 +508,20 @@ pub(crate) fn enumerate_displays() -> Result<Vec<Display>> {
 /// video support (the BGRA→NV12 conversion runs on the D3D11 video processor)
 /// and multithread protection (Media Foundation drives it from its own
 /// threads while we keep using the immediate context here).
+///
+/// An adapter with no video support at all — a virtual machine's basic
+/// display adapter — refuses such a device; then it is made without, and the
+/// encoder, finding no video processor, encodes in software.
 fn create_device(adapter: &IDXGIAdapter1) -> Result<(ID3D11Device, ID3D11DeviceContext)> {
-    let levels = [
-        D3D_FEATURE_LEVEL_11_1,
-        D3D_FEATURE_LEVEL_11_0,
-        D3D_FEATURE_LEVEL_10_1,
-        D3D_FEATURE_LEVEL_10_0,
-    ];
-
-    let mut device = None;
-    let mut context = None;
-    // `D3D11CreateDevice` wants the base interface; the coercion has to be
-    // written out because it is behind a generic parameter.
-    let base: &IDXGIAdapter = adapter;
-
-    unsafe {
-        D3D11CreateDevice(
-            Some(base),
-            D3D_DRIVER_TYPE_UNKNOWN,
-            HMODULE::default(),
-            D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
-            Some(&levels),
-            D3D11_SDK_VERSION,
-            Some(&mut device),
-            None,
-            Some(&mut context),
-        )
-    }
-    .map_err(|e| backend("D3D11CreateDevice", e))?;
-
-    let (Some(device), Some(context)) = (device, context) else {
-        return Err(Error::Backend(
-            "D3D11CreateDevice returned success without a device".to_owned(),
-        ));
+    let video = D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT;
+    let (device, context) = match try_create_device(adapter, video) {
+        Ok(made) => made,
+        Err(with_video) => {
+            let made = try_create_device(adapter, D3D11_CREATE_DEVICE_BGRA_SUPPORT)
+                .map_err(|e| backend("D3D11CreateDevice", e))?;
+            tracing::info!(error = %with_video, "the display adapter has no video support; capturing without it");
+            made
+        }
     };
 
     let multithread = device
@@ -549,6 +531,43 @@ fn create_device(adapter: &IDXGIAdapter1) -> Result<(ID3D11Device, ID3D11DeviceC
     let _ = unsafe { multithread.SetMultithreadProtected(true) };
 
     Ok((device, context))
+}
+
+fn try_create_device(
+    adapter: &IDXGIAdapter1,
+    flags: D3D11_CREATE_DEVICE_FLAG,
+) -> windows::core::Result<(ID3D11Device, ID3D11DeviceContext)> {
+    let levels = [
+        D3D_FEATURE_LEVEL_11_1,
+        D3D_FEATURE_LEVEL_11_0,
+        D3D_FEATURE_LEVEL_10_1,
+        D3D_FEATURE_LEVEL_10_0,
+    ];
+    let mut device = None;
+    let mut context = None;
+    // `D3D11CreateDevice` wants the base interface; the coercion has to be
+    // written out because it is behind a generic parameter.
+    let base: &IDXGIAdapter = adapter;
+    unsafe {
+        D3D11CreateDevice(
+            Some(base),
+            D3D_DRIVER_TYPE_UNKNOWN,
+            HMODULE::default(),
+            flags,
+            Some(&levels),
+            D3D11_SDK_VERSION,
+            Some(&mut device),
+            None,
+            Some(&mut context),
+        )
+    }?;
+    match (device, context) {
+        (Some(device), Some(context)) => Ok((device, context)),
+        _ => Err(windows::core::Error::new(
+            windows::Win32::Foundation::E_FAIL,
+            "D3D11CreateDevice returned success without a device",
+        )),
+    }
 }
 
 /// Start duplicating an output, translating the three failures that mean
@@ -604,6 +623,20 @@ fn clamp_u8(v: usize) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// WARP, Windows' software renderer, stands in for a virtual machine's
+    /// basic display adapter: the capture device must come up on it, with
+    /// or without video support.
+    #[test]
+    fn the_capture_device_comes_up_on_a_software_adapter() {
+        use windows::Win32::Graphics::Dxgi::IDXGIFactory4;
+        let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1() }.expect("factory");
+        let factory: IDXGIFactory4 = factory.cast().expect("IDXGIFactory4");
+        let warp: IDXGIAdapter1 = unsafe { factory.EnumWarpAdapter() }.expect("WARP adapter");
+        let (device, _context) = create_device(&warp).expect("device on WARP");
+        let multithread = device.cast::<ID3D11Multithread>().expect("multithread");
+        assert!(unsafe { multithread.GetMultithreadProtected() }.as_bool());
+    }
 
     #[test]
     fn timeout_never_becomes_infinite() {
