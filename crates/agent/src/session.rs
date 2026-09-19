@@ -46,6 +46,7 @@ use quinn::{Connection, RecvStream};
 use serde::Serialize;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
 
 use crate::gate::Verdict;
 use crate::grants::Grants;
@@ -66,6 +67,13 @@ const SENT_BYTES: usize = 16 * 1024 * 1024;
 /// How often a backlogged sender looks again. Short against a frame interval,
 /// long against the cost of asking.
 const BACKLOG_POLL: Duration = Duration::from_millis(2);
+
+/// Starting video again after it stopped by itself: from this, doubling,
+/// up to the max. Video that ran this long was fine, and the next restart
+/// is prompt again.
+const RESTART_FIRST: Duration = Duration::from_secs(1);
+const RESTART_MAX: Duration = Duration::from_secs(30);
+const HEALTHY_RUN: Duration = Duration::from_secs(30);
 
 /// Stream priorities, highest first. Clipboard text can be large and must
 /// never hold up the pointer.
@@ -104,6 +112,9 @@ struct Video {
     sender: JoinHandle<VideoStats>,
     /// Tells the sender to finish.
     stop: oneshot::Sender<()>,
+    /// What it was started with, to start it again the same way.
+    settings: Settings,
+    started: Instant,
 }
 
 impl Video {
@@ -116,16 +127,55 @@ impl Video {
         let _ = self.stop.send(());
         let stats = self.sender.await.ok();
         self.pipeline.stop().await;
-        let stats = stats?;
-        tracing::info!(
-            frames = stats.frames,
-            keyframes = stats.keyframes,
-            datagrams = stats.datagrams,
-            kib = stats.bytes / 1024,
-            kbps = stats.target_kbps,
-            "video stream ended"
-        );
-        Some((stats.next_frame_id, stats.target_kbps))
+        stats.as_ref().map(ended)
+    }
+}
+
+/// Log what a stream sent, and return the frame id and bitrate the next
+/// one should start from.
+fn ended(stats: &VideoStats) -> (u32, u32) {
+    tracing::info!(
+        frames = stats.frames,
+        keyframes = stats.keyframes,
+        datagrams = stats.datagrams,
+        kib = stats.bytes / 1024,
+        kbps = stats.target_kbps,
+        "video stream ended"
+    );
+    (stats.next_frame_id, stats.target_kbps)
+}
+
+/// Resolves when the video's sender has finished on its own — the pipeline
+/// stopped, or the connection ended — and never while there is no video.
+async fn sender_done(video: &mut Option<Video>) -> Option<VideoStats> {
+    match video {
+        Some(video) => (&mut video.sender).await.ok(),
+        None => std::future::pending().await,
+    }
+}
+
+/// Resolves at `at`, or never if nothing is due.
+async fn due(at: Option<Instant>) {
+    match at {
+        Some(at) => tokio::time::sleep_until(at).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Read the viewer's control messages into `messages`, the last one being
+/// the end of the stream or an error. Reading has a task of its own so the
+/// session can wait on its video too: a read cut short would lose the part
+/// of a message already taken off the stream.
+async fn read_control(
+    mut recv: RecvStream,
+    messages: mpsc::Sender<nearhand_transport::Result<Option<Control>>>,
+) {
+    loop {
+        let message = recv_message::<Control>(&mut recv).await;
+        let last = !matches!(message, Ok(Some(_)));
+        if messages.send(message).await.is_err() || last {
+            return;
+        }
     }
 }
 
@@ -246,11 +296,63 @@ pub async fn serve(
     // Frame ids run on across streams: switching monitors must not reset them,
     // or the viewer would take the new stream for late chunks of the old one.
     let mut next_frame_id: u32 = 0;
+    // Video that stopped by itself starts again then, the same way.
+    let mut restart: Option<(Instant, Settings)> = None;
+    let mut restart_wait = RESTART_FIRST;
+    let stream = |first_frame_id| Stream {
+        first_frame_id,
+        cursor: cursor.clone(),
+        sent: sent.clone(),
+        ceiling: ceiling.subscribe(),
+    };
+    let (messages, mut incoming) = mpsc::channel(8);
+    let reader = tokio::spawn(read_control(recv, messages));
     let outcome = loop {
-        let message = match recv_message::<Control>(&mut recv).await {
-            Ok(message) => message,
-            Err(_) if closed_normally(&conn) => break Ok(()),
-            Err(e) => break Err(e.into()),
+        let message = tokio::select! {
+            message = incoming.recv() => message,
+            stats = sender_done(&mut video) => {
+                let Some(stopped) = video.take() else { continue };
+                stopped.pipeline.stop().await;
+                if let Some(stats) = &stats {
+                    (next_frame_id, start_kbps) = ended(stats);
+                }
+                // A lost connection ends the session through the reader.
+                if conn.close_reason().is_some() {
+                    continue;
+                }
+                // Capture or encoding failed, and the pipeline logged why:
+                // the viewer keeps control, and the picture comes back.
+                if stopped.started.elapsed() >= HEALTHY_RUN {
+                    restart_wait = RESTART_FIRST;
+                }
+                tracing::warn!(retry_in = ?restart_wait, "video stopped by itself; starting it again");
+                restart = Some((Instant::now() + restart_wait, stopped.settings));
+                restart_wait = (restart_wait * 2).min(RESTART_MAX);
+                continue;
+            }
+            () = due(restart.map(|(at, _)| at)) => {
+                let Some((_, settings)) = restart.take() else { continue };
+                let settings = Settings {
+                    bitrate_kbps: start_kbps,
+                    ..settings
+                };
+                match start_video(&conn, settings, stream(next_frame_id)).await {
+                    Ok(started) => video = Some(started),
+                    Err(e) => {
+                        tracing::warn!(error = %format!("{e:#}"), retry_in = ?restart_wait, "video did not start again");
+                        restart = Some((Instant::now() + restart_wait, settings));
+                        restart_wait = (restart_wait * 2).min(RESTART_MAX);
+                    }
+                }
+                continue;
+            }
+        };
+        let message = match message {
+            Some(Ok(message)) => message,
+            Some(Err(_)) if closed_normally(&conn) => break Ok(()),
+            Some(Err(e)) => break Err(e.into()),
+            // The reader always says how the stream ended before it goes.
+            None => break Ok(()),
         };
         match message {
             None | Some(Control::Bye) => break Ok(()),
@@ -260,6 +362,9 @@ pub async fn serve(
                 codec,
                 max_fps,
             }) => {
+                // The viewer's choice replaces any restart still due.
+                restart = None;
+                restart_wait = RESTART_FIRST;
                 if let Some(running) = video.take()
                     && let Some((next, kbps)) = running.stop().await
                 {
@@ -281,13 +386,7 @@ pub async fn serve(
                     max_fps: ceiling.borrow().fps,
                     bitrate_kbps: start_kbps,
                 };
-                let stream = Stream {
-                    first_frame_id: next_frame_id,
-                    cursor: cursor.clone(),
-                    sent: sent.clone(),
-                    ceiling: ceiling.subscribe(),
-                };
-                match start_video(&conn, settings, stream).await {
+                match start_video(&conn, settings, stream(next_frame_id)).await {
                     Ok(started) => {
                         video = Some(started);
                         if let (Some(input), Some(m)) =
@@ -371,6 +470,7 @@ pub async fn serve(
     if let Some(running) = video.take() {
         running.stop().await;
     }
+    reader.abort();
     streams.abort();
     cursor_stream.abort();
     clipboard_stream.abort();
@@ -698,6 +798,8 @@ async fn start_video(conn: &Connection, settings: Settings, stream: Stream) -> R
         pipeline: started.pipeline,
         sender,
         stop,
+        settings,
+        started: Instant::now(),
     })
 }
 
@@ -958,5 +1060,30 @@ mod tests {
             .expect("the sender ends")
             .expect("the sender task");
         assert!(pipeline.is_closed());
+    }
+
+    /// The viewer's control messages come through in order, and then how
+    /// the stream ended.
+    #[tokio::test]
+    async fn control_messages_are_read_through_to_the_end() {
+        let (agent, viewer, _endpoints) = connected().await;
+        let (mut send, _) = viewer.open_bi().await.expect("stream");
+        send_message(&mut send, &Control::RequestKeyframe)
+            .await
+            .expect("send");
+        send_message(&mut send, &Control::Bye).await.expect("send");
+        send.finish().expect("finish");
+        let (_, recv) = agent.accept_bi().await.expect("accept");
+        let (messages, mut incoming) = mpsc::channel(1);
+        let reader = tokio::spawn(read_control(recv, messages));
+        let mut read = Vec::new();
+        while let Some(message) = incoming.recv().await {
+            read.push(message.expect("read"));
+        }
+        assert_eq!(
+            read,
+            [Some(Control::RequestKeyframe), Some(Control::Bye), None]
+        );
+        reader.await.expect("the reader ends");
     }
 }
