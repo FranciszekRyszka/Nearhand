@@ -381,6 +381,14 @@ fn init_tracing(verbose: u8, log: Option<&Path>) {
             }
         }
     }
+    // A panic aborts the process, and the agent the service starts has no
+    // console to say why: the log is where anyone will look.
+    let report = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let backtrace = std::backtrace::Backtrace::force_capture();
+        tracing::error!(%info, %backtrace, "panicked");
+        report(info);
+    }));
 }
 
 /// Past this, a log starts over rather than grow without end.
