@@ -67,6 +67,14 @@ jobs:
         with:
           command: check
 
+  # The server's Docker image: built, started, set up and stopped.
+  docker:
+    name: server image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: sh packaging/docker/smoke-test.sh
+
   # The agent's MSI, unsigned until there is a code-signing certificate. Kept
   # as an artifact of each run, for testing in a VM.
   msi:

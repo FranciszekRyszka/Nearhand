@@ -1,0 +1,12 @@
+# What the server's image build does not need (packaging/docker/Dockerfile).
+.git
+target
+**/target
+planning
+Screenshots
+crates/server/web/pkg
+*.pem
+*.key
+*.crt
+nearhand.db*
+nearhand.toml

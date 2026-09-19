@@ -207,13 +207,34 @@ async fn serve(config: Config, key: PathBuf) -> Result<()> {
             // The API stopped on its own: say why, and stop the rest too.
             result.context("the API task")??;
         }
-        _ = tokio::signal::ctrl_c() => println!("stopping"),
+        () = stop_requested() => println!("stopping"),
     }
     handle.graceful_shutdown(Some(Duration::from_secs(5)));
     endpoint.close(0u32.into(), b"server stopping");
     endpoint.wait_idle().await;
     pool.close().await;
     Ok(())
+}
+
+/// Until Ctrl+C, or SIGTERM: how `docker stop` and systemd ask a service
+/// to stop. A container's first process that does not listen for it is not
+/// stopped by it at all, only killed a while later.
+async fn stop_requested() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        match signal(SignalKind::terminate()) {
+            Ok(mut terminate) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = terminate.recv() => {}
+                }
+                return;
+            }
+            Err(e) => tracing::warn!(error = %e, "cannot listen for SIGTERM; Ctrl+C only"),
+        }
+    }
+    let _ = tokio::signal::ctrl_c().await;
 }
 
 fn prepare_data_dir(config: &Config) -> Result<()> {
@@ -250,5 +271,11 @@ fn init_tracing(verbose: u8) {
         1 => tracing::Level::DEBUG,
         _ => tracing::Level::TRACE,
     };
-    tracing_subscriber::fmt().with_max_level(level).init();
+    // Colours only for a person at a terminal, not in `docker logs` or a
+    // journal.
+    use std::io::IsTerminal as _;
+    tracing_subscriber::fmt()
+        .with_max_level(level)
+        .with_ansi(std::io::stdout().is_terminal())
+        .init();
 }

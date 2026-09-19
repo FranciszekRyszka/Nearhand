@@ -4,7 +4,7 @@
 > relays sessions that cannot go direct, has user accounts behind a REST API,
 > enrolls installed agents into a device list with groups, lets users at
 > them with grants, keeps an audit log, and has a web console for all of it.
-> A Docker image is still to come (M6).
+> It runs as a binary or in Docker.
 
 ## What works today
 
@@ -128,12 +128,41 @@ from certbot or similar, or a reverse proxy for the TCP side.
 
 ## Running it
 
-The binary, as a service — a systemd unit, or a Windows service wrapper.
-(A Docker image comes with M6.)
+The binary, as a service — a systemd unit, or a Windows service wrapper:
 
 ```bash
 nearhand-server serve                 # or: --config /etc/nearhand/nearhand.toml
 ```
+
+It stops cleanly on Ctrl+C or SIGTERM.
+
+### In Docker
+
+`packaging/docker` has the image — the server with the web viewer in it, on
+a distroless base, running unprivileged — and a Compose file. Set
+`NEARHAND_HTTP_PUBLIC_URL` in `compose.yaml` to how people will reach the
+console, then, from that folder:
+
+```bash
+docker compose up -d
+docker compose logs nearhand          # the fingerprint and the first-administrator link
+```
+
+Everything the server keeps is in the `nearhand` volume, mounted at `/data`:
+back that up. Settings come from the environment (`NEARHAND_<SECTION>_<KEY>`,
+as above) or from a file mounted at `/etc/nearhand/nearhand.toml`; for a real
+certificate, mount its files and set `NEARHAND_HTTP_TLS=files` with
+`NEARHAND_HTTP_CERT` and `NEARHAND_HTTP_KEY` (the Compose file has these,
+commented out). `docker compose exec nearhand nearhand-server admin-link`
+makes a new setup link.
+
+Both 443/TCP and **443/UDP** must be published, and UDP must reach the
+container as it is: agents' QUIC, the relay and the web viewer's
+WebTransport all use it. On Linux, Docker keeps the addresses of the agents
+it forwards; Docker Desktop on Windows and macOS does not, which costs
+direct connections between agents on different networks — use it to try the
+server out, not to run it. `packaging/docker/smoke-test.sh` builds the image
+and checks it, as CI does on every push.
 
 The first start, with no users, prints a link for creating the first
 administrator in the web console (or the API call that does the same),

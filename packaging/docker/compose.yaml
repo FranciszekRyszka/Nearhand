@@ -1,0 +1,40 @@
+# The Nearhand server. Set the two addresses below, then:
+#
+#   docker compose up -d
+#   docker compose logs nearhand     # the link for the first administrator
+#
+# Back up the `nearhand` volume: losing its server.key means setting up
+# every agent and viewer again.
+services:
+  nearhand:
+    build:
+      context: ../..
+      dockerfile: packaging/docker/Dockerfile
+    image: nearhand-server
+    restart: unless-stopped
+    ports:
+      - "443:443/tcp"
+      - "443:443/udp"
+    environment:
+      # How people reach the web console.
+      NEARHAND_HTTP_PUBLIC_URL: "https://desk.example.com"
+      # How agents reach the server, for the install commands it hands out;
+      # by default the console's host, port 443.
+      # NEARHAND_QUIC_PUBLIC_ADDRESS: "desk.example.com:443"
+      # A real certificate instead of a self-signed one: mount the files
+      # (below) and uncomment these three.
+      # NEARHAND_HTTP_TLS: "files"
+      # NEARHAND_HTTP_CERT: "/etc/nearhand/tls/fullchain.pem"
+      # NEARHAND_HTTP_KEY: "/etc/nearhand/tls/privkey.pem"
+    volumes:
+      - nearhand:/data
+      # - /etc/letsencrypt/live/desk.example.com:/etc/nearhand/tls:ro
+      # Or all settings in a file, which the environment above overrides:
+      # - ./nearhand.toml:/etc/nearhand/nearhand.toml:ro
+    # The server runs unprivileged; this lets it listen on 443 anyway
+    # (Docker's default, stated for runtimes where it is not).
+    sysctls:
+      net.ipv4.ip_unprivileged_port_start: 0
+
+volumes:
+  nearhand:
