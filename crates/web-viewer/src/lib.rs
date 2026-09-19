@@ -11,12 +11,14 @@
 // it made an import library; nothing to act on.
 #![allow(linker_messages)]
 
+pub mod keys;
 pub mod session;
 
 use js_sys::{Array, Object, Reflect, Uint8Array};
 use nearhand_core::grant::SignedGrant;
 use nearhand_core::rendezvous::{DeviceId, FromServer, ToServer};
 use nearhand_core::wire;
+use nearhand_core::{Input, WHEEL_NOTCH};
 use wasm_bindgen::prelude::*;
 
 use crate::session::{Auth, Event, Session};
@@ -88,6 +90,10 @@ impl Viewer {
     /// * `frame`, with `keyframe`, `timestamp` (µs, the agent's capture
     ///   clock), `data` (H.264 Annex B) and, on keyframes, `codec` for
     ///   WebCodecs
+    /// * `cursor`, with `width`, `height`, `hot_x`, `hot_y` and `rgba`: the
+    ///   agent's pointer, to show as the local one over the picture
+    /// * `cursor_visible`, with `visible`
+    /// * `clipboard`, with `text`: copied on the device
     /// * `closed`, with `reason`
     pub fn event(&mut self) -> Result<JsValue, JsValue> {
         let Some(event) = self.session.event() else {
@@ -134,12 +140,112 @@ impl Viewer {
                 }
                 set("data", Uint8Array::from(&data[..]).into())?;
             }
+            Event::CursorShape(shape) => {
+                set("type", "cursor".into())?;
+                for (key, value) in [
+                    ("width", shape.width),
+                    ("height", shape.height),
+                    ("hot_x", shape.hot_x),
+                    ("hot_y", shape.hot_y),
+                ] {
+                    set(key, f64::from(value).into())?;
+                }
+                set("rgba", Uint8Array::from(&shape.rgba[..]).into())?;
+            }
+            Event::CursorVisible(visible) => {
+                set("type", "cursor_visible".into())?;
+                set("visible", visible.into())?;
+            }
+            Event::Clipboard(text) => {
+                set("type", "clipboard".into())?;
+                set("text", text.into())?;
+            }
             Event::Closed(reason) => {
                 set("type", "closed".into())?;
                 set("reason", reason.into())?;
             }
         }
         Ok(object.into())
+    }
+
+    /// The pointer is over pixel (`x`, `y`) of a picture `width` by
+    /// `height`.
+    pub fn mouse_move(&mut self, x: f64, y: f64, width: u32, height: u32) {
+        let axis = |pos: f64, size: u32| {
+            let last = size.max(1) - 1;
+            let pixel = pos.floor().clamp(0.0, f64::from(last)) as u32;
+            (pixel * u32::from(u16::MAX))
+                .checked_div(last)
+                .map_or(0, |n| n as u16)
+        };
+        self.session.input(Input::MouseMove {
+            x: axis(x, width),
+            y: axis(y, height),
+        });
+    }
+
+    /// A mouse button, numbered as `MouseEvent.button` numbers them.
+    pub fn mouse_button(&mut self, button: i16, down: bool) {
+        let button = match button {
+            0 => nearhand_core::proto::mouse::LEFT,
+            1 => nearhand_core::proto::mouse::MIDDLE,
+            2 => nearhand_core::proto::mouse::RIGHT,
+            3 => nearhand_core::proto::mouse::BACK,
+            4 => nearhand_core::proto::mouse::FORWARD,
+            _ => return,
+        };
+        self.session.input(Input::MouseButton { button, down });
+    }
+
+    /// Scrolling, in notches: positive `down` scrolls down, positive `right`
+    /// right, as a `WheelEvent`'s deltas do.
+    pub fn wheel(&mut self, right: f64, down: f64) {
+        let clamp = |v: f64| {
+            (v * f64::from(WHEEL_NOTCH))
+                .round()
+                .clamp(f64::from(i16::MIN), f64::from(i16::MAX)) as i16
+        };
+        // The protocol, like Windows, counts up as positive.
+        let (dx, dy) = (clamp(right), clamp(-down));
+        if dx != 0 || dy != 0 {
+            self.session.input(Input::Wheel { dx, dy });
+        }
+    }
+
+    /// A key, by its `KeyboardEvent.code`. False if it has no HID usage;
+    /// then the page sends the character it made, if any, with
+    /// [`Viewer::text`].
+    pub fn key(&mut self, code: &str, down: bool) -> bool {
+        match keys::hid_usage(code) {
+            Some(scancode) => {
+                self.session.input(Input::Key { scancode, down });
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Typed text with no key to send it by.
+    pub fn text(&mut self, text: String) {
+        let text: String = text.chars().filter(|c| !c.is_control()).collect();
+        if !text.is_empty() {
+            self.session.input(Input::Text(text));
+        }
+    }
+
+    /// Ctrl+Alt+Del on the device, which no key press can make.
+    pub fn secure_attention(&mut self) {
+        self.session.input(Input::SecureAttention);
+    }
+
+    /// Let go of everything held: the page lost focus.
+    pub fn release_all(&mut self) {
+        self.session.release_all();
+    }
+
+    /// Text copied in the browser, for the device's clipboard.
+    pub fn clipboard(&mut self, text: String) {
+        self.session.clipboard(text);
     }
 
     /// Watch the monitor with this id.

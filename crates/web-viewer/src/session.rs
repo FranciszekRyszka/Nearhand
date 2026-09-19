@@ -8,17 +8,25 @@
 //! native viewer does through the relay: TLS 1.3 pinned to the agent's
 //! certificate fingerprint, the same ALPN, the same control protocol. The
 //! relay sees only its packets.
+//!
+//! Keyboard and mouse go on a stream of their own at the highest priority,
+//! clipboard text on another at the lowest, as the native viewer sends
+//! them; the agent's pointer shape and clipboard come back the same way.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::net::{Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
 use nearhand_core::grant::SignedGrant;
+use nearhand_core::held::Held;
 use nearhand_core::proto::close;
 use nearhand_core::video::{Reassembler, Timing, decode_chunk};
-use nearhand_core::{ALPN, Caps, Codec, Control, Monitor, PROTOCOL_VERSION, wire};
+use nearhand_core::{
+    ALPN, Caps, Clipboard, Codec, Control, Cursor, CursorShape, Input, Monitor, PROTOCOL_VERSION,
+    StreamKind, wire,
+};
 use quinn_proto::crypto::rustls::QuicClientConfig;
 use quinn_proto::{
     ClientConfig, Connection, ConnectionError, ConnectionHandle, DatagramEvent, Dir, Endpoint,
@@ -28,6 +36,8 @@ use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, Server
 use rustls::crypto::{CryptoProvider, verify_tls12_signature, verify_tls13_signature};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{CertificateError, DigitallySignedStruct, SignatureScheme};
+use serde::Serialize;
+use serde::de::DeserializeOwned;
 use web_time::Instant;
 
 /// The name agents' certificates carry; see `nearhand_transport`.
@@ -40,6 +50,10 @@ const KEYFRAME_REQUEST_INTERVAL: Duration = Duration::from_millis(250);
 const MTU: u16 = 1200;
 /// How often the session looks after itself without anything arriving.
 const TICK: Duration = Duration::from_millis(50);
+/// Stream priorities, as the native viewer sets them: input first,
+/// clipboard text last so a large paste never holds up a keystroke.
+const INPUT_PRIORITY: i32 = 1;
+const CLIPBOARD_PRIORITY: i32 = -1;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -76,6 +90,12 @@ pub enum Event {
         capture_ts_us: u64,
         data: Bytes,
     },
+    /// The agent's pointer looks like this now; checked for sense.
+    CursorShape(CursorShape),
+    /// Whether the agent shows a pointer on the watched monitor.
+    CursorVisible(bool),
+    /// Text copied on the device.
+    Clipboard(String),
     /// The session is over, and why.
     Closed(String),
 }
@@ -95,6 +115,13 @@ pub struct Session {
     control_in: Vec<u8>,
     /// Bytes for the control stream, not yet taken by QUIC.
     control_out: VecDeque<u8>,
+    input: Outgoing,
+    clipboard: Outgoing,
+    /// Streams from the agent: what each carries, once its first message
+    /// says, and bytes not yet a whole message.
+    incoming: HashMap<StreamId, (Option<StreamKind>, Vec<u8>)>,
+    /// What this viewer holds down, to let go of when it loses focus.
+    held: Held,
     /// Packets to send that the endpoint made, not the connection.
     outgoing: VecDeque<Vec<u8>>,
     events: VecDeque<Event>,
@@ -124,6 +151,10 @@ impl Session {
             control: None,
             control_in: Vec::new(),
             control_out: VecDeque::new(),
+            input: Outgoing::new(StreamKind::Input, INPUT_PRIORITY),
+            clipboard: Outgoing::new(StreamKind::Clipboard, CLIPBOARD_PRIORITY),
+            incoming: HashMap::new(),
+            held: Held::default(),
             outgoing: VecDeque::new(),
             events: VecDeque::new(),
             reassembler: Reassembler::new(),
@@ -217,6 +248,61 @@ impl Session {
         self.drive();
     }
 
+    /// Keyboard or mouse. Key and button presses are remembered, so that
+    /// [`Session::release_all`] can let go of them.
+    pub fn input(&mut self, event: Input) {
+        match &event {
+            Input::Key { scancode, down } => {
+                let was_down = self.held.key(*scancode, *down);
+                // A release of a key this viewer never pressed is not the
+                // agent's business.
+                if !down && !was_down {
+                    return;
+                }
+            }
+            Input::MouseButton { button, down } => self.held.button(*button, *down),
+            _ => {}
+        }
+        if self.control.is_none() {
+            return;
+        }
+        if let Err(e) = self.input.push(&event) {
+            self.fail(&e.to_string());
+        }
+        self.drive();
+    }
+
+    /// Let go of every key and button held: the page lost focus, and the
+    /// releases would go elsewhere.
+    pub fn release_all(&mut self) {
+        let (keys, buttons) = self.held.take();
+        for scancode in keys {
+            let _ = self.input.push(&Input::Key {
+                scancode,
+                down: false,
+            });
+        }
+        for button in buttons {
+            let _ = self.input.push(&Input::MouseButton {
+                button,
+                down: false,
+            });
+        }
+        self.drive();
+    }
+
+    /// Text copied in the browser, for the device's clipboard.
+    pub fn clipboard(&mut self, text: String) {
+        if text.is_empty() || text.len() > Clipboard::MAX_TEXT || self.control.is_none() {
+            return;
+        }
+        let text = text.replace("\r\n", "\n");
+        if let Err(e) = self.clipboard.push(&Clipboard::Text(text)) {
+            self.fail(&e.to_string());
+        }
+        self.drive();
+    }
+
     /// Say goodbye to the agent.
     pub fn close(&mut self) {
         if self.closed {
@@ -262,9 +348,8 @@ impl Session {
                 quinn_proto::Event::Connected => self.connected(),
                 quinn_proto::Event::Stream(StreamEvent::Readable { id }) => self.read(id),
                 quinn_proto::Event::Stream(StreamEvent::Opened { dir: Dir::Uni }) => {
-                    // The agent's cursor and clipboard streams: not shown
-                    // yet, so read and dropped.
                     while let Some(id) = self.conn.streams().accept(Dir::Uni) {
+                        self.incoming.insert(id, (None, Vec::new()));
                         self.read(id);
                     }
                 }
@@ -285,6 +370,12 @@ impl Session {
             self.keyframe_needed = wants_keyframe;
         }
         self.flush_control();
+        if let Err(e) = self.input.flush(&mut self.conn) {
+            self.fail(&e);
+        }
+        if let Err(e) = self.clipboard.flush(&mut self.conn) {
+            self.fail(&e);
+        }
     }
 
     fn connected(&mut self) {
@@ -312,10 +403,10 @@ impl Session {
             return;
         };
         let mut finished = false;
+        let mut received = Vec::new();
         loop {
             match chunks.next(usize::MAX) {
-                Ok(Some(chunk)) if control => self.control_in.extend_from_slice(&chunk.bytes),
-                Ok(Some(_)) => {}
+                Ok(Some(chunk)) => received.extend_from_slice(&chunk.bytes),
                 Ok(None) => {
                     finished = true;
                     break;
@@ -325,10 +416,72 @@ impl Session {
         }
         let _ = chunks.finalize();
         if control {
+            self.control_in.extend_from_slice(&received);
             self.parse_control();
             if finished && !self.closed {
                 self.fail("the agent ended the session");
             }
+        } else {
+            self.read_incoming(id, &received);
+            if finished {
+                self.incoming.remove(&id);
+            }
+        }
+    }
+
+    /// Messages on one of the agent's own streams: pointer or clipboard.
+    fn read_incoming(&mut self, id: StreamId, received: &[u8]) {
+        let Some((kind, buffer)) = self.incoming.get_mut(&id) else {
+            return;
+        };
+        buffer.extend_from_slice(received);
+        let mut messages = Vec::new();
+        let mut broken = None;
+        loop {
+            match kind {
+                None => match take::<StreamKind>(buffer) {
+                    Ok(Some(k)) => *kind = Some(k),
+                    Ok(None) => break,
+                    Err(e) => {
+                        broken = Some(e);
+                        break;
+                    }
+                },
+                Some(StreamKind::Cursor) => match take::<Cursor>(buffer) {
+                    Ok(Some(Cursor::Shape(shape))) if shape.is_valid() => {
+                        messages.push(Event::CursorShape(shape));
+                    }
+                    Ok(Some(Cursor::Shape(_))) => {}
+                    Ok(Some(Cursor::Visible(visible))) => {
+                        messages.push(Event::CursorVisible(visible));
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        broken = Some(e);
+                        break;
+                    }
+                },
+                Some(StreamKind::Clipboard) => match take::<Clipboard>(buffer) {
+                    Ok(Some(Clipboard::Text(text))) if text.len() <= Clipboard::MAX_TEXT => {
+                        messages.push(Event::Clipboard(text));
+                    }
+                    Ok(Some(_)) => {}
+                    Ok(None) => break,
+                    Err(e) => {
+                        broken = Some(e);
+                        break;
+                    }
+                },
+                // Not a stream the agent sends: ignore what it carries.
+                Some(StreamKind::Input) => {
+                    buffer.clear();
+                    break;
+                }
+            }
+        }
+        self.events.extend(messages);
+        if let Some(e) = broken {
+            self.fail(&e);
         }
     }
 
@@ -470,6 +623,83 @@ impl Session {
         );
         self.closed = true;
         self.events.push_back(Event::Closed(why.to_owned()));
+    }
+}
+
+/// One whole message off the front of `buffer`, if it holds one.
+fn take<T: DeserializeOwned>(buffer: &mut Vec<u8>) -> Result<Option<T>, String> {
+    if buffer.len() < wire::HEADER_LEN {
+        return Ok(None);
+    }
+    let mut header = [0u8; wire::HEADER_LEN];
+    header.copy_from_slice(&buffer[..wire::HEADER_LEN]);
+    let len = wire::body_len(header).map_err(|e| e.to_string())?;
+    if buffer.len() < wire::HEADER_LEN + len {
+        return Ok(None);
+    }
+    let message =
+        wire::decode(&buffer[wire::HEADER_LEN..wire::HEADER_LEN + len]).map_err(|e| e.to_string());
+    buffer.drain(..wire::HEADER_LEN + len);
+    message.map(Some)
+}
+
+/// A stream from this viewer to the agent, opened when first needed: its
+/// kind first, then its messages.
+struct Outgoing {
+    kind: StreamKind,
+    priority: i32,
+    id: Option<StreamId>,
+    /// Bytes QUIC has not taken yet.
+    queue: VecDeque<u8>,
+}
+
+impl Outgoing {
+    fn new(kind: StreamKind, priority: i32) -> Self {
+        Self {
+            kind,
+            priority,
+            id: None,
+            queue: VecDeque::new(),
+        }
+    }
+
+    fn push<T: Serialize>(&mut self, message: &T) -> Result<(), nearhand_core::Error> {
+        if self.id.is_none() && self.queue.is_empty() {
+            self.queue.extend(wire::encode(&self.kind)?);
+        }
+        self.queue.extend(wire::encode(message)?);
+        Ok(())
+    }
+
+    /// Hand QUIC what it will take, opening the stream if need be.
+    fn flush(&mut self, conn: &mut Connection) -> Result<(), String> {
+        if self.queue.is_empty() {
+            return Ok(());
+        }
+        let id = match self.id {
+            Some(id) => id,
+            None => {
+                // No stream to be had yet: the agent has not allowed one.
+                let Some(id) = conn.streams().open(Dir::Uni) else {
+                    return Ok(());
+                };
+                let _ = conn.send_stream(id).set_priority(self.priority);
+                self.id = Some(id);
+                id
+            }
+        };
+        while !self.queue.is_empty() {
+            let (front, _) = self.queue.as_slices();
+            match conn.send_stream(id).write(front) {
+                Ok(0) => break,
+                Ok(written) => {
+                    self.queue.drain(..written);
+                }
+                Err(quinn_proto::WriteError::Blocked) => break,
+                Err(e) => return Err(format!("{:?} stream: {e}", self.kind)),
+            }
+        }
+        Ok(())
     }
 }
 

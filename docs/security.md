@@ -181,7 +181,12 @@ account (M5).
   ciphertext. The page checks that the fingerprint the server introduces is
   the one in the grant the API issued, and the agent checks the grant as
   for any viewer. Its page may compile WebAssembly (`'wasm-unsafe-eval'`,
-  which permits nothing for JavaScript); the console's may not.
+  which permits nothing for JavaScript) and show `data:` images — the
+  device's pointer; the console's may do neither.
+- The web viewer reads this machine's clipboard only with the browser's
+  permission, only while its tab has focus, and only when the picture gets
+  focus; a `view` grant sends nothing, since the agent takes no input or
+  clipboard from a watcher.
 - WebTransport uses a certificate browsers accept, not the pinned server
   key: CA-issued, or self-signed for at most 13 days and accepted by the
   hash the console hands over HTTPS. Whoever can serve the console could

@@ -248,6 +248,12 @@ Then grants, with the VM enrolled into a device group (make the token with
   server ("you have no grant for that device").
 * `nearhand-agent set-password --none` in the VM: the access password no
   longer works, and grants still do. `nearhand-agent status` says so.
+* In a browser on the host, the console's **View** beside the VM shows its
+  screen. With a `control` grant, click it and type into Notepad in the
+  VM: letters appear, Shift and AltGr work, scrolling scrolls. Ctrl+Alt+Del
+  (the button) shows the VM's secure screen. Copy text in the VM: it pastes
+  on the host; copy on the host and click the picture: it pastes in the
+  VM.
 
 ## Also worth checking while the VM is up
 

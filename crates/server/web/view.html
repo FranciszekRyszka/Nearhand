@@ -14,11 +14,13 @@
   <span id="device"></span>
   <select id="monitor" hidden></select>
   <span id="stats" class="quiet"></span>
+  <button id="cad" title="Also Ctrl+Alt+End">Ctrl+Alt+Del</button>
+  <button id="full">Full screen</button>
   <button id="leave">Disconnect</button>
 </header>
 <main>
   <p id="status">Starting…</p>
-  <canvas id="screen" hidden></canvas>
+  <canvas id="screen" tabindex="0" hidden></canvas>
 </main>
 <noscript>The viewer needs JavaScript and WebAssembly.</noscript>
 </body>

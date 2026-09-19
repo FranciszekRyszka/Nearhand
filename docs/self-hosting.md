@@ -152,12 +152,22 @@ phone: the console draws no QR code.
 ### The web viewer
 
 Beside each device a user has a grant for, and which is online, the console
-shows **View**: the device's screen in the browser tab, in current Chrome,
-Edge or Firefox. It runs the same session as the native viewer, end-to-end
-encrypted to the agent, carried over WebTransport on the QUIC port through
-the server's relay — so it works wherever the console does, as long as UDP
-reaches the QUIC port. Keyboard, mouse and clipboard from the browser come
-next; for now it watches.
+shows **View**: the device in the browser tab, in current Chrome, Edge or
+Firefox, to watch — or, with a `control` or `full` grant, to use. It runs
+the same session as the native viewer, end-to-end encrypted to the agent,
+carried over WebTransport on the QUIC port through the server's relay — so
+it works wherever the console does, as long as UDP reaches the QUIC port.
+
+- Click the picture to type into it. Keys go by position, so the device's
+  own layout applies. **Ctrl+Alt+Del** is a button (or Ctrl+Alt+End).
+- Shortcuts the browser keeps — Ctrl+W, Ctrl+T, Alt+Tab — stay with it,
+  except in **Full screen**, where Chrome and Edge hand them to the device
+  too.
+- The device's pointer shape shows as the browser's own over the picture.
+- Clipboard text: what is copied on the device lands in the browser's
+  clipboard; what is copied here goes to the device when the picture gets
+  focus, once the browser has been allowed to read the clipboard — it asks
+  the first time.
 
 Browsers do not accept the server's own QUIC certificate, so WebTransport
 connections get another: the HTTPS certificate files with `tls = "files"`,

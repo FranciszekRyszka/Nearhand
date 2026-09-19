@@ -136,6 +136,38 @@ async fn run_until(
     }
 }
 
+/// Keep `session`'s packets moving for `time`; the events it produced.
+async fn pump(
+    session: &mut Session,
+    socket: &UdpSocket,
+    agent: SocketAddr,
+    time: Duration,
+) -> Vec<Event> {
+    let mut seen = Vec::new();
+    let mut buf = vec![0u8; 65536];
+    let until = tokio::time::Instant::now() + time;
+    loop {
+        while let Some(packet) = session.transmit() {
+            socket.send_to(&packet, agent).await.expect("send");
+        }
+        while let Some(event) = session.event() {
+            seen.push(event);
+        }
+        let wake = session
+            .next_wakeup()
+            .map(|at| at.saturating_duration_since(web_time::Instant::now()))
+            .unwrap_or(Duration::from_millis(50));
+        tokio::select! {
+            received = socket.recv_from(&mut buf) => {
+                let (len, _) = received.expect("receive");
+                session.receive(&buf[..len]);
+            }
+            () = tokio::time::sleep(wake) => session.tick(),
+            () = tokio::time::sleep_until(until) => return seen,
+        }
+    }
+}
+
 #[tokio::test]
 async fn a_session_authenticates_and_receives_a_whole_frame() {
     let identity = Identity::generate().expect("agent key");
@@ -197,4 +229,159 @@ async fn a_session_pinned_to_another_key_never_connects() {
         panic!("not closed");
     };
     assert!(!why.is_empty());
+}
+
+/// An agent that lets the viewer in, then sends a pointer shape and
+/// clipboard text on streams of its own, and reports what the viewer sends
+/// on its input and clipboard streams.
+fn chatty_agent(identity: &Identity) -> (SocketAddr, tokio::sync::mpsc::UnboundedReceiver<String>) {
+    use nearhand_core::{Clipboard, Cursor, CursorShape, Input, StreamKind};
+    let endpoint = server_endpoint(([127, 0, 0, 1], 0).into(), identity).expect("agent endpoint");
+    let address = endpoint.local_addr().expect("address");
+    let (report, reports) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        let conn = endpoint
+            .accept()
+            .await
+            .expect("incoming")
+            .await
+            .expect("connection");
+        let (mut send, mut recv) = conn.accept_bi().await.expect("control stream");
+        let _hello: Option<Control> = recv_message(&mut recv).await.expect("hello");
+        let caps = Caps {
+            codecs: vec![Codec::H264],
+            max_width: 1920,
+            max_height: 1080,
+            max_fps: 60,
+        };
+        send_message(
+            &mut send,
+            &Control::Hello {
+                version: PROTOCOL_VERSION,
+                caps,
+            },
+        )
+        .await
+        .expect("hello");
+        send_message(&mut send, &Control::AuthRequired)
+            .await
+            .expect("auth");
+        let _answer: Option<Control> = recv_message(&mut recv).await.expect("answer");
+        send_message(&mut send, &Control::MonitorList(Vec::new()))
+            .await
+            .expect("monitors");
+
+        let mut cursor = conn.open_uni().await.expect("cursor stream");
+        send_message(&mut cursor, &StreamKind::Cursor)
+            .await
+            .expect("kind");
+        let shape = CursorShape {
+            width: 2,
+            height: 2,
+            hot_x: 1,
+            hot_y: 0,
+            rgba: vec![255; 16],
+        };
+        send_message(&mut cursor, &Cursor::Shape(shape))
+            .await
+            .expect("shape");
+        send_message(&mut cursor, &Cursor::Visible(false))
+            .await
+            .expect("visible");
+        let mut clipboard = conn.open_uni().await.expect("clipboard stream");
+        send_message(&mut clipboard, &StreamKind::Clipboard)
+            .await
+            .expect("kind");
+        send_message(&mut clipboard, &Clipboard::Text("from the device".into()))
+            .await
+            .expect("text");
+
+        while let Ok(mut stream) = conn.accept_uni().await {
+            let report = report.clone();
+            tokio::spawn(async move {
+                match recv_message::<StreamKind>(&mut stream).await {
+                    Ok(Some(StreamKind::Input)) => {
+                        while let Ok(Some(input)) = recv_message::<Input>(&mut stream).await {
+                            let _ = report.send(format!("{input:?}"));
+                        }
+                    }
+                    Ok(Some(StreamKind::Clipboard)) => {
+                        while let Ok(Some(text)) = recv_message::<Clipboard>(&mut stream).await {
+                            let _ = report.send(format!("{text:?}"));
+                        }
+                    }
+                    _ => {}
+                }
+            });
+        }
+    });
+    (address, reports)
+}
+
+#[tokio::test]
+async fn input_clipboard_and_pointer_travel_both_ways() {
+    use nearhand_core::Input;
+    let identity = Identity::generate().expect("agent key");
+    let (agent, mut reports) = chatty_agent(&identity);
+    let socket = UdpSocket::bind("127.0.0.1:0").await.expect("socket");
+    let mut session = Session::new(
+        *identity.fingerprint().as_bytes(),
+        Auth::Password(PASSWORD.to_owned()),
+        60,
+    )
+    .expect("session");
+    let mut seen = run_until(&mut session, &socket, agent, |e| {
+        matches!(e, Event::Monitors(_))
+    })
+    .await;
+
+    session.input(Input::MouseMove { x: 100, y: 200 });
+    session.input(Input::Key {
+        scancode: 0x04,
+        down: true,
+    });
+    session.input(Input::MouseButton {
+        button: 0,
+        down: true,
+    });
+    // Released without having been pressed: never sent.
+    session.input(Input::Key {
+        scancode: 0x05,
+        down: false,
+    });
+    session.release_all();
+    session.clipboard("from the\r\nbrowser".into());
+
+    seen.extend(pump(&mut session, &socket, agent, Duration::from_millis(500)).await);
+    let mut got = Vec::new();
+    while let Ok(line) = reports.try_recv() {
+        got.push(line);
+    }
+    let clipboard = got
+        .iter()
+        .position(|l| l.starts_with("Text"))
+        .map(|i| got.remove(i));
+    assert_eq!(
+        clipboard.as_deref(),
+        Some(r#"Text("from the\nbrowser")"#),
+        "line endings as the protocol has them"
+    );
+    assert_eq!(
+        got,
+        [
+            "MouseMove { x: 100, y: 200 }",
+            "Key { scancode: 4, down: true }",
+            "MouseButton { button: 0, down: true }",
+            "Key { scancode: 4, down: false }",
+            "MouseButton { button: 0, down: false }",
+        ],
+        "in order; every press released once; nothing never pressed"
+    );
+
+    assert!(
+        seen.iter()
+            .any(|e| matches!(e, Event::CursorShape(s) if s.hot_x == 1))
+    );
+    assert!(seen.contains(&Event::CursorVisible(false)));
+    assert!(seen.contains(&Event::Clipboard("from the device".into())));
 }

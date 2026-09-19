@@ -1,9 +1,15 @@
-// The web viewer: watch a device from the browser.
+// The web viewer: see and control a device from the browser.
 //
 // The session with the agent is Rust compiled to WebAssembly (`Viewer`):
 // the same QUIC connection a native viewer makes, end-to-end encrypted to
 // the agent's key. This page carries its packets over WebTransport through
-// the server's relay, decodes the video with WebCodecs, and draws it.
+// the server's relay, decodes the video with WebCodecs, draws it, and
+// sends the keyboard and mouse over the picture back.
+//
+// Keys go by position (`KeyboardEvent.code`), so the device's own layout
+// applies. What the browser keeps for itself — Ctrl+W, Ctrl+T, Alt+Tab —
+// stays with the browser, except in full screen, where the Keyboard Lock
+// API (where the browser has it) sends those too.
 //
 // Opened from the console as /view?device=<device row id>, signed in.
 "use strict";
@@ -55,7 +61,7 @@ async function main() {
 
   viewer = new Viewer(fingerprint, granted.grant, undefined, 60);
   status("Connecting to the device…");
-  run(transport, viewer);
+  run(transport, viewer, granted.role);
 }
 
 /// Ask the server to introduce this browser to the device; its key's
@@ -81,9 +87,10 @@ async function introduce(transport, deviceId) {
   return introduction_answer(whole);
 }
 
-function run(transport, viewer) {
+function run(transport, viewer, role) {
   const writer = transport.datagrams.writable.getWriter();
   const decoder = new Decoder(viewer);
+  const clipboard = new ClipboardSync(viewer);
   let timer = null;
   let frames = 0;
   let closed = false;
@@ -117,6 +124,16 @@ function run(transport, viewer) {
       case "frame":
         frames++;
         decoder.decode(event);
+        break;
+      case "cursor":
+        showCursor(event);
+        break;
+      case "cursor_visible":
+        $("screen").dataset.pointer = event.visible ? "" : "hidden";
+        applyCursor();
+        break;
+      case "clipboard":
+        clipboard.fromDevice(event.text);
         break;
       case "closed":
         closed = true;
@@ -152,7 +169,147 @@ function run(transport, viewer) {
     pump();
     setTimeout(() => (location.href = "/"), 300);
   };
+  if (role === "view") {
+    // The agent ignores a watcher's keyboard and mouse; say so.
+    $("device").textContent += " (watching only)";
+    $("cad").hidden = true;
+  }
+  attachInput(viewer, pump, clipboard);
   pump();
+}
+
+/// The keyboard and mouse over the picture, to the device.
+function attachInput(viewer, pump, clipboard) {
+  const canvas = $("screen");
+  const send = (action) => {
+    action();
+    pump();
+  };
+  const at = (event) => {
+    const rect = canvas.getBoundingClientRect();
+    const x = ((event.clientX - rect.left) / rect.width) * canvas.width;
+    const y = ((event.clientY - rect.top) / rect.height) * canvas.height;
+    return [x, y];
+  };
+  canvas.addEventListener("pointermove", (e) => {
+    const [x, y] = at(e);
+    send(() => viewer.mouse_move(x, y, canvas.width, canvas.height));
+  });
+  canvas.addEventListener("pointerdown", (e) => {
+    canvas.focus();
+    canvas.setPointerCapture(e.pointerId);
+    const [x, y] = at(e);
+    send(() => {
+      viewer.mouse_move(x, y, canvas.width, canvas.height);
+      viewer.mouse_button(e.button, true);
+    });
+    e.preventDefault();
+  });
+  canvas.addEventListener("pointerup", (e) => {
+    send(() => viewer.mouse_button(e.button, false));
+    e.preventDefault();
+  });
+  canvas.addEventListener("contextmenu", (e) => e.preventDefault());
+  canvas.addEventListener("wheel", (e) => {
+    // Notches: a wheel detent is about 100 pixels, or 3 lines.
+    const per = e.deltaMode === 0 ? 100 : e.deltaMode === 1 ? 3 : 1;
+    send(() => viewer.wheel(e.deltaX / per, e.deltaY / per));
+    e.preventDefault();
+  }, { passive: false });
+
+  const key = (e, down) => {
+    // Ctrl+Alt+End stands for Ctrl+Alt+Del, which the local system keeps.
+    if (down && e.code === "End" && e.ctrlKey && e.altKey) {
+      send(() => viewer.secure_attention());
+    } else if (!viewer.key(e.code, down) && down && e.key.length === 1) {
+      viewer.text(e.key);
+    }
+    pump();
+    e.preventDefault();
+  };
+  canvas.addEventListener("keydown", (e) => key(e, true));
+  canvas.addEventListener("keyup", (e) => key(e, false));
+
+  // Whatever is held when the picture loses focus would be let go of
+  // elsewhere: let go of it on the device too.
+  canvas.addEventListener("blur", () => send(() => viewer.release_all()));
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) send(() => viewer.release_all());
+  });
+  canvas.addEventListener("focus", () => clipboard.toDevice());
+
+  $("cad").onclick = () => {
+    send(() => viewer.secure_attention());
+    canvas.focus();
+  };
+  $("full").onclick = async () => {
+    const main = document.querySelector("main");
+    if (document.fullscreenElement) {
+      await document.exitFullscreen();
+      return;
+    }
+    await main.requestFullscreen();
+    // Where the browser offers it, full screen also takes Alt+Tab, the
+    // Windows key and the like, instead of leaving them to this machine.
+    if (navigator.keyboard && navigator.keyboard.lock) navigator.keyboard.lock().catch(() => {});
+    canvas.focus();
+  };
+}
+
+/// The device's pointer, shown as this browser's own over the picture.
+let cursorUrl = null;
+function showCursor({ width, height, hot_x, hot_y, rgba }) {
+  const image = document.createElement("canvas");
+  image.width = width;
+  image.height = height;
+  image.getContext("2d").putImageData(new ImageData(new Uint8ClampedArray(rgba), width, height), 0, 0);
+  // Browsers take cursors up to 128 pixels; the default arrow beyond that.
+  cursorUrl = width <= 128 && height <= 128 ? `url(${image.toDataURL()}) ${hot_x} ${hot_y}, default` : "default";
+  applyCursor();
+}
+function applyCursor() {
+  const canvas = $("screen");
+  canvas.style.cursor = canvas.dataset.pointer === "hidden" ? "none" : cursorUrl || "default";
+}
+
+/// Clipboard text both ways. The device's copies go to this browser's
+/// clipboard; this browser's go to the device when the picture gets focus —
+/// browsers let a page read the clipboard only with permission, and only
+/// while it has focus.
+class ClipboardSync {
+  constructor(viewer) {
+    this.viewer = viewer;
+    this.last = null;
+    this.pending = null;
+  }
+
+  fromDevice(text) {
+    this.last = text;
+    if (!navigator.clipboard) return;
+    navigator.clipboard.writeText(text).catch(() => {
+      // Without focus the write fails: try again when it comes back.
+      this.pending = text;
+    });
+  }
+
+  async toDevice() {
+    if (this.pending !== null) {
+      const text = this.pending;
+      this.pending = null;
+      await navigator.clipboard.writeText(text).catch(() => {});
+      return;
+    }
+    if (!navigator.clipboard || !navigator.clipboard.readText) return;
+    try {
+      const text = await navigator.clipboard.readText();
+      if (text && text !== this.last) {
+        this.last = text;
+        this.viewer.clipboard(text);
+      }
+    } catch {
+      // No permission: the clipboard stays this browser's.
+    }
+  }
 }
 
 function showMonitors(monitors, viewer, pump) {

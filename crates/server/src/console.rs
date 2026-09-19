@@ -7,8 +7,9 @@
 //! this server's own script, style and API, and its WebTransport address for
 //! the web viewer, and nothing else — no inline script, no other origin, no
 //! framing. The viewer page may also compile WebAssembly
-//! (`'wasm-unsafe-eval'`, which permits nothing for JavaScript); the
-//! console may not.
+//! (`'wasm-unsafe-eval'`, which permits nothing for JavaScript) and use
+//! `data:` images, which is how it shows the device's pointer; the console
+//! may do neither.
 
 use std::sync::Arc;
 
@@ -47,14 +48,14 @@ const WASM: &[u8] = b"";
 /// sessions to `webtransport` (`host:port` of the QUIC side), and, with
 /// `wasm`, compile WebAssembly.
 pub fn policy(webtransport: &str, wasm: bool) -> String {
-    let script = if wasm {
-        "'self' 'wasm-unsafe-eval'"
+    let (script, img) = if wasm {
+        ("'self' 'wasm-unsafe-eval'", "'self' data:")
     } else {
-        "'self'"
+        ("'self'", "'self'")
     };
     format!(
         "default-src 'none'; script-src {script}; style-src 'self'; \
-         connect-src 'self' https://{webtransport}; img-src 'self'; form-action 'self'; \
+         connect-src 'self' https://{webtransport}; img-src {img}; form-action 'self'; \
          base-uri 'none'; frame-ancestors 'none'"
     )
 }
