@@ -1,0 +1,68 @@
+# Fuzzing the decoders, weekly and on demand.
+#
+# `cargo-fuzz` needs a nightly toolchain, so it cannot live in CI proper —
+# every build runs `crates/core/tests/hostile.rs` instead, which is the same
+# idea without the coverage feedback. This job is the deeper pass: libFuzzer
+# guided by coverage, over a corpus that grows from run to run.
+#
+# A crash uploads the input that caused it. To reproduce it:
+#
+#   cargo +nightly fuzz run <target> <the downloaded file>
+
+name: Fuzz
+
+on:
+  schedule:
+    # Mondays, early, at a minute nobody else picked.
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: Seconds to fuzz each target for
+        default: "300"
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  fuzz:
+    name: cargo-fuzz
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+      # The corpus from the last run: coverage accumulates rather than
+      # starting from nothing every Monday.
+      - uses: actions/cache@v4
+        with:
+          path: fuzz/corpus
+          key: fuzz-corpus-${{ github.run_id }}
+          restore-keys: fuzz-corpus-
+      - name: install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: fuzz
+        working-directory: fuzz
+        env:
+          SECONDS_EACH: ${{ github.event.inputs.seconds || '300' }}
+        run: |
+          set -e
+          for target in wire video signature_file signatures; do
+            echo "::group::$target"
+            cargo +nightly fuzz run "$target" -- \
+              -max_total_time="$SECONDS_EACH" \
+              -max_len=16384 \
+              -rss_limit_mb=4096
+            echo "::endgroup::"
+          done
+      - name: the input that crashed
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts
+          if-no-files-found: ignore

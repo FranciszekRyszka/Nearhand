@@ -24,6 +24,11 @@ jobs:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
+      # The fuzzing targets are their own workspace, on nightly weekly
+      # (`fuzz.yml`); this keeps them compiling as the crates they call
+      # change, rather than finding out next Monday.
+      - run: cargo fmt --manifest-path fuzz/Cargo.toml --all --check
+      - run: cargo check --manifest-path fuzz/Cargo.toml --all-targets
       # `core` must keep compiling for the browser viewer.
       # Cheap to enforce now, painful to retrofit later.
       - run: cargo check -p nearhand-core --target wasm32-unknown-unknown

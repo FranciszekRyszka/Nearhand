@@ -232,8 +232,14 @@ account (M5).
   (`crates/core/tests/hostile.rs`): messages, grants, releases, signature
   files and video chunks, and the video reassembler is driven with chunks no
   sane sender would produce. A malformed message must be an error, never a
-  panic and never an unbounded loop. `cargo-fuzz` on top of that is for
-  before 1.0.
+  panic and never an unbounded loop.
+- On top of that, `cargo-fuzz` runs the same decoders under libFuzzer, which
+  is guided by coverage and keeps what it learns: four targets in `fuzz/`,
+  weekly and on demand (`.github/workflows/fuzz.yml`), over a corpus that
+  carries over between runs. It needs a nightly toolchain, so it is a job of
+  its own rather than part of every build; what it finds becomes a case in
+  the standing test above. `fuzz/README.md` says how to run it and how to
+  reproduce a crash.
 - External review before 1.0.
 
 ## Known limits

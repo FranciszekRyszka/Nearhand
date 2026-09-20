@@ -7,7 +7,8 @@
 //! This is not a fuzzer — it is the standing check that runs on every
 //! build. It feeds random bytes, and mutations of real messages, to each
 //! decoder, and drives the video reassembler with chunks no sane sender
-//! would produce. `cargo-fuzz` on top of this is for before 1.0.
+//! would produce. The fuzzer proper is in `fuzz/`, on nightly and weekly;
+//! what it finds belongs here afterwards, as a case every build sees.
 
 use nearhand_core::grant::{Grant, Role, SignedGrant};
 use nearhand_core::release::{Package, Release, SignedRelease, Version};

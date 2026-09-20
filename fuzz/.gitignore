@@ -1,0 +1,5 @@
+# Build output, the corpus a run grows, and the inputs that crashed.
+target/
+corpus/
+artifacts/
+coverage/

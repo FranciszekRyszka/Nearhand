@@ -75,8 +75,13 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 cargo check -p nearhand-core --target wasm32-unknown-unknown
+cargo check --manifest-path fuzz/Cargo.toml --all-targets
 cargo deny check      # cargo install cargo-deny
 ```
+
+The decoders are fuzzed too, weekly in CI and on demand: see
+[fuzz/README.md](fuzz/README.md). It needs a nightly toolchain, so it is not
+part of a normal build.
 
 The web viewer is built separately, into `crates/server/web/pkg`, from where
 the server's build embeds it (without it, the server builds and its `/view`

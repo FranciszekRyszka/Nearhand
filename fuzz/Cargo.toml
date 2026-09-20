@@ -1,0 +1,60 @@
+# Fuzzing targets, for `cargo fuzz` on a nightly toolchain. Its own
+# workspace: the targets are built with sanitizers and a profile of their
+# own, and nothing in the main workspace should depend on them.
+#
+# See `fuzz/README.md`.
+
+[package]
+name = "nearhand-fuzz"
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4.11"
+nearhand-core = { path = "../crates/core" }
+nearhand-transport = { path = "../crates/transport" }
+# For the certificate type `Fingerprint::of` takes; the same build as
+# the transport crate uses.
+rustls = { version = "0.23.45", default-features = false, features = ["ring", "std"] }
+
+[[bin]]
+name = "wire"
+path = "fuzz_targets/wire.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "video"
+path = "fuzz_targets/video.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "signature_file"
+path = "fuzz_targets/signature_file.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "signatures"
+path = "fuzz_targets/signatures.rs"
+test = false
+doc = false
+bench = false
+
+# Overflow checks stay on: an overflow in a length or an index is a bug
+# worth a crash here, even where release builds would wrap.
+[profile.release]
+debug = true
+debug-assertions = true
+overflow-checks = true
+
+[workspace]

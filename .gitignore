@@ -37,3 +37,6 @@ desktop.ini
 
 # The web viewer, built by packaging/web/build.*
 crates/server/web/pkg/
+
+# Logs and notes dropped here from the test VM, kept local.
+Screenshots/
