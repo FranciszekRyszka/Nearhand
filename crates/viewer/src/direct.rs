@@ -29,6 +29,8 @@ use nearhand_transport::{
     Fingerprint, client_endpoint, connect, recv_message, rendezvous, send_all, send_message,
 };
 use quinn::{Connection, ConnectionError, RecvStream, SendStream};
+
+use crate::known;
 use tokio::sync::{Notify, mpsc};
 
 /// Keyframes are expensive; ask at most this often. A keyframe takes an RTT
@@ -148,6 +150,9 @@ pub struct Options {
     /// Requests to watch another of the host's monitors, by id.
     pub switch: Option<mpsc::UnboundedReceiver<u8>>,
     pub shared: Arc<Shared>,
+    /// Take a device's key even where it is not the one this viewer saw
+    /// last time under that ID (`known`).
+    pub trust_new_key: bool,
 }
 
 pub async fn run(options: Options) -> Result<()> {
@@ -191,6 +196,10 @@ pub async fn run(options: Options) -> Result<()> {
                     None,
                 ),
             };
+            // The server said which key this device has; this is the
+            // key that answered. Whether it is the one it had last time
+            // is for `known` to say.
+            remember(*id, &conn, options.trust_new_key)?;
             (endpoint, conn, grant)
         }
     };
@@ -791,6 +800,48 @@ async fn prove(
             "the agent cannot prove it knows the password:              something is standing between this viewer and the device",
         )?,
         other => bail!("expected the agent's proof, got {other:?}"),
+    }
+    Ok(())
+}
+
+/// Hold a server to what it said before: the key a device answered with
+/// must be the key it answered with last time. A grant proves the server's
+/// say-so, not the device's, so without this a server that was taken over
+/// could put itself in the middle of a session opened with one
+/// (`docs/security.md`).
+fn remember(id: DeviceId, conn: &Connection, trust_new_key: bool) -> Result<()> {
+    let Some(fingerprint) = nearhand_transport::peer_fingerprint(conn) else {
+        bail!("the device sent no certificate");
+    };
+    let mut known = known::Known::load();
+    match known.check(id, fingerprint) {
+        known::Continuity::Same => return Ok(()),
+        known::Continuity::First => {
+            println!("first time with {id}: its key is {fingerprint}");
+        }
+        known::Continuity::Changed { known: before } if !trust_new_key => {
+            conn.close(close::PROTOCOL.into(), b"another key than last time");
+            bail!(
+                "{id} answered with another key than last time.\n\
+                 \n\
+                 was:  {before}\n\
+                 now:  {fingerprint}\n\
+                 \n\
+                 A device's ID is made from its key, so this is not a \
+                 reinstall — that would change the ID too. Either the \
+                 server introduced another machine, or something is \
+                 standing between this viewer and the device. Check with \
+                 whoever runs the device before going on; --trust-new-key \
+                 takes the new key and remembers it instead."
+            );
+        }
+        known::Continuity::Changed { known: before } => {
+            println!("{id} has a new key: {before} → {fingerprint}");
+        }
+    }
+    if let Err(e) = known.remember(id, fingerprint) {
+        // Worth saying, not worth refusing the session over.
+        tracing::warn!(error = %format!("{e:#}"), "could not write the known devices");
     }
     Ok(())
 }

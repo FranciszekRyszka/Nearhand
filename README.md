@@ -114,7 +114,7 @@ If M0 cannot get under about 80 ms on LAN, the pipeline is revisited before anyt
 
 ## Security
 
-Built in from the start, not added later: Ed25519 device keys, TLS 1.3 between viewer and agent with pinned keys on both sides, passwords proved rather than sent — SPAKE2, tied to the connection, so not even the server that introduced the two can collect them — the relay only ever forwarding ciphertext, outbound-only agent connections, and a visible indicator on the host for every session — there is no hidden mode, ever.
+Built in from the start, not added later: Ed25519 device keys, TLS 1.3 between viewer and agent with pinned keys on both sides, a viewer that remembers which key each device answered with and stops if it changes, passwords proved rather than sent — SPAKE2, tied to the connection, so not even the server that introduced the two can collect them — the relay only ever forwarding ciphertext, outbound-only agent connections, and a visible indicator on the host for every session — there is no hidden mode, ever.
 
 ## Licence
 

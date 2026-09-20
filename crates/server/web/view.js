@@ -65,9 +65,56 @@ async function connect(granted, password) {
     throw new Error("The server answered with another device's key.");
   }
 
+  if (!keyIsTheOneSeenBefore(granted.device_id, link.fingerprint)) {
+    link.close();
+    throw new Error("Stopped: this device answered with another key than last time.");
+  }
+
   viewer = new Viewer(link.fingerprint, granted.grant, password, 60);
   status("Connecting to the device…");
   run(link, viewer, granted);
+}
+
+/// A device's ID is made from its key, but ten digits are not many: a
+/// server willing to grind keys could find another that matches. So this
+/// browser remembers which key each device had, and says so if it changes
+/// — which a reinstall does not do, since that changes the ID too.
+///
+/// Kept per browser, in this console's own storage; losing it costs one
+/// "seen for the first time" per device. Private windows and blocked
+/// storage simply remember nothing.
+function keyIsTheOneSeenBefore(deviceId, fingerprint) {
+  let seen = null;
+  try {
+    seen = localStorage.getItem(`nearhand.device.${deviceId}`);
+  } catch (e) {
+    console.warn("no storage for device keys; not checking", e);
+    return true;
+  }
+  if (seen === null || seen === fingerprint) return true;
+  return window.confirm(
+    [
+      `${deviceId} answered with another key than last time.`,
+      "",
+      `was:  ${seen}`,
+      `now:  ${fingerprint}`,
+      "",
+      "A device's ID is made from its key, so this is not a reinstall — that",
+      "would change the ID too. Either the server introduced another machine,",
+      "or something is standing between this browser and the device.",
+      "",
+      "Connect anyway, and remember the new key?",
+    ].join("\n"),
+  );
+}
+
+/// Write the key down once the device has actually answered with it.
+function rememberKey(deviceId, fingerprint) {
+  try {
+    localStorage.setItem(`nearhand.device.${deviceId}`, fingerprint);
+  } catch (e) {
+    console.warn("could not remember the device's key", e);
+  }
 }
 
 /// Reach the device through the server's relay: over WebTransport where
@@ -190,6 +237,8 @@ function run(link, viewer, granted) {
   const handle = (event) => {
     switch (event.type) {
       case "connected":
+        // It answered with the key the server named: worth remembering.
+        rememberKey(granted.device_id, link.fingerprint);
         status("Connected; waiting to be let in…");
         break;
       case "awaiting":

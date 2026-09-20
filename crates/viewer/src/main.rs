@@ -4,6 +4,7 @@
 //! surrounding UI.
 
 mod direct;
+mod known;
 #[cfg(windows)]
 mod present;
 
@@ -65,6 +66,11 @@ enum Command {
         /// would work: for testing the relay and measuring what it costs.
         #[arg(long)]
         relay_only: bool,
+        /// Connect although the device answers with another key than the
+        /// one this viewer saw under that ID before, and remember the new
+        /// one. Only when you know why it changed.
+        #[arg(long)]
+        trust_new_key: bool,
         #[command(flatten)]
         watch: Watch,
     },
@@ -117,6 +123,7 @@ fn main() -> Result<()> {
             password,
             token,
             relay_only,
+            trust_new_key,
             watch,
         }) => {
             let token = token.or_else(|| {
@@ -136,7 +143,7 @@ fn main() -> Result<()> {
                 route,
                 token,
             };
-            watch_target(target, password, watch)
+            watch_target(target, password, watch, trust_new_key)
         }
         Some(Command::Direct {
             address,
@@ -147,14 +154,19 @@ fn main() -> Result<()> {
                 address,
                 fingerprint,
             };
-            watch_target(target, None, watch)
+            watch_target(target, None, watch, false)
         }
         // No subcommand opens the address book, which needs a server. [M2]
         None => bail!("not implemented: scheduled for M2, see the roadmap in README.md"),
     }
 }
 
-fn watch_target(target: direct::Target, password: Option<String>, watch: Watch) -> Result<()> {
+fn watch_target(
+    target: direct::Target,
+    password: Option<String>,
+    watch: Watch,
+    trust_new_key: bool,
+) -> Result<()> {
     let options = direct::Options {
         target,
         password,
@@ -169,6 +181,7 @@ fn watch_target(target: direct::Target, password: Option<String>, watch: Watch) 
         clipboard: false,
         switch: None,
         shared: Arc::new(Shared::default()),
+        trust_new_key,
     };
     if watch.headless {
         let runtime = tokio::runtime::Runtime::new().context("starting the runtime")?;

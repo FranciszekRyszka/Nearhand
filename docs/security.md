@@ -18,8 +18,9 @@ changing the wire format.
 - Each agent generates an **Ed25519** keypair on first run. The device ID is
   derived from the public key.
 - Viewer ↔ agent is **TLS 1.3 with both sides pinning** the key delivered
-  through the server. A changed key blocks the connection and raises an alert,
-  the way SSH does — it is not a warning the user can click through.
+  through the server. A viewer also remembers the key each device answered
+  with: a different key under the same ID stops the session, the way SSH
+  does, and the native viewer needs `--trust-new-key` to go on.
 - The agent pins the **server key** at install; enrolling does not change
   it.
 
@@ -29,9 +30,22 @@ A device ID is ten digits derived from the device's key. That makes it stable
 without the server storing anything, but it is a name, not a proof. Ten digits
 are about 33 bits, and a malicious server could find another key with the same
 ID in minutes. What the viewer pins is the full fingerprint the server reports,
-so for an attended session the viewer trusts the server to report it
-honestly. The one-time password then decides who gets in, and only the agent
-checks it.
+so on a **first** connection the viewer trusts the server to report it
+honestly. Two things limit what that is worth to a dishonest server. A
+password is proved rather than sent, and the proof is tied to the connection
+it runs on, so a server in the middle gets one guess and learns nothing. And
+a viewer remembers: the key a device answered with is written down the first
+time, and a later session under the same ID with another key stops before it
+starts.
+
+That memory is the viewer's own — `known-devices` beside its settings for the
+native viewer, this console's browser storage for the web one — so a server
+cannot change it. The native viewer refuses and says what changed;
+`--trust-new-key` takes the new key deliberately. The browser asks, and
+refuses if the answer is no. A device that is reinstalled keeps its key, and
+one that loses its key gets a new ID with it, so a changed key under an
+unchanged ID is not something that happens by itself. Losing the file costs
+one "seen for the first time" per device, nothing more.
 
 Someone could also register a key of their own under a device's ID first,
 to keep the device from being found: first come, first served, and the
@@ -279,9 +293,12 @@ runs on, so a server in the middle cannot complete it towards the agent or
 learn anything to use later — it gets one guess per connection, against the
 agent's lockouts. What such a server can still do is refuse, or answer as a
 device that shows nothing: a viewer that types a password into it learns
-that something is wrong, but only after the attempt. A viewer that connects
-with a grant rather than a password is in the same position as before: the
-grant proves the server's say-so, not the device's.
+that something is wrong, but only after the attempt. A viewer that connects with
+a grant rather than a password proves nothing to the device itself — a grant
+is the server's say-so — but such a server still has to answer with the key
+that device answered with before, or the viewer stops (see "What the device
+ID is, and is not"). That leaves a first connection, and machines told to ask
+for a grant *and* the password are out of reach even then.
 
 A **fully compromised management server** can issue itself a grant, and open
 every machine enrolled with it that takes grants alone. Machines installed
