@@ -1,12 +1,12 @@
 [package]
 name = "nearhand-clipboard"
-version = "0.1.0"
+version = "0.2.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
 [dependencies]
-nearhand-core = { version = "0.1.0", path = "../core" }
+nearhand-core = { version = "0.2.0", path = "../core" }
 thiserror = "2.0.20"
 tracing = "0.1.44"
 

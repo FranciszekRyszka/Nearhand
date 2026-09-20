@@ -1,6 +1,6 @@
 [package]
 name = "nearhand-web"
-version = "0.1.0"
+version = "0.2.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -12,7 +12,7 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 bytes = "1"
 js-sys = "0.3.105"
-nearhand-core = { version = "0.1.0", path = "../core" }
+nearhand-core = { version = "0.2.0", path = "../core" }
 postcard = { version = "1", features = ["use-std"] }
 quinn-proto = { version = "0.11.18", default-features = false, features = ["rustls-ring"] }
 ring = "0.17.14"
@@ -26,7 +26,7 @@ web-time = "1"
 workspace = true
 
 [dev-dependencies]
-nearhand-transport = { version = "0.1.0", path = "../transport" }
+nearhand-transport = { version = "0.2.0", path = "../transport" }
 quinn = "0.11.12"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time"] }
 web-time = "1"

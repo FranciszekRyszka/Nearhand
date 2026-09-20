@@ -1,6 +1,6 @@
 [package]
 name = "nearhand-release"
-version = "0.1.0"
+version = "0.2.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -8,8 +8,8 @@ repository.workspace = true
 [dependencies]
 anyhow = "1.0.104"
 clap = { version = "4.6.7", features = ["derive"] }
-nearhand-core = { version = "0.1.0", path = "../core" }
-nearhand-transport = { version = "0.1.0", path = "../transport" }
+nearhand-core = { version = "0.2.0", path = "../core" }
+nearhand-transport = { version = "0.2.0", path = "../transport" }
 
 [lints]
 workspace = true

@@ -2781,7 +2781,7 @@ dependencies = [
 
 [[package]]
 name = "nearhand-agent"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -2806,7 +2806,7 @@ dependencies = [
 
 [[package]]
 name = "nearhand-capture"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "nearhand-core",
  "thiserror 2.0.20",
@@ -2816,7 +2816,7 @@ dependencies = [
 
 [[package]]
 name = "nearhand-clipboard"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "nearhand-core",
  "thiserror 2.0.20",
@@ -2826,7 +2826,7 @@ dependencies = [
 
 [[package]]
 name = "nearhand-codec"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "nearhand-capture",
@@ -2839,7 +2839,7 @@ dependencies = [
 
 [[package]]
 name = "nearhand-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "postcard",
@@ -2849,7 +2849,7 @@ dependencies = [
 
 [[package]]
 name = "nearhand-input"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "nearhand-capture",
  "nearhand-core",
@@ -2859,7 +2859,7 @@ dependencies = [
 
 [[package]]
 name = "nearhand-release"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -2869,7 +2869,7 @@ dependencies = [
 
 [[package]]
 name = "nearhand-server"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "argon2",
@@ -2903,7 +2903,7 @@ dependencies = [
 
 [[package]]
 name = "nearhand-transport"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "nearhand-core",
@@ -2919,7 +2919,7 @@ dependencies = [
 
 [[package]]
 name = "nearhand-viewer"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -2943,7 +2943,7 @@ dependencies = [
 
 [[package]]
 name = "nearhand-web"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "js-sys",
