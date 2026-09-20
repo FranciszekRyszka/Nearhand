@@ -221,6 +221,7 @@ async fn read<T: DeserializeOwned>(recv: &mut web_transport_quinn::RecvStream) -
 mod tests {
     use super::*;
     use crate::rendezvous::serve as serve_quic;
+    use crate::testkit::testing;
     use nearhand_core::rendezvous::DeviceId;
     use nearhand_transport::relay::{endpoint_over, relayed_address};
     use nearhand_transport::rendezvous::{Registration, stay_registered};
@@ -310,7 +311,7 @@ mod tests {
                         echo(relay);
                     }
                 };
-                stay_registered(&agent, server_addr, fp, &identity, events).await
+                stay_registered(&agent, server_addr, fp, &identity, &testing(), events).await
             });
         }
         tokio::time::timeout(Duration::from_secs(5), async {

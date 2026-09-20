@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use nearhand_core::proto::close;
-use nearhand_transport::rendezvous::{Registration, stay_registered};
+use nearhand_transport::rendezvous::{Registration, Running, stay_registered};
 use nearhand_transport::{Fingerprint, Identity, server_endpoint};
 use quinn::Endpoint;
 
@@ -102,9 +102,17 @@ pub(crate) async fn serve(
         }
         Registration::Lost { error, .. } => host.set_server(Server::Unreachable { error }),
     };
+    let running = Running::new(env!("CARGO_PKG_VERSION"));
     tokio::join!(
         crate::accept_viewers(endpoint.clone(), config.clone(), slot.clone()),
-        stay_registered(&endpoint, server, server_fingerprint, &identity, events),
+        stay_registered(
+            &endpoint,
+            server,
+            server_fingerprint,
+            &identity,
+            &running,
+            events,
+        ),
     );
 }
 

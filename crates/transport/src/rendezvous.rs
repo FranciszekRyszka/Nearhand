@@ -62,6 +62,26 @@ pub const PEER_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// when there is no direct path.
 pub const DIRECT_GRACE: Duration = Duration::from_secs(1);
 
+/// What an agent tells the server it is, so a device's entry follows an
+/// agent that updates itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Running {
+    /// Such as `windows x86_64`.
+    pub os: String,
+    pub version: String,
+}
+
+impl Running {
+    /// This platform, and `version` — the caller passes its own crate's,
+    /// since this one's says nothing about the agent.
+    pub fn new(version: &str) -> Self {
+        Self {
+            os: format!("{} {}", std::env::consts::OS, std::env::consts::ARCH),
+            version: version.to_owned(),
+        }
+    }
+}
+
 /// Keep this agent registered with the server, reconnecting whenever the
 /// connection is lost, and open the way to every viewer the server
 /// introduces. Never returns; drop it to stop.
@@ -76,11 +96,21 @@ pub async fn stay_registered(
     server: SocketAddr,
     server_fingerprint: Fingerprint,
     identity: &Identity,
+    running: &Running,
     events: impl Fn(Registration),
 ) {
     let mut wait = RECONNECT_FIRST;
     loop {
-        match register(endpoint, server, server_fingerprint, identity, &events).await {
+        match register(
+            endpoint,
+            server,
+            server_fingerprint,
+            identity,
+            running,
+            &events,
+        )
+        .await
+        {
             // Registered for a while and then lost: reconnect promptly.
             Ok(()) => {
                 tracing::info!("server connection ended; reconnecting");
@@ -117,11 +147,12 @@ async fn register(
     server: SocketAddr,
     server_fingerprint: Fingerprint,
     identity: &Identity,
+    running: &Running,
     events: &impl Fn(Registration),
 ) -> Result<()> {
     let conn = connect_server(endpoint, server, server_fingerprint, Some(identity)).await?;
     let relay = relay::endpoint(conn.clone(), true, Some(peer_server_config(identity)?))?;
-    let result = serve_registration(endpoint, &conn, relay.clone(), events).await;
+    let result = serve_registration(endpoint, &conn, relay.clone(), running, events).await;
     relay.close(close::NORMAL.into(), b"server connection lost");
     result
 }
@@ -130,6 +161,7 @@ async fn serve_registration(
     endpoint: &Endpoint,
     conn: &Connection,
     relay: Endpoint,
+    running: &Running,
     events: &impl Fn(Registration),
 ) -> Result<()> {
     let server = conn.remote_address();
@@ -144,6 +176,16 @@ async fn serve_registration(
         Some(FromServer::Refused(refusal)) => return Err(Error::Refused(refusal)),
         other => return Err(Error::Unexpected(format!("{other:?}"))),
     }
+    // What this agent is now, so its entry in the server's device list
+    // follows an agent that has updated itself.
+    send_message(
+        &mut send,
+        &ToServer::Running {
+            os: running.os.clone(),
+            version: running.version.clone(),
+        },
+    )
+    .await?;
 
     while let Some(message) = recv_message::<FromServer>(&mut recv).await? {
         match message {

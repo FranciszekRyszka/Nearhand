@@ -18,6 +18,8 @@ mod https;
 mod netsim;
 mod releases;
 mod rendezvous;
+#[cfg(test)]
+mod testkit;
 mod totp;
 mod webtransport;
 

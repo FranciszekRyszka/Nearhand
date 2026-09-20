@@ -148,6 +148,14 @@ pub enum ToServer {
     },
     /// After `Offered` with a release: send its package.
     Fetch,
+    /// From an agent on its registration stream, once registered: what it
+    /// is running now. A device's list entry follows it, so an agent that
+    /// updated itself is listed as what it became.
+    ///
+    /// A server older than the agent does not know this message and will
+    /// drop the connection, so a server is upgraded before its agents —
+    /// which is the order anyway, since agents take their updates from it.
+    Running { os: String, version: String },
 }
 
 /// What an agent sends to enroll.

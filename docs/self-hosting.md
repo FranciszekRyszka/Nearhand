@@ -222,8 +222,9 @@ turned on per user; wrong passwords are limited per address and per name.
 ## Enrollment
 
 Enrolled machines make up the server's device list: their names, groups,
-operating system and agent version, whether they are online now, and when
-and from where they were last seen. An administrator makes an enrollment
+operating system and agent version — which follows an agent that updates
+itself, since each one says what it is running every time it registers —
+whether they are online now, and when and from where they were last seen. An administrator makes an enrollment
 token — for one device or any number, lasting 1 to 90 days, optionally
 putting devices into a group:
 

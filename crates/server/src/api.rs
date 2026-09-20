@@ -1394,6 +1394,7 @@ async fn audit_log(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testkit::testing;
     use axum::body::Body;
     use axum::extract::connect_info::MockConnectInfo;
     use axum::http::Request;
@@ -2386,6 +2387,7 @@ mod tests {
                     quic_addr,
                     server_identity.fingerprint(),
                     &agent,
+                    &testing(),
                     events,
                 )
                 .await;

@@ -445,6 +445,18 @@ impl Devices {
 
     /// Note that the device with this certificate is here now, from `from`;
     /// nothing if it is not enrolled.
+    /// Record what a device is running now, as its agent reports on every
+    /// registration. Nothing to do for a device that is not enrolled.
+    pub async fn running(&self, fingerprint: &Fingerprint, os: &str, version: &str) -> Result<()> {
+        sqlx::query("UPDATE devices SET os = ?, version = ? WHERE fingerprint = ?")
+            .bind(reported(os, "unknown"))
+            .bind(reported(version, "unknown"))
+            .bind(fingerprint.as_bytes().as_slice())
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     pub async fn seen(&self, fingerprint: &Fingerprint, from: SocketAddr) -> Result<()> {
         sqlx::query("UPDATE devices SET last_seen_at = ?, last_address = ? WHERE fingerprint = ?")
             .bind(now())

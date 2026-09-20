@@ -93,6 +93,12 @@ agent            server             viewer
   `Enrolled { id }` or `Refused(Enrollment)`. That records the device in the
   server's list; it registers as above either way. An enrolled device takes
   its ID from another key holding it.
+* An agent follows `Register` with `Running { os, version }` on the same
+  stream. A managed device's entry in the server's list follows it, so a
+  device that updated itself is listed as what it became. A server older
+  than the agent does not know the message and drops the connection, so a
+  server is upgraded before its agents — which is the order anyway, since
+  agents take their updates from it.
 * An installed agent asks for updates the same way, with its certificate:
   `Update { product, platform, version }` ──▶, answered by `Offered(None)`,
   or `Offered(Some(signed release))` when the server's administrators offer

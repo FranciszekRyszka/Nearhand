@@ -173,7 +173,7 @@ async fn handle(conn: Connection, registry: &Registry) -> Result<()> {
         Some(ToServer::Register { addresses }) => {
             let registered = register(&conn, send, registry, addresses).await?;
             // An agent's stream carries its answers until it goes away.
-            let result = serve_agent(&mut recv, &registered).await;
+            let result = serve_agent(&mut recv, &registered, registry).await;
             registry.remove(&registered, &conn).await;
             result
         }
@@ -303,11 +303,27 @@ async fn register(
     })
 }
 
-async fn serve_agent(recv: &mut quinn::RecvStream, registered: &Registered) -> Result<()> {
+async fn serve_agent(
+    recv: &mut quinn::RecvStream,
+    registered: &Registered,
+    registry: &Registry,
+) -> Result<()> {
     while let Some(message) = recv_message::<ToServer>(recv).await? {
         let (session, ready) = match message {
             ToServer::Ready { session } => (session, true),
             ToServer::Decline { session } => (session, false),
+            // What it is running now: a managed device's entry follows it,
+            // so one that updated itself is listed as what it became.
+            ToServer::Running { os, version } => {
+                if let Some(devices) = &registry.devices
+                    && let Err(e) = devices
+                        .running(&registered.fingerprint, &os, &version)
+                        .await
+                {
+                    tracing::warn!(error = %e, "could not record what an agent runs");
+                }
+                continue;
+            }
             other => bail!("unexpected from an agent: {other:?}"),
         };
         if let Some(viewer) = lock(&registered.waiting).remove(&session) {
@@ -800,6 +816,7 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testkit::testing;
 
     #[test]
     fn candidates_drop_nonsense_and_repeats_and_add_the_observed() {
@@ -920,7 +937,7 @@ mod tests {
             let agent = agent.clone();
             let identity = identity.clone();
             tokio::spawn(async move {
-                stay_registered(&agent, server_addr, fp, &identity, |_| {}).await
+                stay_registered(&agent, server_addr, fp, &identity, &testing(), |_| {}).await
             });
         }
         {
@@ -994,7 +1011,7 @@ mod tests {
     async fn agents_enroll_with_a_token_and_are_seen_when_they_register() {
         use crate::accounts::Accounts;
         use nearhand_core::rendezvous::Enrollment;
-        use nearhand_transport::rendezvous::enroll;
+        use nearhand_transport::rendezvous::{Running, enroll};
         use nearhand_transport::{Error, rendezvous_endpoint, server_endpoint};
 
         let pool = crate::db::in_memory().await;
@@ -1044,11 +1061,18 @@ mod tests {
         assert_eq!(listed[0].fingerprint, identity.fingerprint().to_string());
         assert!(registry.online(&identity.fingerprint()).is_none());
 
+        // Enrolled as 0.1.0 above; this one runs something newer, as an
+        // agent that has updated itself does.
+        let running = Running {
+            os: "windows x86_64".into(),
+            version: "9.9.9".into(),
+        };
         let registering = {
             let agent = agent.clone();
             let identity = identity.clone();
+            let running = running.clone();
             tokio::spawn(async move {
-                stay_registered(&agent, server_addr, fp, &identity, |_| {}).await
+                stay_registered(&agent, server_addr, fp, &identity, &running, |_| {}).await
             })
         };
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -1059,6 +1083,19 @@ mod tests {
         .await
         .expect("the agent registers");
         assert!(lock(&registry.agents)[&id].enrolled);
+
+        // The device list follows what it is running now.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let listed = devices.devices().await.expect("devices");
+                if listed[0].version == running.version {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the version follows the agent");
         registering.abort();
         server.close(0u32.into(), b"done");
     }
@@ -1276,7 +1313,15 @@ mod tests {
                             echo(relay);
                         }
                     };
-                    stay_registered(&agent, server_addr, server_fp, &agent_identity, events).await
+                    stay_registered(
+                        &agent,
+                        server_addr,
+                        server_fp,
+                        &agent_identity,
+                        &testing(),
+                        events,
+                    )
+                    .await
                 });
             } else {
                 tokio::spawn(register_without_punching(
