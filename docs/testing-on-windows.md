@@ -255,6 +255,20 @@ Then grants, with the VM enrolled into a device group (make the token with
   on the host; copy on the host and click the picture: it pastes in the
   VM.
 
+## Updates
+
+With a newer MSI built and signed (`nearhand-release sign --version <newer>
+<msi>`, which needs the release key) and uploaded to the test server:
+
+* `POST /api/v1/releases/<id>/offer`, then wait for the VM's agent to ask —
+  or restart the service to make it ask five minutes later.
+* `%ProgramData%\Nearhand\logs\agent.log` says "fetching an update" and
+  "installing the update"; `update.log` is the installer's own.
+* Afterwards *Installed apps* shows the new version, the service is running
+  again, and the device's version in the console is the new one.
+* With a session open from the viewer, the update waits: the log says so,
+  and nothing is installed until the session ends.
+
 ## Also worth checking while the VM is up
 
 M2 has not yet been tested across two real networks. With the VM on a NAT

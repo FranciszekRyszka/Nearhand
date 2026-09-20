@@ -26,6 +26,7 @@ mod service;
 mod session;
 mod setup;
 mod unattended;
+mod update;
 mod window;
 
 use std::net::SocketAddr;

@@ -279,6 +279,37 @@ and lets the viewer in with the grant's role, without asking the server. See
 [security](security.md#authorisation) for what that trusts the server
 with.
 
+## Updating agents
+
+Installed agents update themselves from **this** server, and from nowhere
+else. They install only a package that the project's release key signed,
+whose hash matches, and whose version is newer than the one they run — so
+you choose when your machines update, and to which release, and a server
+can do no more to them than that ([security](security.md#supply-chain)).
+
+Every Nearhand release comes as an MSI with a `.release` file beside it,
+both from the project's CI. Upload the pair, then offer it:
+
+```bash
+api() { curl -s "https://desk.example.com/api/v1$1" -H "authorization: Bearer $ADMIN" "${@:2}"; }
+api /releases -F package=@nearhand-agent-0.2.0-x64.msi \
+              -F signature=@nearhand-agent-0.2.0-x64.msi.release   # → id 1
+api /releases/1/offer -X POST        # from now on, agents older than 0.2.0 take it
+api /releases/1/offer -X DELETE      # stop offering it; those already updated stay
+```
+
+One release is offered per product and platform. Agents ask a few minutes
+after starting and every six hours after that, and install only when no
+session is running, so nobody is cut off mid-session; the machine's service
+restarts as the installer replaces it. `%ProgramData%\Nearhand\logs` holds
+the agent's log and the installer's `update.log`.
+
+A machine that should not update itself — one on a change-controlled
+rollout — takes `updates = false` in its `agent.toml`.
+
+`nearhand-release verify nearhand-agent-0.2.0-x64.msi` checks a package
+against the release key before you upload it.
+
 ## Backup
 
 The data folder: the SQLite file (`nearhand.db`, with its `-wal` file while

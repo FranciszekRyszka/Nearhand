@@ -19,7 +19,7 @@ nearhand-transport = { version = "0.1.0", path = "../transport" }
 quinn = "0.11.12"
 ring = "0.17.14"
 serde = "1.0.229"
-tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal"] }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "fs", "time", "sync", "signal"] }
 toml = "1.1.6"
 tracing = "0.1.44"
 tracing-subscriber = "0.3.23"

@@ -73,6 +73,7 @@ pub fn configure(options: Install) -> Result<Identity> {
         access,
         managed: enrollment.is_some(),
         enrollment,
+        updates: true,
     };
     config.save(&dir)?;
     let identity =

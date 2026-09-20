@@ -10,6 +10,7 @@
 //!                                  an enrollment token not yet used
 //!     device.key                   the device's Ed25519 key: its ID
 //!     logs\                        the service's and the agent's logs
+//!     updates\                     packages downloaded to update with
 //! ```
 
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
@@ -55,6 +56,11 @@ pub fn log_dir(dir: &Path) -> PathBuf {
     dir.join("logs")
 }
 
+/// Where update packages are downloaded (`crate::update`).
+pub fn updates_dir(dir: &Path) -> PathBuf {
+    dir.join("updates")
+}
+
 /// `agent.toml`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Config {
@@ -74,6 +80,14 @@ pub struct Config {
     /// agent does it when it can, and then forgets the token.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enrollment: Option<Enrollment>,
+    /// Install newer releases this machine's own server offers, signed by
+    /// the project's release key (`crate::update`). On unless set false.
+    #[serde(default = "yes")]
+    pub updates: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -254,6 +268,7 @@ mod tests {
                 name: None,
             }),
             managed: true,
+            updates: true,
         }
     }
 

@@ -11,6 +11,9 @@
 //!
 //! An enrollment token that installing could not use yet is used here, once
 //! the server can be reached (`enroll`).
+//!
+//! It also updates itself from that server, unless `agent.toml` says not to
+//! (`update`).
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -62,6 +65,13 @@ pub fn run(dir: PathBuf, stop_event: Option<String>) -> Result<()> {
             .then(|| Arc::new(Grants::new(server_fingerprint, identity.fingerprint()))),
         host: Some(host.clone()),
     });
+    let updates = config
+        .updates
+        .then(|| Identity::load_or_create(&key).context("loading the device key"));
+    let updates = match updates {
+        Some(identity) => Some(identity?),
+        None => None,
+    };
     let pending = match config.enrollment {
         // A second copy of the key, for enrolling alongside.
         Some(pending) => Some((
@@ -90,6 +100,21 @@ pub fn run(dir: PathBuf, stop_event: Option<String>) -> Result<()> {
                     }
                 };
             *opened.lock().unwrap_or_else(|p| p.into_inner()) = Some(endpoint.clone());
+            if let Some(identity) = updates {
+                let endpoint = endpoint.clone();
+                let host = host.clone();
+                tokio::spawn(crate::update::keep_updated(crate::update::Updates {
+                    endpoint,
+                    server,
+                    server_fingerprint,
+                    identity,
+                    dir: machine::updates_dir(&dir),
+                    log: machine::log_dir(&dir).join("update.log"),
+                    host,
+                    key: nearhand_core::release::KEY,
+                    installer: None,
+                }));
+            }
             if let Some((pending, identity)) = pending {
                 let endpoint = endpoint.clone();
                 tokio::spawn(async move {
