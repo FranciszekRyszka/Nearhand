@@ -363,9 +363,23 @@ browser viewer, grants and clocks, and updates that do not arrive.
 
 ## Backup
 
-The data folder: the SQLite file (`nearhand.db`, with its `-wal` file while
-the server runs — or stop it first, or use `sqlite3 nearhand.db ".backup
-copy.db"`) and the server key. That is the whole backup.
+```bash
+nearhand-server backup /backups/nearhand-$(date +%F)
+```
 
-**Losing the server key means re-enrolling every device**, because agents pin it.
-Back it up somewhere other than the server.
+It writes the two things that cannot be rebuilt — the **server key** and
+the **database** — into a folder that must not exist yet, and the
+self-signed HTTPS certificate with them. The server can keep serving
+throughout: the database is copied with SQLite's `VACUUM INTO`, which takes
+a consistent snapshot including whatever is still in the write-ahead log. A
+plain `cp` of `nearhand.db` while the server runs can be short of the most
+recent writes, or torn.
+
+Release packages are not copied: they are large, and they can be
+downloaded from the project's releases again.
+
+To restore, stop the server, put the files back in the data folder, and
+start it. In Docker, that folder is the volume mounted at `/data`.
+
+**Losing the server key means installing every agent again**, because they
+pin it. Keep the backup somewhere other than the server.

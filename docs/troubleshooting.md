@@ -158,6 +158,9 @@ a server that is serving.
   and lasts 24 hours; `nearhand-server admin-link` prints another.
 - **In Docker.** The data folder is `/data`; keep it on a volume, because
   it holds the server key — losing it means reconfiguring every agent.
+  `nearhand-server backup /data/backups/<date>` takes a copy of the key and
+  the database while the server runs; the image has no shell, so this is
+  the way to get one out of it.
 
 ## What to send when asking for help
 

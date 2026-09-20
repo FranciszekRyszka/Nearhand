@@ -61,6 +61,10 @@ how agents get to this version.
 - `nearhand-server doctor` — the data folder, the key's fingerprint, the
   database, the certificate, both ports, and whether agents are told an
   address they could use. It changes nothing.
+- `nearhand-server backup <folder>` — the server key and a consistent copy
+  of the database, taken while the server serves. The distroless image has
+  no shell to run `sqlite3` in, and a plain copy of a database in WAL mode
+  can be short of the most recent writes.
 - [docs/troubleshooting.md](docs/troubleshooting.md).
 
 ### Fixed

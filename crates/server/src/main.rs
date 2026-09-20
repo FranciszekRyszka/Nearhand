@@ -8,6 +8,7 @@
 mod accounts;
 mod api;
 mod audit;
+mod backup;
 mod config;
 mod console;
 mod db;
@@ -78,6 +79,12 @@ enum Command {
     /// Look at this server without changing it: its key's fingerprint, the
     /// data folder, the database, the certificate and the two ports.
     Doctor,
+    /// Copy what cannot be rebuilt — the server key and the database — into
+    /// a folder, while the server keeps running.
+    Backup {
+        /// Where to put it; it must not exist yet.
+        to: PathBuf,
+    },
     /// Print a new one-time link for creating the first administrator.
     AdminLink,
 }
@@ -110,6 +117,7 @@ fn main() -> Result<()> {
             Ok(())
         }),
         Command::Doctor => runtime.block_on(doctor::run(config, &cli.config)),
+        Command::Backup { to } => runtime.block_on(backup::run(config, to)),
         Command::AdminLink => runtime.block_on(async {
             prepare_data_dir(&config)?;
             let accounts = Accounts::new(db::open(&config.database_path()).await?);
