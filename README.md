@@ -56,6 +56,8 @@ One Cargo workspace:
 - [docs/security.md](docs/security.md) — threat model
 - [docs/self-hosting.md](docs/self-hosting.md) — running your own server
 - [docs/performance.md](docs/performance.md) — latency measurements and how they were taken
+- [docs/api.md](docs/api.md) — the REST API the console is built on
+- [docs/releasing.md](docs/releasing.md) — how a release is built and signed
 
 ## Building
 

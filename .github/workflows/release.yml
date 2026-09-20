@@ -1,0 +1,220 @@
+name: Release
+
+# Tag a commit `v<version>` and push it: this builds what a release is
+# made of, signs the agent's installer with the project's release key, and
+# leaves a draft release to look over before it goes out.
+#
+#   git tag v0.2.0 && git push origin v0.2.0
+#
+# The tag must match the agent's version in its Cargo.toml.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: The tag to build, for a rehearsal
+        required: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  # The tag says what this is; the crate says what it built. They must agree,
+  # because agents compare versions to decide whether to update.
+  version:
+    name: version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+      - id: check
+        run: |
+          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          version="$(sed -n 's/^version = "\(.*\)"$/\1/p' crates/agent/Cargo.toml | head -n 1)"
+          if [ "$tag" != "v$version" ]; then
+            echo "the tag is $tag, the agent is $version" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  # The agent's installer, without an Authenticode signature until there is
+  # a code-signing certificate.
+  msi:
+    name: agent MSI
+    needs: version
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: |
+          dotnet tool install --global wix --version 5.0.2
+          wix extension add -g WixToolset.Util.wixext/5.0.2
+      - run: ./packaging/windows/build-msi.ps1
+        shell: pwsh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: msi
+          path: target/release/nearhand-agent-*-x64.msi
+          if-no-files-found: error
+
+  # The release signature agents check before they update. The key reaches
+  # only the step that signs, after everything is built.
+  sign:
+    name: sign the MSI
+    needs: [version, msi]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked -p nearhand-release
+      - uses: actions/download-artifact@v4
+        with:
+          name: msi
+          path: out
+      - name: sign
+        env:
+          NEARHAND_RELEASE_KEY: ${{ secrets.NEARHAND_RELEASE_KEY }}
+        run: |
+          for msi in out/*.msi; do
+            target/release/nearhand-release sign --version "${{ needs.version.outputs.version }}" "$msi"
+          done
+      # Against the key built into agents: a wrong secret fails here.
+      - run: for msi in out/*.msi; do target/release/nearhand-release verify "$msi"; done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: signed
+          path: out/
+          if-no-files-found: error
+
+  # The binaries people run by hand: the server, the viewer, the portable
+  # agent. The server carries the web viewer, so its build needs the wasm
+  # toolchain.
+  binaries:
+    name: binaries (${{ matrix.os }})
+    needs: version
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            rustflags: -C target-feature=+crt-static
+            archive: nearhand-windows-x86_64.zip
+          - os: ubuntu-latest
+            rustflags: ""
+            archive: nearhand-linux-x86_64.tar.gz
+    env:
+      RUSTFLAGS: ${{ matrix.rustflags }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - name: the web viewer, for the server to serve
+        shell: bash
+        run: |
+          version="$(awk '/^name = "wasm-bindgen"$/ { getline; gsub(/[^0-9.]/, ""); print }' Cargo.lock)"
+          cargo install wasm-bindgen-cli --version "$version" --locked
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends clang llvm
+          fi
+          sh packaging/web/build.sh
+      - name: the server, the viewer and the agent
+        shell: bash
+        run: |
+          # The viewer and the agent are Windows-only until M4.
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cargo build --release --locked -p nearhand-server -p nearhand-viewer -p nearhand-agent
+          else
+            cargo build --release --locked -p nearhand-server
+          fi
+      - name: pack
+        shell: bash
+        run: |
+          mkdir -p out
+          cd target/release
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            7z a "../../out/${{ matrix.archive }}" nearhand-server.exe nearhand-viewer.exe nearhand-agent.exe
+          else
+            tar czf "../../out/${{ matrix.archive }}" nearhand-server
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binaries-${{ runner.os }}
+          path: out/
+          if-no-files-found: error
+
+  # The server's image, on this repository's registry.
+  image:
+    name: server image
+    needs: version
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: packaging/docker/Dockerfile
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/nearhand-server:${{ needs.version.outputs.version }}
+            ghcr.io/${{ github.repository_owner }}/nearhand-server:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # Everything together, as a draft: look it over, then publish it.
+  publish:
+    name: draft the release
+    needs: [version, sign, binaries, image]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: gather
+        run: |
+          mkdir -p release
+          find artifacts -type f -exec cp {} release/ \;
+          cd release
+          sha256sum * > SHA256SUMS
+          ls -l
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "v${{ needs.version.outputs.version }}" release/* \
+            --draft --prerelease \
+            --title "Nearhand ${{ needs.version.outputs.version }}" \
+            --notes-file - <<'NOTES'
+          Pre-alpha. Windows only; see the README for what works.
+
+          * `nearhand-agent-*-x64.msi` and its `.release` — the agent's
+            installer and the signature agents check before updating to it.
+            Upload both to your server's **Agent updates**.
+          * `nearhand-windows-x86_64.zip` — the server, the viewer and the
+            portable agent, to run by hand.
+          * `nearhand-linux-x86_64.tar.gz` — the server.
+          * The server's image: `ghcr.io/${{ github.repository_owner }}/nearhand-server:${{ needs.version.outputs.version }}`.
+
+          The MSI has no Authenticode signature yet, so Windows warns before
+          running it. `SHA256SUMS` covers everything here.
+          NOTES

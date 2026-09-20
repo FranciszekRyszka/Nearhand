@@ -294,9 +294,9 @@ you choose when your machines update, and to which release, and a server
 can do no more to them than that ([security](security.md#supply-chain)).
 
 Every Nearhand release comes as an MSI with a `.release` file beside it,
-both from the project's CI. Upload the pair in the console's **Agent
-updates**, and press **Offer**; it says how many devices are still older.
-The same over the API:
+both from the project's own build ([how they are made](releasing.md)).
+Upload the pair in the console's **Agent updates**, and press **Offer**; it
+says how many devices are still older. The same over the API:
 
 ```bash
 api() { curl -s "https://desk.example.com/api/v1$1" -H "authorization: Bearer $ADMIN" "${@:2}"; }
