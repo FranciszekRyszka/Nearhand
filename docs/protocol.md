@@ -28,8 +28,18 @@ choosing QUIC:
 The browser viewer runs this same connection, byte for byte, inside a
 WebTransport session with the server: a browser cannot open raw QUIC or
 punch holes, so it always takes the relay, and its session's datagrams are
-the tunnel (see *The relay* below). A WebSocket fallback, for browsers or
-networks without WebTransport, is not built yet.
+the tunnel (see *The relay* below).
+
+Where WebTransport is not there — a browser without it, or a network that
+blocks UDP — the page carries the same tunnel over a WebSocket to
+`/api/v1/relay` on the console's own port instead, and says so beside the
+frame rate. The first message asks to be introduced (`ToServer::Connect`),
+the answer comes back as one message, and every message after that is one
+packet of the session, exactly as a datagram would be. The signed-in
+account and the console's origin are what the server checks before it
+opens the tunnel; what runs inside it is still end-to-end encrypted to the
+agent's key. TCP retransmits, so a lost packet holds up the ones behind
+it: video is smoother over WebTransport where it works.
 
 ## Finding a device: the server
 

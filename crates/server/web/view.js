@@ -2,9 +2,11 @@
 //
 // The session with the agent is Rust compiled to WebAssembly (`Viewer`):
 // the same QUIC connection a native viewer makes, end-to-end encrypted to
-// the agent's key. This page carries its packets over WebTransport through
-// the server's relay, decodes the video with WebCodecs, draws it, and
-// sends the keyboard and mouse over the picture back.
+// the agent's key. This page carries its packets through the server's
+// relay — over WebTransport where the browser and the network have it,
+// else over a WebSocket on the console's own port — decodes the video with
+// WebCodecs, draws it, and sends the keyboard and mouse over the picture
+// back.
 //
 // Keys go by position (`KeyboardEvent.code`), so the device's own layout
 // applies. What the browser keeps for itself — Ctrl+W, Ctrl+T, Alt+Tab —
@@ -34,13 +36,13 @@ async function api(method, path) {
 const hexBytes = (hex) => new Uint8Array(hex.match(/../g).map((b) => parseInt(b, 16)));
 
 let viewer = null;
-let transport = null;
+let link = null;
 
 async function main() {
   const device = new URLSearchParams(location.search).get("device");
   if (!device) throw new Error("No device given: open the viewer from the console's device list.");
-  if (!("WebTransport" in window) || !("VideoDecoder" in window)) {
-    throw new Error("This browser lacks WebTransport or WebCodecs; use a current Chrome, Edge or Firefox, or the native viewer.");
+  if (!("VideoDecoder" in window)) {
+    throw new Error("This browser lacks WebCodecs; use a current Chrome, Edge or Firefox, or the native viewer.");
   }
   status("Loading…");
   await init();
@@ -48,25 +50,45 @@ async function main() {
   status("Asking the server for access…");
   const granted = await api("POST", `/devices/${encodeURIComponent(device)}/grant`);
   $("device").textContent = `${granted.device_id} · ${granted.role}`;
-  const web = await api("GET", "/webtransport");
 
   status("Reaching the device…");
-  transport = new WebTransport(web.url, {
+  link = await reach(granted.device_id);
+  // The server names the key; the grant says which one it must be.
+  if (link.fingerprint !== granted.fingerprint) {
+    link.close();
+    throw new Error("The server answered with another device's key.");
+  }
+
+  viewer = new Viewer(link.fingerprint, granted.grant, undefined, 60);
+  status("Connecting to the device…");
+  run(link, viewer, granted.role);
+}
+
+/// Reach the device through the server's relay: over WebTransport where
+/// that works, else over a WebSocket, which any browser and any network
+/// that reaches the console can carry.
+///
+/// `?transport=tcp` asks for the WebSocket straight away, for testing.
+async function reach(deviceId) {
+  const asked = new URLSearchParams(location.search).get("transport");
+  if (asked !== "tcp" && "WebTransport" in window) {
+    try {
+      return await overWebTransport(deviceId);
+    } catch (e) {
+      // UDP blocked, or the certificate refused: TCP still goes.
+      console.warn("WebTransport did not work; falling back to TCP", e);
+      status("Reaching the device over TCP…");
+    }
+  }
+  return await overWebSocket(deviceId);
+}
+
+async function overWebTransport(deviceId) {
+  const web = await api("GET", "/webtransport");
+  const transport = new WebTransport(web.url, {
     serverCertificateHashes: web.certificate_hashes.map((h) => ({ algorithm: "sha-256", value: hexBytes(h) })),
   });
   await transport.ready;
-  const fingerprint = await introduce(transport, granted.device_id);
-  // The server names the key; the grant says which one it must be.
-  if (fingerprint !== granted.fingerprint) throw new Error("The server answered with another device's key.");
-
-  viewer = new Viewer(fingerprint, granted.grant, undefined, 60);
-  status("Connecting to the device…");
-  run(transport, viewer, granted.role);
-}
-
-/// Ask the server to introduce this browser to the device; its key's
-/// fingerprint, once the device has opened its way.
-async function introduce(transport, deviceId) {
   const stream = await transport.createBidirectionalStream();
   const writer = stream.writable.getWriter();
   await writer.write(introduction_request(deviceId));
@@ -78,17 +100,65 @@ async function introduce(transport, deviceId) {
     if (done) break;
     parts.push(value);
   }
+  const fingerprint = introduction_answer(join(parts));
+  const datagrams = transport.datagrams.writable.getWriter();
+  return {
+    over: "WebTransport",
+    fingerprint,
+    send: (packet) => datagrams.write(packet).catch(() => {}),
+    onPacket: (take) => {
+      (async () => {
+        const reader = transport.datagrams.readable.getReader();
+        for (;;) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          take(value);
+        }
+      })().catch(() => {});
+    },
+    close: () => transport.close(),
+    closed: transport.closed,
+  };
+}
+
+async function overWebSocket(deviceId) {
+  const url = new URL("/api/v1/relay", location.href);
+  url.protocol = url.protocol === "http:" ? "ws:" : "wss:";
+  const socket = new WebSocket(url);
+  socket.binaryType = "arraybuffer";
+  const answer = new Promise((resolve, reject) => {
+    socket.addEventListener("open", () => socket.send(introduction_request(deviceId)), { once: true });
+    socket.addEventListener("message", (event) => resolve(new Uint8Array(event.data)), { once: true });
+    socket.addEventListener("error", () => reject(new Error("the server did not take the connection")), { once: true });
+    socket.addEventListener("close", () => reject(new Error("the server closed the connection")), { once: true });
+  });
+  const fingerprint = introduction_answer(await answer);
+  return {
+    over: "TCP",
+    fingerprint,
+    send: (packet) => {
+      if (socket.readyState === WebSocket.OPEN) socket.send(packet);
+    },
+    onPacket: (take) => {
+      socket.addEventListener("message", (event) => take(new Uint8Array(event.data)));
+    },
+    close: () => socket.close(),
+    closed: new Promise((resolve) => socket.addEventListener("close", resolve, { once: true })),
+  };
+}
+
+/// One buffer from the parts of a stream.
+function join(parts) {
   const whole = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
   let at = 0;
   for (const p of parts) {
     whole.set(p, at);
     at += p.length;
   }
-  return introduction_answer(whole);
+  return whole;
 }
 
-function run(transport, viewer, role) {
-  const writer = transport.datagrams.writable.getWriter();
+function run(link, viewer, role) {
   const decoder = new Decoder(viewer);
   const clipboard = new ClipboardSync(viewer);
   let timer = null;
@@ -97,7 +167,7 @@ function run(transport, viewer, role) {
 
   const pump = () => {
     let packet;
-    while ((packet = viewer.transmit())) writer.write(packet).catch(() => {});
+    while ((packet = viewer.transmit())) link.send(packet);
     let event;
     while ((event = viewer.event())) handle(event);
     clearTimeout(timer);
@@ -139,28 +209,26 @@ function run(transport, viewer, role) {
         closed = true;
         status(event.reason, !/ended/.test(event.reason));
         $("screen").hidden = true;
-        transport.close();
+        link.close();
         break;
     }
   };
 
-  (async () => {
-    const reader = transport.datagrams.readable.getReader();
-    for (;;) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      viewer.receive(value);
-      pump();
-    }
-  })().catch(() => {});
+  link.onPacket((packet) => {
+    viewer.receive(packet);
+    pump();
+  });
 
-  transport.closed
+  link.closed
     .then(() => !closed && status("The server ended the session.", true))
     .catch((e) => !closed && status(`Connection lost: ${e.message}`, true));
 
+  // The way in is worth seeing: TCP means UDP did not get through, and
+  // costs some smoothness on a lossy link.
+  const over = link.over === "TCP" ? " · over TCP" : "";
   setInterval(() => {
     if (closed) return;
-    $("stats").textContent = `${frames} fps · ${viewer.rtt_ms().toFixed(0)} ms round trip`;
+    $("stats").textContent = `${frames} fps · ${viewer.rtt_ms().toFixed(0)} ms round trip${over}`;
     frames = 0;
   }, 1000);
 
@@ -397,5 +465,5 @@ class Decoder {
 
 main().catch((e) => {
   status(e.message || String(e), true);
-  if (transport) transport.close();
+  if (link) link.close();
 });

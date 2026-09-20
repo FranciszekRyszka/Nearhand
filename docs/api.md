@@ -56,6 +56,7 @@ Errors are `{"error": "..."}` with a fitting status code.
 | `POST /grants` | administrators | `{user_group_id, device_group_id, role}`, role `view`, `control` or `full`; sets the role if the two have a grant already |
 | `DELETE /grants/{id}` | administrators | deletes one |
 | `POST /devices/{id}/grant` | signed in | a grant for the caller on that device, for the web viewer: `{device_id, fingerprint, role, grant}`, `grant` the signed grant in hex; 404 without one |
+| `GET /relay` | signed in | a WebSocket, from the console's own origin: the web viewer's session when WebTransport or UDP is not there. The first message asks to be introduced (`Connect`), the answer comes back as one message, and every message after that is one packet of the session |
 | `GET /webtransport` | signed in | `{url, certificate_hashes}`: where the web viewer's WebTransport goes, and the SHA-256 (hex) of the certificate to accept when it is self-signed |
 | `GET /audit?before=&limit=` | administrators | newest first, `limit` up to 500 (100 unless given); `before`, an entry's id, pages back: `{id, at, actor, address, action, target, detail}` |
 | `GET /releases` | administrators | agent releases held: `{id, product, platform, version, package, sha256, size, uploaded_at, offered}` |

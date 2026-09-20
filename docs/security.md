@@ -134,6 +134,10 @@ account (M5).
     a viewer's connection and the agent it was introduced to, once that agent
     has said it is ready. The pairing is the ticket; a relay on a separate
     host, which cannot see the pairing, will need a signed one.
+  - *Implemented:* a browser that cannot use UDP takes the same relay over a
+    WebSocket (`/api/v1/relay`). That one is opened only for a signed-in
+    account, and only from the console's own origin, so another site cannot
+    tunnel through this server with a visitor's cookie.
   - *Not yet:* limits on how much one session may relay. Only an agent that
     accepted the session can receive its traffic, but a server open to
     everyone carries whatever that pair sends.
@@ -177,7 +181,8 @@ account (M5).
   them), and what happens inside any session.
 - The **web viewer** runs the same session as the native one, compiled to
   WebAssembly: QUIC and TLS 1.3 to the agent, pinned to its fingerprint,
-  carried in WebTransport datagrams through the relay, which sees only
+  carried in WebTransport datagrams — or, where UDP does not get through,
+  in WebSocket messages — through the relay, which sees only
   ciphertext. The page checks that the fingerprint the server introduces is
   the one in the grant the API issued, and the agent checks the grant as
   for any viewer. Its page may compile WebAssembly (`'wasm-unsafe-eval'`,

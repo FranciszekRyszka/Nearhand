@@ -184,8 +184,14 @@ Beside each device a user has a grant for, and which is online, the console
 shows **View**: the device in the browser tab, in current Chrome, Edge or
 Firefox, to watch — or, with a `control` or `full` grant, to use. It runs
 the same session as the native viewer, end-to-end encrypted to the agent,
-carried over WebTransport on the QUIC port through the server's relay — so
-it works wherever the console does, as long as UDP reaches the QUIC port.
+carried over WebTransport on the QUIC port through the server's relay.
+
+Where WebTransport is not there — Safari, or a network that lets nothing
+but TCP out — the page falls back to a WebSocket on the console's own
+port, and says "over TCP" beside the frame rate. So the viewer works
+wherever the console does. It is the slower way on a lossy link, since TCP
+holds packets up until it has resent what was lost; where UDP gets
+through, WebTransport is used.
 
 - Click the picture to type into it. Keys go by position, so the device's
   own layout applies. **Ctrl+Alt+Del** is a button (or Ctrl+Alt+End).

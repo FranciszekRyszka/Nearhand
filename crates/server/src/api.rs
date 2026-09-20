@@ -20,6 +20,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::ops::Deref;
 use std::sync::Arc;
 
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{
     ConnectInfo, DefaultBodyLimit, FromRequestParts, Multipart, Path, Query, State,
 };
@@ -29,9 +30,13 @@ use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, patch, post, put};
 use axum::{Json, Router};
+use bytes::Bytes;
+use nearhand_core::rendezvous::{FromServer, Refusal, ToServer};
+use nearhand_core::wire;
 use nearhand_transport::Fingerprint;
 use serde::{Deserialize, Deserializer};
 use serde_json::json;
+use tokio::sync::mpsc;
 
 use crate::accounts::{Accounts, Refused, User};
 use crate::audit::{Audit, Entry, Event};
@@ -44,6 +49,15 @@ use nearhand_core::grant::Role;
 use nearhand_transport::Identity;
 
 pub const SESSION_COOKIE: &str = "nearhand_session";
+
+/// Where browsers without WebTransport, or on networks without UDP, carry
+/// their session instead: the same relay, over this TCP connection.
+pub const RELAY_PATH: &str = "/api/v1/relay";
+/// The largest relayed packet taken from a browser. A QUIC packet in the
+/// tunnel is about 1.2 kB; this leaves room and no more.
+const MAX_RELAYED: usize = 16 * 1024;
+/// How long a browser has to say which device it wants.
+const RELAY_FIRST_MESSAGE: std::time::Duration = std::time::Duration::from_secs(10);
 
 pub struct AppState {
     pub accounts: Arc<Accounts>,
@@ -145,6 +159,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/api/v1/devices/{id}/grant", post(device_grant))
         .route("/api/v1/webtransport", get(webtransport))
+        .route(RELAY_PATH, get(relay))
         .merge(console)
         .with_state(state)
 }
@@ -1121,6 +1136,137 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+// --- The relay over TCP -----------------------------------------------------------
+
+/// The web viewer's session, carried over this WebSocket instead of
+/// WebTransport: for browsers without WebTransport, and networks that block
+/// UDP. The first message asks to be introduced to a device, the answer
+/// comes back as one message, and everything after that is the tunnel — the
+/// same datagrams, which the server cannot read either way.
+async fn relay(
+    State(state): State<Arc<AppState>>,
+    caller: Caller,
+    ConnectInfo(from): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    upgrade: WebSocketUpgrade,
+) -> ApiResult<Response> {
+    // A WebSocket carries the console's cookie, so it must come from the
+    // console: another site must not tunnel through this server.
+    if !same_origin(&headers) {
+        return Err(ApiError::CrossSite);
+    }
+    tracing::debug!(user = %caller.user.name, %from, "a browser is relaying over TCP");
+    Ok(upgrade
+        .max_message_size(MAX_RELAYED)
+        .on_upgrade(move |socket| async move {
+            if let Err(e) = tunnel(socket, state, from).await {
+                tracing::debug!(%from, error = %format!("{e:#}"), "the relay over TCP ended");
+            }
+        }))
+}
+
+async fn tunnel(socket: WebSocket, state: Arc<AppState>, from: SocketAddr) -> anyhow::Result<()> {
+    use anyhow::{Context as _, bail};
+    use futures_util::{SinkExt as _, StreamExt as _};
+
+    let (mut writer, mut reader) = socket.split();
+    let first = tokio::time::timeout(RELAY_FIRST_MESSAGE, reader.next())
+        .await
+        .context("no first message in time")?
+        .context("the browser left")??;
+    let Message::Binary(asked) = first else {
+        bail!("the first message was not a request");
+    };
+    let asked: ToServer = framed(&asked)?;
+    // A browser cannot be reached directly, so it gives no addresses.
+    let arranged = match asked {
+        ToServer::Connect { id, .. } => {
+            crate::rendezvous::arrange(&state.registry, from, id, Vec::new(), None).await
+        }
+        _ => Err(Refusal::Protocol),
+    };
+    let introduction = match arranged {
+        Ok(introduction) => introduction,
+        Err(refusal) => {
+            let answer = wire::encode(&FromServer::Refused(refusal))?;
+            let _ = writer.send(Message::Binary(answer.into())).await;
+            let _ = writer.close().await;
+            return Ok(());
+        }
+    };
+    // One message, so the page has the whole answer at once.
+    let mut answer = Vec::new();
+    for message in introduction.messages() {
+        answer.extend_from_slice(&wire::encode(&message)?);
+    }
+    writer.send(Message::Binary(answer.into())).await?;
+
+    let (out, sending) = mpsc::unbounded_channel();
+    let writing = tokio::spawn(async move {
+        let mut out: mpsc::UnboundedReceiver<Bytes> = sending;
+        while let Some(datagram) = out.recv().await {
+            if writer.send(Message::Binary(datagram)).await.is_err() {
+                break;
+            }
+        }
+        let _ = writer.close().await;
+    });
+    introduction
+        .relay(Arc::new(OverTcp {
+            out,
+            incoming: tokio::sync::Mutex::new(reader),
+        }))
+        .await;
+    writing.abort();
+    Ok(())
+}
+
+/// One length-prefixed message, as the wire carries them.
+fn framed<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> anyhow::Result<T> {
+    use anyhow::Context as _;
+    let header: [u8; wire::HEADER_LEN] = bytes
+        .get(..wire::HEADER_LEN)
+        .context("a message with no header")?
+        .try_into()?;
+    let body = bytes
+        .get(wire::HEADER_LEN..wire::HEADER_LEN + wire::body_len(header)?)
+        .context("a message cut short")?;
+    Ok(wire::decode(body)?)
+}
+
+/// A browser's WebSocket, as the viewer's side of a tunnel.
+struct OverTcp {
+    out: mpsc::UnboundedSender<Bytes>,
+    incoming: tokio::sync::Mutex<futures_util::stream::SplitStream<WebSocket>>,
+}
+
+impl nearhand_transport::relay::Carrier for OverTcp {
+    fn send_datagram(&self, datagram: Bytes) -> bool {
+        self.out.send(datagram).is_ok()
+    }
+
+    fn read_datagram(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Bytes>> + Send + '_>> {
+        use futures_util::StreamExt as _;
+        Box::pin(async move {
+            let mut incoming = self.incoming.lock().await;
+            loop {
+                match incoming.next().await {
+                    Some(Ok(Message::Binary(packet))) => return Some(packet),
+                    // Pings and the like are not the tunnel's.
+                    Some(Ok(_)) => continue,
+                    Some(Err(_)) | None => return None,
+                }
+            }
+        })
+    }
+
+    fn describe(&self) -> String {
+        "a browser over TCP".to_owned()
+    }
+}
+
 // --- Releases -------------------------------------------------------------------------
 
 async fn list_releases(
@@ -1241,6 +1387,7 @@ mod tests {
     use axum::extract::connect_info::MockConnectInfo;
     use axum::http::Request;
     use http_body_util::BodyExt;
+    use std::time::Duration;
     use tower::ServiceExt;
 
     struct Api {
@@ -2113,6 +2260,250 @@ mod tests {
                 "release.upload"
             ]
         );
+    }
+
+    // --- The relay over TCP ----------------------------------------------
+
+    /// The browser's side of the tunnel in the test: a WebSocket.
+    struct OverWebSocket {
+        out: mpsc::UnboundedSender<Bytes>,
+        incoming: tokio::sync::Mutex<
+            futures_util::stream::SplitStream<
+                tokio_tungstenite::WebSocketStream<
+                    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+                >,
+            >,
+        >,
+    }
+
+    impl nearhand_transport::relay::Carrier for OverWebSocket {
+        fn send_datagram(&self, datagram: Bytes) -> bool {
+            self.out.send(datagram).is_ok()
+        }
+
+        fn read_datagram(
+            &self,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Bytes>> + Send + '_>>
+        {
+            use futures_util::StreamExt as _;
+            Box::pin(async move {
+                let mut incoming = self.incoming.lock().await;
+                loop {
+                    match incoming.next().await {
+                        Some(Ok(tokio_tungstenite::tungstenite::Message::Binary(packet))) => {
+                            return Some(Bytes::from(packet.to_vec()));
+                        }
+                        Some(Ok(_)) => continue,
+                        Some(Err(_)) | None => return None,
+                    }
+                }
+            })
+        }
+
+        fn describe(&self) -> String {
+            "the test's browser".to_owned()
+        }
+    }
+
+    /// Echo whatever a viewer sends on `endpoint`, so a tunnel can be
+    /// shown to carry a session end to end.
+    fn echo(endpoint: quinn::Endpoint) {
+        tokio::spawn(async move {
+            while let Some(incoming) = endpoint.accept().await {
+                tokio::spawn(async move {
+                    let Ok(conn) = incoming.await else { return };
+                    if let Ok((mut send, mut recv)) = conn.accept_bi().await
+                        && let Ok(data) = recv.read_to_end(64 * 1024).await
+                    {
+                        let _ = send.write_all(&data).await;
+                        let _ = send.finish();
+                    }
+                    conn.closed().await;
+                });
+            }
+        });
+    }
+
+    /// A signed-in user's API token, an agent registered on the QUIC side
+    /// and echoing whatever a viewer sends it, and the address of this
+    /// server's HTTP side.
+    async fn world_over_tcp() -> (
+        String,
+        SocketAddr,
+        nearhand_core::rendezvous::DeviceId,
+        Fingerprint,
+    ) {
+        use nearhand_transport::rendezvous::{Registration, stay_registered};
+        use nearhand_transport::{rendezvous_endpoint, server_endpoint};
+
+        let pool = crate::db::in_memory().await;
+        let accounts = Arc::new(Accounts::new(pool.clone()));
+        let setup = accounts.new_setup_token().await.expect("setup token");
+        let user = accounts
+            .setup(&setup, "ada", "correct horse battery")
+            .await
+            .expect("admin");
+        let (_, token) = accounts
+            .new_api_token(&user, "the browser", None)
+            .await
+            .expect("token");
+        let devices = Arc::new(Devices::new(pool.clone()));
+        let registry = Arc::new(Registry::new(devices.clone()));
+
+        // The QUIC side, and an agent registered with it.
+        let server_identity = Identity::generate().expect("server key");
+        let quic = rendezvous_endpoint(([127, 0, 0, 1], 0).into(), &server_identity)
+            .expect("rendezvous endpoint");
+        let quic_addr = quic.local_addr().expect("addr");
+        tokio::spawn(crate::rendezvous::serve(quic, registry.clone()));
+
+        let agent = Arc::new(Identity::generate().expect("agent key"));
+        let endpoint = server_endpoint(([127, 0, 0, 1], 0).into(), &agent).expect("agent endpoint");
+        let (agent_id, agent_fp) = (agent.device_id(), agent.fingerprint());
+        {
+            // A relayed session arrives on the endpoint the agent is given
+            // when it registers, not on its own socket.
+            let agent = agent.clone();
+            tokio::spawn(async move {
+                let events = |event| {
+                    if let Registration::Registered { relay } = event {
+                        echo(relay);
+                    }
+                };
+                stay_registered(
+                    &endpoint,
+                    quic_addr,
+                    server_identity.fingerprint(),
+                    &agent,
+                    events,
+                )
+                .await;
+            });
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while registry.online(&agent_fp).is_none() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the agent registers");
+
+        // The HTTP side, on a port of its own.
+        let releases_dir = crate::releases::tests::tempdir::Dir::new();
+        let state = Arc::new(AppState {
+            accounts,
+            registry,
+            devices,
+            grants: Arc::new(Grants::new(pool.clone())),
+            releases: Arc::new(Releases::new(
+                pool.clone(),
+                releases_dir.path().to_path_buf(),
+                [0; 32],
+            )),
+            audit: Arc::new(Audit::new(pool)),
+            identity: Arc::new(Identity::generate().expect("key")),
+            web: Web::new(&crate::config::Config::default()).expect("web certificate"),
+            server: ServerInfo {
+                address: "localhost:443".into(),
+                fingerprint: "ab".repeat(32),
+            },
+        });
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("http listener");
+        let http = listener.local_addr().expect("addr");
+        let app = router(state).into_make_service_with_connect_info::<SocketAddr>();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        // The folder outlives the test through the state it was given to.
+        std::mem::forget(releases_dir);
+        (token, http, agent_id, agent_fp)
+    }
+
+    /// The whole fallback: a browser that cannot use UDP opens a WebSocket,
+    /// is introduced, and runs its session with the agent inside it.
+    #[tokio::test]
+    async fn a_browser_reaches_an_agent_over_tcp() {
+        use futures_util::{SinkExt as _, StreamExt as _};
+        use nearhand_core::rendezvous::{FromServer, ToServer};
+        use nearhand_core::wire;
+        use nearhand_transport::relay::{endpoint_over, relayed_address};
+        use tokio_tungstenite::tungstenite::Message as Ws;
+
+        let (token, http, agent_id, agent_fp) = world_over_tcp().await;
+        let request = tokio_tungstenite::tungstenite::http::Request::builder()
+            .uri(format!("ws://{http}{RELAY_PATH}"))
+            .header("host", http.to_string())
+            .header("authorization", format!("Bearer {token}"))
+            .header("connection", "Upgrade")
+            .header("upgrade", "websocket")
+            .header("sec-websocket-version", "13")
+            .header(
+                "sec-websocket-key",
+                tokio_tungstenite::tungstenite::handshake::client::generate_key(),
+            )
+            .body(())
+            .expect("request");
+        let (socket, _) = tokio_tungstenite::connect_async(request)
+            .await
+            .expect("the server takes the WebSocket");
+        let (mut writer, mut reader) = socket.split();
+        let asked = wire::encode(&ToServer::Connect {
+            id: agent_id,
+            addresses: Vec::new(),
+        })
+        .expect("encode");
+        writer.send(Ws::Binary(asked.into())).await.expect("ask");
+        let Some(Ok(Ws::Binary(answer))) = reader.next().await else {
+            panic!("no answer");
+        };
+        let introduced: FromServer = framed(&answer).expect("answer");
+        let FromServer::Peer { fingerprint, .. } = introduced else {
+            panic!("not introduced: {introduced:?}");
+        };
+        assert_eq!(Fingerprint::from_bytes(fingerprint), agent_fp);
+
+        // The session itself, inside the WebSocket: QUIC to the agent,
+        // pinned to its key, which the server cannot read.
+        let (out, mut sending) = mpsc::unbounded_channel::<Bytes>();
+        tokio::spawn(async move {
+            while let Some(packet) = sending.recv().await {
+                if writer.send(Ws::Binary(packet)).await.is_err() {
+                    break;
+                }
+            }
+        });
+        let tunnel = endpoint_over(
+            Arc::new(OverWebSocket {
+                out,
+                incoming: tokio::sync::Mutex::new(reader),
+            }),
+            false,
+            None,
+        )
+        .expect("tunnel");
+        let conn = tokio::time::timeout(
+            Duration::from_secs(5),
+            nearhand_transport::connect(&tunnel, relayed_address(0), agent_fp),
+        )
+        .await
+        .expect("in time")
+        .expect("end-to-end connection");
+        let message: Vec<u8> = (0..5000u32).map(|i| i as u8).collect();
+        let (mut send, mut recv) = conn.open_bi().await.expect("stream");
+        send.write_all(&message).await.expect("write");
+        send.finish().expect("finish");
+        let echoed = recv.read_to_end(64 * 1024).await.expect("echo");
+        assert_eq!(echoed, message, "through the browser's TCP tunnel and back");
+    }
+
+    /// Without an account, no tunnel: the relay is not an open proxy.
+    #[tokio::test]
+    async fn the_relay_over_tcp_needs_an_account() {
+        let (_, http, _, _) = world_over_tcp().await;
+        let refused = tokio_tungstenite::connect_async(format!("ws://{http}{RELAY_PATH}")).await;
+        assert!(refused.is_err(), "a stranger was let in");
     }
 
     #[tokio::test]
