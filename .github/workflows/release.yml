@@ -172,6 +172,10 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - uses: docker/build-push-action@v6
+        env:
+          # Its build record is an artifact whose name no other step can
+          # read back; nothing here wants it.
+          DOCKER_BUILD_RECORD_UPLOAD: false
         with:
           context: .
           file: packaging/docker/Dockerfile
@@ -191,13 +195,19 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v5
+      # By name, not everything: a build leaves artifacts of its own that
+      # are not part of a release.
       - uses: actions/download-artifact@v4
         with:
-          path: artifacts
+          name: signed
+          path: release
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: binaries-*
+          merge-multiple: true
+          path: release
       - name: gather
         run: |
-          mkdir -p release
-          find artifacts -type f -exec cp {} release/ \;
           cd release
           sha256sum * > SHA256SUMS
           ls -l
