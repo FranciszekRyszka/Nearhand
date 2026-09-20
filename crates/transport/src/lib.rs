@@ -21,6 +21,7 @@
 //! * The server learns an agent's key from the client certificate the agent
 //!   presents, and derives its ID from it.
 
+pub mod access;
 pub mod grant;
 pub mod relay;
 pub mod release;

@@ -109,18 +109,37 @@ account (M5).
     and is a second way in beside grants, not a second factor. The
     password is set at install, at least 10 characters, and kept
     only as a salted PBKDF2-HMAC-SHA256 hash (600,000 rounds) in a folder
-    only SYSTEM and administrators can read, beside the device key. Each
-    check takes a noticeable fraction of a second. After five wrong
-    passwords in a row the agent refuses every attempt for 30 seconds,
-    doubling up to 15 minutes, so guessing online is hopeless. The server
-    never sees the password.
+    only SYSTEM and administrators can read, beside the device key. After
+    five wrong passwords in a row the agent refuses every attempt for 30
+    seconds, doubling up to 15 minutes, so guessing online is hopeless.
+  - *Implemented:* the password is **never sent**, to the agent or to
+    anything between. The viewer proves it knows the password with SPAKE2 —
+    a password-authenticated key exchange — over the hash the agent stores,
+    and each side then proves to the other that it reached the same key
+    (`core::access`, `docs/protocol.md`). The proofs are tied to the
+    connection by keying material exported from its TLS session, so a
+    server that answered with a key of its own and stood in the middle
+    cannot pass the exchange through: the proofs do not match and both ends
+    stop. Standing in the middle is worth one guess per connection, against
+    the lockouts above. The stretching — the noticeable fraction of a
+    second — is now the viewer's to pay.
+  - *Trade-off:* the exchange runs with the stored hash, so that hash is
+    enough to open the machine it belongs to. Reading it needs SYSTEM or an
+    administrator on that machine, who is past this door anyway and who
+    would also find the device key beside it; it is still not enough to
+    learn the password itself, for that machine or anywhere else it may
+    have been used. The gain is that a server — the one part of the system
+    a self-hoster may not fully control — cannot collect passwords that
+    last.
   - No one at the machine is asked, with a password or a grant. The password
     should be treated like an administrator's password.
 - **Attended** sessions require the person at the host to accept, or a one-time
   password. Attempts are rate-limited.
-  - *Implemented:* the portable agent shows six random digits. The agent
-    checks them and the server never sees them. Each wrong guess costs a
-    whole connection, and three wrong guesses replace the password. The
+  - *Implemented:* the portable agent shows six random digits. They are
+    proved to the agent, not sent to it — the same exchange as above, with
+    the digits themselves — so the server never sees them and cannot make a
+    guess off the wire. Each wrong guess costs a whole connection, and
+    three wrong guesses replace the password. The
     server also limits each viewer address to 10 introductions a minute.
   - *Implemented:* with its window showing, the portable agent asks the
     person at the host to allow each viewer who gave the right password.
@@ -244,14 +263,17 @@ account (M5).
 
 ## Known limits
 
-A **malicious server** can put itself between a viewer and an agent.
-It can report its own key as the device's, since the ID does not pin the key.
-It can then relay the password the viewer types to the real agent. The
-password protects against anyone who is not the server; it does not protect
-against the server itself. For an installed agent this is worse than for a
-portable one: the access password lasts, so a server that captured it once
-could use it again later. A password-authenticated key exchange (PAKE) would
-close this gap, and is worth adding before 1.0.
+A **malicious server** can put itself between a viewer and an agent: it can
+report its own key as the device's, since the ten-digit ID does not pin the
+key. What it gets from that is now much less than it was. The password is
+never sent, and the exchange that proves it is tied to the connection it
+runs on, so a server in the middle cannot complete it towards the agent or
+learn anything to use later — it gets one guess per connection, against the
+agent's lockouts. What such a server can still do is refuse, or answer as a
+device that shows nothing: a viewer that types a password into it learns
+that something is wrong, but only after the attempt. A viewer that connects
+with a grant rather than a password is in the same position as before: the
+grant proves the server's say-so, not the device's.
 
 A **fully compromised management server** could issue itself a grant, and
 open every machine enrolled with it. Machines installed with only an access

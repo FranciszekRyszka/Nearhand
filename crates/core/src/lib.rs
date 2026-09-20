@@ -8,6 +8,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod access;
 pub mod clock;
 pub mod grant;
 pub mod held;
@@ -25,7 +26,7 @@ pub use proto::{
 /// Application-layer protocol name negotiated in the TLS handshake. Carries the
 /// protocol version, so a mismatched peer fails at the handshake with a clear
 /// reason instead of speaking a format it does not understand.
-pub const ALPN: &[u8] = b"nearhand/5";
+pub const ALPN: &[u8] = b"nearhand/6";
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {

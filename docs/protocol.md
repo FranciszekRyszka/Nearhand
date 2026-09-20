@@ -167,7 +167,7 @@ added about 0.2 ms to the round trip, with the frame rate unchanged.
 
 ## Session
 
-The TLS handshake negotiates ALPN `nearhand/5`, so a peer on a different
+The TLS handshake negotiates ALPN `nearhand/6`, so a peer on a different
 protocol version fails there rather than mid-stream. The viewer then opens one
 bidirectional stream for control and speaks first:
 
@@ -175,9 +175,12 @@ bidirectional stream for control and speaks first:
 viewer                         agent
   Hello { version, caps }  ──▶
                            ◀──  Hello { version, caps }
-                           ◀──  AuthRequired           (portable and installed agents)
-  Authenticate { password } ──▶
-    or Present { grant }                                (installed with a token)
+                           ◀──  AuthRequired { secret } (portable and installed agents)
+  AuthStart { pake }       ──▶                          (proving a password)
+                           ◀──  AuthAnswer { pake }
+  AuthProve { proof }      ──▶
+                           ◀──  AuthProved { proof }
+    or Present { grant }   ──▶                          (installed with a token)
                            ◀──  AwaitingApproval       (when someone at the host decides)
                            ◀──  MonitorList
   StartVideo               ──▶
@@ -188,6 +191,27 @@ viewer                         agent
                            ◀──  Cursor …  (own stream)
   (own stream) Clipboard … ◀─▶  Clipboard …  (own stream)
 ```
+
+A password is never sent — not to the agent, and so not to anything between
+the two. `AuthRequired` says what the password is and how to prepare it:
+`OneTime` for the six digits a portable agent shows, used as they are read
+out, or `Access { salt, iterations }` for an installed agent, which holds
+only a PBKDF2-HMAC-SHA256 hash of its access password and so runs the
+exchange with that hash; the viewer stretches what was typed the same way.
+Both sides then run SPAKE2 over that material (`core::access`) and prove to
+each other that they arrived at the same key.
+
+The proofs are MACs over the transcript, keyed from the exchange with
+keying material exported from the connection's TLS session as the salt (RFC
+5705, label `nearhand access binding v1`, 32 bytes). Both ends of one
+connection derive the same bytes; a server holding one connection to each
+end does not, so it cannot pass an exchange through and stay in the middle.
+The agent checks the viewer's proof first — a wrong one closes with code 5,
+and counts against the agent's lockouts — and answers with its own, which
+the viewer checks before it shows anything: without that, a viewer would
+know the password reached *something*, not that it reached the device.
+`secret` is `None` when an agent has no password at all, and only a grant
+will do.
 
 `Present` carries a grant the server signed (`core::grant`): the agent checks
 it against the server key it pinned, and the grant's role limits the session

@@ -34,6 +34,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 use nearhand_clipboard::ClipboardSync;
+use nearhand_core::access;
 use nearhand_core::grant::Role;
 use nearhand_core::proto::close;
 use nearhand_core::video::{encode_chunk, packetize};
@@ -456,9 +457,12 @@ pub async fn serve(
                 other @ (Control::Hello { .. }
                 | Control::MonitorList(_)
                 | Control::Pong { .. }
-                | Control::AuthRequired
+                | Control::AuthRequired { .. }
                 | Control::AwaitingApproval
-                | Control::Authenticate { .. }
+                | Control::AuthStart { .. }
+                | Control::AuthAnswer { .. }
+                | Control::AuthProve { .. }
+                | Control::AuthProved { .. }
                 | Control::Present { .. }),
             ) => {
                 conn.close(close::PROTOCOL.into(), b"unexpected message");
@@ -478,8 +482,6 @@ pub async fn serve(
     outcome
 }
 
-/// Ask for the password and check it. A wrong one ends the connection: each
-/// guess costs a whole handshake, and a few wrong ones replace the password.
 /// Who was let in, and what they may do.
 struct Admitted {
     /// The server's name for them, when they came with a grant.
@@ -487,19 +489,31 @@ struct Admitted {
     role: Role,
 }
 
+/// Have the viewer prove the password, and prove it back. Neither side ever
+/// sends the password: they run the exchange in `nearhand_core::access`,
+/// tied to this connection, so a server that stood in the middle of the
+/// introduction cannot pass it through. A wrong password ends the
+/// connection — each guess costs a whole handshake, and a few wrong ones
+/// replace the password.
 async fn authenticate(
     conn: &Connection,
     send: &mut quinn::SendStream,
     recv: &mut RecvStream,
     config: &SessionConfig,
 ) -> Result<Admitted> {
-    send_message(send, &Control::AuthRequired).await?;
     let refuse = |reason: &str| {
         conn.close(close::AUTH_FAILED.into(), reason.as_bytes());
         anyhow::anyhow!("{reason}")
     };
-    let attempt = match recv_message::<Control>(recv).await? {
-        Some(Control::Authenticate { password }) => password,
+    send_message(
+        send,
+        &Control::AuthRequired {
+            secret: config.gate.as_ref().map(|gate| gate.secret()),
+        },
+    )
+    .await?;
+    let started = match recv_message::<Control>(recv).await? {
+        Some(Control::AuthStart { pake }) => pake,
         Some(Control::Present { grant }) => {
             let Some(grants) = &config.grants else {
                 return Err(refuse("this device takes a password, not a grant"));
@@ -513,8 +527,8 @@ async fn authenticate(
             };
         }
         other => {
-            conn.close(close::PROTOCOL.into(), b"expected Authenticate");
-            bail!("expected Authenticate, got {other:?}");
+            conn.close(close::PROTOCOL.into(), b"expected AuthStart");
+            bail!("expected AuthStart, got {other:?}");
         }
     };
     let Some(gate) = &config.gate else {
@@ -522,28 +536,53 @@ async fn authenticate(
             "this device has no access password; sign in to its server instead",
         ));
     };
-    let verdict = if gate.is_slow() {
-        let gate = gate.clone();
-        tokio::task::spawn_blocking(move || gate.check(&attempt)).await?
-    } else {
-        gate.check(&attempt)
+    let material = gate.material().map_err(refuse)?;
+    let binding = nearhand_transport::access::binding(conn)
+        .map_err(|_| refuse("this connection cannot carry a password exchange"))?;
+    let seed = nearhand_transport::access::seed()
+        .map_err(|_| refuse("this machine's random number generator failed"))?;
+    let (pending, answer) = access::Agent::answer(&material, &binding, seed, &started)
+        .map_err(|_| refuse("that is not the start of a password exchange"))?;
+    send_message(send, &Control::AuthAnswer { pake: answer }).await?;
+    let proof = match recv_message::<Control>(recv).await? {
+        Some(Control::AuthProve { proof }) => proof,
+        other => {
+            conn.close(close::PROTOCOL.into(), b"expected AuthProve");
+            bail!("expected AuthProve, got {other:?}");
+        }
     };
-    match verdict {
-        // A password is the device's own say-so: everything a session can do.
-        Verdict::Accepted => Ok(Admitted {
-            user: None,
-            role: Role::Full,
-        }),
-        Verdict::Rejected(reason) => {
-            conn.close(close::AUTH_FAILED.into(), reason.as_bytes());
-            bail!("{reason}");
+    match pending.check(&proof) {
+        Ok(ours) => {
+            gate.accepted();
+            // The viewer checks this in turn: without it, it knows the
+            // password reached something, not that it reached this agent.
+            send_message(
+                send,
+                &Control::AuthProved {
+                    proof: ours.to_vec(),
+                },
+            )
+            .await?;
+            // A password is the device's own say-so: everything a session
+            // can do.
+            Ok(Admitted {
+                user: None,
+                role: Role::Full,
+            })
         }
-        Verdict::Replaced(new) => {
-            conn.close(close::AUTH_FAILED.into(), b"wrong password");
-            // Printed: the person at this machine has to read out the new one.
-            println!("too many wrong passwords; the password is now {new}");
-            bail!("wrong password, replaced");
-        }
+        Err(_) => match gate.rejected() {
+            Verdict::Rejected(reason) => {
+                conn.close(close::AUTH_FAILED.into(), reason.as_bytes());
+                bail!("{reason}");
+            }
+            Verdict::Replaced(new) => {
+                conn.close(close::AUTH_FAILED.into(), b"wrong password");
+                // Printed: the person at this machine has to read out the
+                // new one.
+                println!("too many wrong passwords; the password is now {new}");
+                bail!("wrong password, replaced");
+            }
+        },
     }
 }
 
@@ -1027,6 +1066,110 @@ mod tests {
             control: QualityControl::detached(),
         };
         (stream, rate)
+    }
+
+    /// The agent's side of letting a viewer in, against a viewer that
+    /// types `typed`: what the agent made of it, and whether the viewer
+    /// could prove the agent knows the password too.
+    async fn password_exchange(typed: &str) -> (Result<Admitted>, bool) {
+        use nearhand_core::access;
+
+        let (agent_conn, viewer_conn, _endpoints) = connected().await;
+        let config = Arc::new(SessionConfig {
+            bitrate_kbps: 4000,
+            gate: Some(Arc::new(crate::password::Password::new())),
+            grants: None,
+            host: None,
+        });
+        let shown = config
+            .gate
+            .as_ref()
+            .expect("a gate")
+            .material()
+            .expect("the password it shows");
+        let typed = typed.replace("{shown}", &String::from_utf8_lossy(&shown));
+
+        let agent_side = tokio::spawn(async move {
+            let (mut send, mut recv) = agent_conn.accept_bi().await.expect("stream");
+            // `serve` has read the viewer's Hello by this point.
+            let _: Option<Control> = recv_message(&mut recv).await.expect("hello");
+            let outcome = authenticate(&agent_conn, &mut send, &mut recv, &config).await;
+            // Held as `serve` holds them: a stream dropped unfinished is
+            // reset, and the last message with it.
+            (outcome, agent_conn, send, recv)
+        });
+
+        let viewer_side = tokio::spawn(async move {
+            let (mut send, mut recv) = viewer_conn.open_bi().await.expect("stream");
+            send_message(
+                &mut send,
+                &Control::Hello {
+                    version: PROTOCOL_VERSION,
+                    caps: Caps {
+                        codecs: Vec::new(),
+                        max_width: 0,
+                        max_height: 0,
+                        max_fps: 0,
+                    },
+                },
+            )
+            .await
+            .expect("hello");
+            let Some(Control::AuthRequired {
+                secret: Some(secret),
+            }) = recv_message(&mut recv).await.expect("what to prove")
+            else {
+                panic!("expected AuthRequired with a password");
+            };
+            let material = secret.material(&typed).expect("material");
+            let binding = nearhand_transport::access::binding(&viewer_conn).expect("binding");
+            let seed = nearhand_transport::access::seed().expect("seed");
+            let (viewer, start) = access::Viewer::start(&material, &binding, seed);
+            send_message(&mut send, &Control::AuthStart { pake: start })
+                .await
+                .expect("start");
+            let Ok(Some(Control::AuthAnswer { pake })) = recv_message(&mut recv).await else {
+                return false;
+            };
+            let (viewer, proof) = viewer.prove(&pake).expect("prove");
+            send_message(
+                &mut send,
+                &Control::AuthProve {
+                    proof: proof.to_vec(),
+                },
+            )
+            .await
+            .expect("proof");
+            match recv_message(&mut recv).await {
+                Ok(Some(Control::AuthProved { proof })) => viewer.check(&proof).is_ok(),
+                // A wrong password: the agent has closed by now.
+                _ => false,
+            }
+        });
+        let (agent_side, proved) = tokio::join!(agent_side, viewer_side);
+        let (admitted, ..) = agent_side.expect("the agent's side");
+        (admitted, proved.expect("the viewer's side"))
+    }
+
+    /// The password is proved, never sent, and both sides end up sure of
+    /// each other.
+    #[tokio::test]
+    async fn a_viewer_with_the_password_is_let_in() {
+        let (admitted, proved) = password_exchange("{shown}").await;
+        let admitted = admitted.expect("let in");
+        assert!(
+            admitted.user.is_none(),
+            "a password is nobody in particular"
+        );
+        assert!(matches!(admitted.role, Role::Full));
+        assert!(proved, "the agent did not prove itself back");
+    }
+
+    #[tokio::test]
+    async fn a_viewer_with_another_password_is_not() {
+        let (admitted, proved) = password_exchange("000000 is not it").await;
+        assert!(admitted.is_err(), "let in with the wrong password");
+        assert!(!proved);
     }
 
     /// A lost viewer ends the video, though the pipeline is still there

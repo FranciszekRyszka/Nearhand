@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use nearhand_clipboard::ClipboardSync;
+use nearhand_core::access;
 use nearhand_core::clock::ClockSync;
 use nearhand_core::proto::close;
 use nearhand_core::rendezvous::DeviceId;
@@ -228,17 +229,22 @@ pub async fn run(options: Options) -> Result<()> {
         Err(e) => return Err(explain(&conn, e.into())),
     };
     let mut next = recv_message::<Control>(&mut recv).await;
-    if let Ok(Some(Control::AuthRequired)) = next {
-        let answer = match grant {
-            Some(grant) => Control::Present { grant },
-            None => Control::Authenticate {
-                password: match options.password.clone() {
+    if let Ok(Some(Control::AuthRequired { secret })) = next {
+        match grant {
+            Some(grant) => send_message(&mut send, &Control::Present { grant }).await?,
+            None => {
+                let Some(secret) = secret else {
+                    bail!(
+                        "this device lets nobody in with a password; sign in to its server instead"
+                    );
+                };
+                let typed = match options.password.clone() {
                     Some(password) => password,
                     None => ask_password().await?,
-                },
-            },
-        };
-        send_message(&mut send, &answer).await?;
+                };
+                prove(&conn, &mut send, &mut recv, &secret, &typed).await?;
+            }
+        }
         next = recv_message::<Control>(&mut recv).await;
     }
     if let Ok(Some(Control::AwaitingApproval)) = next {
@@ -714,6 +720,57 @@ async fn send_input(
 
 /// Replace an opaque "connection closed" with the agent's own reason, when it
 /// gave one.
+/// Prove the password to the agent without sending it, and make it prove
+/// the password back (`nearhand_core::access`). Whoever introduced the two
+/// of us cannot do either, so if this works there is nobody in between.
+async fn prove(
+    conn: &Connection,
+    send: &mut SendStream,
+    recv: &mut RecvStream,
+    secret: &access::Secret,
+    typed: &str,
+) -> Result<()> {
+    let binding = nearhand_transport::access::binding(conn)
+        .context("this connection carries no password exchange")?;
+    let seed = nearhand_transport::access::seed()?;
+    // An access password is stretched the slow way the agent stored it:
+    // hundreds of milliseconds, off the runtime's threads.
+    let material = {
+        let secret = secret.clone();
+        let typed = typed.to_owned();
+        tokio::task::spawn_blocking(move || secret.material(&typed)).await??
+    };
+    let (viewer, start) = access::Viewer::start(&material, &binding, seed);
+    send_message(send, &Control::AuthStart { pake: start }).await?;
+    let answer = match recv_message::<Control>(recv)
+        .await
+        .map_err(|e| explain(conn, e.into()))?
+    {
+        Some(Control::AuthAnswer { pake }) => pake,
+        other => bail!("expected the agent's half of the password exchange, got {other:?}"),
+    };
+    let (viewer, proof) = viewer.prove(&answer)?;
+    send_message(
+        send,
+        &Control::AuthProve {
+            proof: proof.to_vec(),
+        },
+    )
+    .await?;
+    match recv_message::<Control>(recv)
+        .await
+        .map_err(|e| explain(conn, e.into()))?
+    {
+        // Wrong, and the agent has closed by now; right, and this is what
+        // says the agent is the agent.
+        Some(Control::AuthProved { proof }) => viewer.check(&proof).context(
+            "the agent cannot prove it knows the password:              something is standing between this viewer and the device",
+        )?,
+        other => bail!("expected the agent's proof, got {other:?}"),
+    }
+    Ok(())
+}
+
 fn explain(conn: &Connection, error: anyhow::Error) -> anyhow::Error {
     match conn.close_reason() {
         Some(ConnectionError::ApplicationClosed(close)) => {

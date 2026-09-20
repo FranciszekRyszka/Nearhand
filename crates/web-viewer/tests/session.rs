@@ -5,6 +5,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use bytes::Bytes;
+use nearhand_core::access::{self, Secret};
 use nearhand_core::proto::close;
 use nearhand_core::video::{encode_chunk, packetize};
 use nearhand_core::{Caps, Codec, Control, Monitor, PROTOCOL_VERSION};
@@ -13,6 +14,73 @@ use nearhand_web::session::{Auth, Event, Session};
 use tokio::net::UdpSocket;
 
 const PASSWORD: &str = "correct horse battery";
+
+/// As an installed agent would stretch it, with the rounds turned down so
+/// that a test does not wait on a deliberately slow hash.
+fn secret() -> Secret {
+    Secret::Access {
+        salt: b"0123456789abcdef".to_vec(),
+        iterations: 1_000,
+    }
+}
+
+/// The agent's side of the password exchange: neither side sends the
+/// password, and each proves to the other that it has it
+/// (`nearhand_core::access`).
+async fn let_in(
+    conn: &quinn::Connection,
+    send: &mut quinn::SendStream,
+    recv: &mut quinn::RecvStream,
+    password: &str,
+) {
+    send_message(
+        send,
+        &Control::AuthRequired {
+            secret: Some(secret()),
+        },
+    )
+    .await
+    .expect("auth");
+    let started = match recv_message(recv).await.expect("the exchange starts") {
+        Some(Control::AuthStart { pake }) => pake,
+        other => {
+            conn.close(close::AUTH_FAILED.into(), b"expected AuthStart");
+            panic!("unexpected {other:?}");
+        }
+    };
+    let material = secret().material(password).expect("material");
+    let (agent, answer) = access::Agent::answer(
+        &material,
+        &nearhand_transport::access::binding(conn).expect("binding"),
+        nearhand_transport::access::seed().expect("seed"),
+        &started,
+    )
+    .expect("the viewer's half");
+    send_message(send, &Control::AuthAnswer { pake: answer })
+        .await
+        .expect("answer");
+    let proof = match recv_message(recv).await.expect("the viewer proves it") {
+        Some(Control::AuthProve { proof }) => proof,
+        other => {
+            conn.close(close::AUTH_FAILED.into(), b"expected AuthProve");
+            panic!("unexpected {other:?}");
+        }
+    };
+    match agent.check(&proof) {
+        Ok(ours) => send_message(
+            send,
+            &Control::AuthProved {
+                proof: ours.to_vec(),
+            },
+        )
+        .await
+        .expect("proved"),
+        Err(e) => {
+            conn.close(close::AUTH_FAILED.into(), b"wrong password");
+            panic!("the viewer did not prove the password: {e}");
+        }
+    }
+}
 
 /// A frame's worth of bytes, recognisable when it comes back whole.
 fn picture() -> Bytes {
@@ -50,16 +118,7 @@ fn agent(identity: &Identity) -> SocketAddr {
         send_message(&mut send, &Control::Hello { version, caps })
             .await
             .expect("hello");
-        send_message(&mut send, &Control::AuthRequired)
-            .await
-            .expect("auth");
-        match recv_message(&mut recv).await.expect("answer") {
-            Some(Control::Authenticate { password }) if password == PASSWORD => {}
-            other => {
-                conn.close(close::AUTH_FAILED.into(), b"wrong password");
-                panic!("unexpected {other:?}");
-            }
-        }
+        let_in(&conn, &mut send, &mut recv, PASSWORD).await;
         let monitor = Monitor {
             id: 0,
             width: 1920,
@@ -263,10 +322,7 @@ fn chatty_agent(identity: &Identity) -> (SocketAddr, tokio::sync::mpsc::Unbounde
         )
         .await
         .expect("hello");
-        send_message(&mut send, &Control::AuthRequired)
-            .await
-            .expect("auth");
-        let _answer: Option<Control> = recv_message(&mut recv).await.expect("answer");
+        let_in(&conn, &mut send, &mut recv, PASSWORD).await;
         send_message(&mut send, &Control::MonitorList(Vec::new()))
             .await
             .expect("monitors");

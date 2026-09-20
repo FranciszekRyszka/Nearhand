@@ -1,18 +1,22 @@
 //! The access password of an unattended machine: set when the agent is
-//! installed, stored only as a salted hash on the machine, and checked by the
-//! agent itself. The server never sees it, so a server alone cannot open a
-//! session (`docs/security.md`).
+//! installed, stored only as a salted hash on the machine, and proved to the
+//! agent itself. The password never leaves the viewer, so a server that put
+//! itself in the middle learns nothing to use later (`docs/security.md`).
 //!
-//! The hash is PBKDF2-HMAC-SHA256, deliberately slow: a check costs a few
-//! hundred milliseconds, which is nothing to someone typing the password and
-//! a lot to someone guessing it. Guessing online is slowed further: after a
-//! few wrong passwords in a row, the agent refuses every attempt for a while,
-//! and the while doubles each time.
+//! The hash is PBKDF2-HMAC-SHA256, deliberately slow: arriving at it costs a
+//! few hundred milliseconds, which is nothing to someone typing the password
+//! and a lot to someone guessing it. It is the viewer that pays that now —
+//! the exchange in `nearhand_core::access` runs with the hash, so the agent
+//! needs only what it already stores, and tells the viewer the salt and the
+//! iteration count to arrive at the same. Guessing online is slowed further:
+//! after a few wrong passwords in a row, the agent refuses every attempt for
+//! a while, and the while doubles each time.
 
 use std::num::NonZeroU32;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use nearhand_core::access::Secret;
 use ring::pbkdf2;
 use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
@@ -67,16 +71,19 @@ impl Stored {
         }
     }
 
-    /// Whether `attempt` is the password. Takes as long whether it is or not.
-    pub fn matches(&self, attempt: &str) -> bool {
-        let (Some(salt), Some(hash), Some(rounds)) = (
-            from_hex(&self.salt),
-            from_hex(&self.hash),
-            NonZeroU32::new(self.iterations),
-        ) else {
-            return false;
-        };
-        pbkdf2::verify(ALGORITHM, rounds, &salt, attempt.as_bytes(), &hash).is_ok()
+    /// What to tell a viewer to prepare: the same stretch that made the
+    /// hash. An unreadable record gives an empty salt, which every viewer
+    /// refuses.
+    fn secret(&self) -> Secret {
+        Secret::Access {
+            salt: from_hex(&self.salt).unwrap_or_default(),
+            iterations: self.iterations,
+        }
+    }
+
+    /// The hash itself: what both sides run the exchange with.
+    fn material(&self) -> Option<Vec<u8>> {
+        from_hex(&self.hash)
     }
 }
 
@@ -113,28 +120,32 @@ impl AccessPassword {
 }
 
 impl Gate for AccessPassword {
-    fn check(&self, attempt: &str) -> Verdict {
-        let now = Instant::now();
+    fn secret(&self) -> Secret {
+        self.stored.secret()
+    }
+
+    fn material(&self) -> Result<Vec<u8>, &'static str> {
         if let Some(until) = self.lock().locked_until
-            && now < until
+            && Instant::now() < until
         {
-            // Not even checked: a guess made now tells nothing.
-            return Verdict::Rejected("too many wrong passwords; try again later");
+            // No exchange at all: a guess made now tells nothing.
+            return Err("too many wrong passwords; try again later");
         }
-        // The slow part, outside the lock.
-        let right = self.stored.matches(attempt);
+        self.stored
+            .material()
+            .ok_or("this device's access password cannot be read")
+    }
+
+    fn accepted(&self) {
+        *self.lock() = Failures::default();
+    }
+
+    fn rejected(&self) -> Verdict {
+        let now = Instant::now();
         let mut state = self.lock();
-        if right {
-            *state = Failures::default();
-            return Verdict::Accepted;
-        }
         state.in_a_row += 1;
         state.locked_until = Self::lockout(state.in_a_row).map(|d| now + d);
         Verdict::Rejected("wrong password")
-    }
-
-    fn is_slow(&self) -> bool {
-        true
     }
 }
 
@@ -162,21 +173,12 @@ mod tests {
     }
 
     #[test]
-    fn the_password_matches_and_others_do_not() {
-        let stored = quick("correct horse battery");
-        assert!(stored.matches("correct horse battery"));
-        assert!(!stored.matches("correct horse batterY"));
-        assert!(!stored.matches(""));
-    }
-
-    #[test]
     fn salts_make_equal_passwords_hash_differently() {
         let a = Stored::new("the same password").expect("a");
         let b = Stored::new("the same password").expect("b");
         assert_ne!(a.salt, b.salt);
         assert_ne!(a.hash, b.hash);
         assert_eq!(a.iterations, ITERATIONS);
-        assert!(a.matches("the same password"));
     }
 
     #[test]
@@ -185,14 +187,27 @@ mod tests {
         assert!(Stored::new("1234567890").is_ok());
     }
 
+    /// A record that cannot be read leaves nothing to run an exchange with,
+    /// and nothing a viewer would agree to run.
     #[test]
-    fn damaged_records_match_nothing() {
+    fn damaged_records_let_nobody_in() {
         let mut stored = quick("correct horse battery");
         stored.hash.pop();
-        assert!(!stored.matches("correct horse battery"));
+        assert_eq!(stored.material(), None);
+
         let mut stored = quick("correct horse battery");
         stored.iterations = 0;
-        assert!(!stored.matches("correct horse battery"));
+        assert_eq!(
+            stored.secret().material("correct horse battery"),
+            Err(nearhand_core::access::Refused::Unreasonable)
+        );
+
+        let mut stored = quick("correct horse battery");
+        stored.salt = "nonsense".to_owned();
+        assert_eq!(
+            stored.secret().material("correct horse battery"),
+            Err(nearhand_core::access::Refused::Unreasonable)
+        );
     }
 
     #[test]
@@ -217,31 +232,54 @@ mod tests {
 
         let access = AccessPassword::new(quick("correct horse battery"));
         for _ in 0..FREE_FAILURES {
-            assert!(matches!(access.check("guess"), Verdict::Rejected(_)));
+            assert!(matches!(access.rejected(), Verdict::Rejected(_)));
         }
-        // Locked: even the right password is turned away for now.
-        assert!(matches!(
-            access.check("correct horse battery"),
-            Verdict::Rejected(reason) if reason.contains("later")
-        ));
+        // Locked: there is no exchange to run at all for now, so not even
+        // the right password gets a turn.
+        assert_eq!(
+            access.material(),
+            Err("too many wrong passwords; try again later")
+        );
     }
 
     #[test]
     fn a_success_clears_the_failures() {
         let access = AccessPassword::new(quick("correct horse battery"));
         for _ in 0..FREE_FAILURES - 1 {
-            assert!(matches!(access.check("guess"), Verdict::Rejected(_)));
+            assert!(matches!(access.rejected(), Verdict::Rejected(_)));
         }
-        assert!(matches!(
-            access.check("correct horse battery"),
-            Verdict::Accepted
-        ));
+        access.accepted();
+        // The count started over, so there is room for as many again.
         for _ in 0..FREE_FAILURES - 1 {
-            assert!(matches!(access.check("guess"), Verdict::Rejected(_)));
+            assert!(matches!(access.rejected(), Verdict::Rejected(_)));
         }
-        assert!(matches!(
-            access.check("correct horse battery"),
-            Verdict::Accepted
-        ));
+        assert!(access.material().is_ok(), "locked after a success");
+    }
+
+    /// The agent holds a hash and the viewer holds a password, and the
+    /// exchange only works if both arrive at the same bytes. That they do is
+    /// two libraries agreeing on PBKDF2-HMAC-SHA256: `ring` here, the
+    /// `pbkdf2` crate in `nearhand_core::access`, which also runs in a
+    /// browser.
+    #[test]
+    fn what_a_viewer_derives_is_what_the_agent_holds() {
+        let access = AccessPassword::new(quick("correct horse battery"));
+        let stored = access.material().expect("the stored material");
+        let secret = access.secret();
+        assert_eq!(
+            secret.material("correct horse battery").expect("typed"),
+            stored
+        );
+        assert_ne!(
+            secret.material("correct horse batterY").expect("typed"),
+            stored
+        );
+        assert_eq!(
+            secret,
+            Secret::Access {
+                salt: b"0123456789abcdef".to_vec(),
+                iterations: 1000,
+            }
+        );
     }
 }

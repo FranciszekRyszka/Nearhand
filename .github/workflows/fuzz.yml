@@ -51,7 +51,7 @@ jobs:
           SECONDS_EACH: ${{ github.event.inputs.seconds || '300' }}
         run: |
           set -e
-          for target in wire video signature_file signatures; do
+          for target in wire video signature_file signatures access; do
             echo "::group::$target"
             cargo +nightly fuzz run "$target" -- \
               -max_total_time="$SECONDS_EACH" \

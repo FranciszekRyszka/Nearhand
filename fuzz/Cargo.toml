@@ -44,6 +44,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "access"
+path = "fuzz_targets/access.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "signatures"
 path = "fuzz_targets/signatures.rs"
 test = false

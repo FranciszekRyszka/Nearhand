@@ -19,6 +19,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
+use nearhand_core::access;
 use nearhand_core::grant::SignedGrant;
 use nearhand_core::held::Held;
 use nearhand_core::proto::close;
@@ -109,6 +110,8 @@ pub struct Session {
     remote: SocketAddr,
     started: Instant,
     auth: Option<Auth>,
+    /// The password exchange, between its messages.
+    proving: Option<Proving>,
     max_fps: u8,
     control: Option<StreamId>,
     /// Bytes read from the control stream, not yet a whole message.
@@ -147,6 +150,7 @@ impl Session {
             remote,
             started: now,
             auth: Some(auth),
+            proving: None,
             max_fps: max_fps.max(1),
             control: None,
             control_in: Vec::new(),
@@ -521,17 +525,18 @@ impl Session {
                 self.fail("the agent offers no H.264 encoder");
             }
             Control::Hello { .. } => {}
-            Control::AuthRequired => {
-                let answer = match self.auth.take() {
-                    Some(Auth::Grant(grant)) => Control::Present { grant },
-                    Some(Auth::Password(password)) => Control::Authenticate { password },
-                    None => {
-                        self.fail("the agent asked twice to be let in");
-                        return;
-                    }
-                };
-                self.send_control(&answer);
-            }
+            Control::AuthRequired { secret } => match self.auth.take() {
+                Some(Auth::Grant(grant)) => self.send_control(&Control::Present { grant }),
+                Some(Auth::Password(password)) => match secret {
+                    Some(secret) => self.start_proving(&secret, &password),
+                    None => self.fail(
+                        "this device lets nobody in with a password; sign in to its server instead",
+                    ),
+                },
+                None => self.fail("the agent asked twice to be let in"),
+            },
+            Control::AuthAnswer { pake } => self.prove(&pake),
+            Control::AuthProved { proof } => self.check_the_agent(&proof),
             Control::AwaitingApproval => self.events.push_back(Event::AwaitingApproval),
             Control::MonitorList(monitors) => self.events.push_back(Event::Monitors(monitors)),
             _ => {}
@@ -570,6 +575,70 @@ impl Session {
                 chunks: missing.chunks,
             });
         }
+    }
+
+    /// Begin proving the password without sending it: the exchange in
+    /// `nearhand_core::access`, tied to this connection, so that whatever
+    /// introduced this viewer to the agent cannot stand in the middle of
+    /// it.
+    fn start_proving(&mut self, secret: &access::Secret, password: &str) {
+        let binding = match self.binding() {
+            Ok(binding) => binding,
+            Err(why) => return self.fail(&why),
+        };
+        let seed = match seed() {
+            Ok(seed) => seed,
+            Err(why) => return self.fail(&why),
+        };
+        // Stretching an access password is slow on purpose — the agent
+        // stored it that way — and there is nothing else for this viewer to
+        // be doing until it is in.
+        let material = match secret.material(password) {
+            Ok(material) => material,
+            Err(e) => return self.fail(&e.to_string()),
+        };
+        let (viewer, start) = access::Viewer::start(&material, &binding, seed);
+        self.proving = Some(Proving::Started(viewer));
+        self.send_control(&Control::AuthStart { pake: start });
+    }
+
+    /// The agent's half of the exchange: prove the password to it.
+    fn prove(&mut self, pake: &[u8]) {
+        let Some(Proving::Started(viewer)) = self.proving.take() else {
+            return self.fail("the agent answered a password exchange that never started");
+        };
+        match viewer.prove(pake) {
+            Ok((proven, proof)) => {
+                self.proving = Some(Proving::Proven(proven));
+                self.send_control(&Control::AuthProve {
+                    proof: proof.to_vec(),
+                });
+            }
+            Err(e) => self.fail(&e.to_string()),
+        }
+    }
+
+    /// The agent's proof in return. Without it this viewer would know the
+    /// password reached something, not that it reached the device.
+    fn check_the_agent(&mut self, proof: &[u8]) {
+        let Some(Proving::Proven(proven)) = self.proving.take() else {
+            return self.fail("the agent proved a password exchange that never started");
+        };
+        if proven.check(proof).is_err() {
+            self.fail(
+                "the agent cannot prove it knows the password:                  something is standing between this viewer and the device",
+            );
+        }
+    }
+
+    /// Keying material only the two ends of this connection can derive.
+    fn binding(&self) -> Result<[u8; access::BINDING_LEN], String> {
+        let mut out = [0u8; access::BINDING_LEN];
+        self.conn
+            .crypto_session()
+            .export_keying_material(&mut out, access::BINDING_LABEL, b"")
+            .map_err(|_| "this connection carries no password exchange".to_owned())?;
+        Ok(out)
     }
 
     fn send_control(&mut self, message: &Control) {
@@ -624,6 +693,23 @@ impl Session {
         self.closed = true;
         self.events.push_back(Event::Closed(why.to_owned()));
     }
+}
+
+/// The password exchange, between the messages that carry it.
+enum Proving {
+    Started(access::Viewer),
+    Proven(access::Proven),
+}
+
+/// Randomness for one exchange, from the browser — the same source TLS
+/// here draws on.
+fn seed() -> Result<access::Seed, String> {
+    use ring::rand::SecureRandom as _;
+    let mut bytes = [0u8; 64];
+    ring::rand::SystemRandom::new()
+        .fill(&mut bytes)
+        .map_err(|_| "this browser gave no random numbers".to_owned())?;
+    Ok(access::Seed(bytes))
 }
 
 /// One whole message off the front of `buffer`, if it holds one.

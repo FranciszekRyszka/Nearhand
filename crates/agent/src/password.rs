@@ -1,7 +1,10 @@
 //! The one-time password that lets a viewer into a portable agent.
 //!
-//! The person at the host reads it out; the viewer types it; the agent checks
-//! it. The server never sees it, so a server alone cannot open a session.
+//! The person at the host reads it out; the viewer types it; neither sends
+//! it anywhere. The viewer proves it knows the password with the exchange
+//! in `nearhand_core::access`, which the agent answers from the password it
+//! is showing — so the server never sees it, and nor does anything else
+//! between the two.
 //!
 //! Six digits is a million possibilities, and a wrong guess costs a whole
 //! connection. After [`MAX_FAILURES`] wrong ones the password changes, so
@@ -9,6 +12,7 @@
 
 use std::sync::Mutex;
 
+use nearhand_core::access::Secret;
 use ring::rand::{SecureRandom, SystemRandom};
 
 use crate::gate::{Gate, Verdict};
@@ -24,13 +28,6 @@ pub struct Password {
 struct State {
     current: String,
     failures: u32,
-}
-
-pub enum Check {
-    Accepted,
-    Rejected,
-    /// Rejected, and that was one too many: here is the new password.
-    Replaced(String),
 }
 
 impl Password {
@@ -50,23 +47,6 @@ impl Password {
         self.lock().current.clone()
     }
 
-    pub fn check(&self, attempt: &str) -> Check {
-        let mut state = self.lock();
-        // Spaces are how people read six digits out: "482 913".
-        let attempt: String = attempt.chars().filter(|c| !c.is_whitespace()).collect();
-        if attempt == state.current {
-            state.failures = 0;
-            return Check::Accepted;
-        }
-        state.failures += 1;
-        if state.failures < MAX_FAILURES {
-            return Check::Rejected;
-        }
-        state.failures = 0;
-        state.current = draw(&self.random);
-        Check::Replaced(state.current.clone())
-    }
-
     /// Replace the password, at the host's request: whoever had the old one
     /// can no longer use it.
     pub fn renew(&self) -> String {
@@ -82,12 +62,27 @@ impl Password {
 }
 
 impl Gate for Password {
-    fn check(&self, attempt: &str) -> Verdict {
-        match Password::check(self, attempt) {
-            Check::Accepted => Verdict::Accepted,
-            Check::Rejected => Verdict::Rejected("wrong password"),
-            Check::Replaced(new) => Verdict::Replaced(new),
+    fn secret(&self) -> Secret {
+        Secret::OneTime
+    }
+
+    fn material(&self) -> Result<Vec<u8>, &'static str> {
+        Ok(self.current().into_bytes())
+    }
+
+    fn accepted(&self) {
+        self.lock().failures = 0;
+    }
+
+    fn rejected(&self) -> Verdict {
+        let mut state = self.lock();
+        state.failures += 1;
+        if state.failures < MAX_FAILURES {
+            return Verdict::Rejected("wrong password");
         }
+        state.failures = 0;
+        state.current = draw(&self.random);
+        Verdict::Replaced(state.current.clone())
     }
 }
 
@@ -121,54 +116,51 @@ mod tests {
         assert!(others.iter().any(|o| *o != a), "six draws all equal");
     }
 
+    /// What a viewer runs the exchange with is the password as read out,
+    /// spaces and all.
     #[test]
-    fn the_right_password_passes_with_or_without_spaces() {
+    fn the_material_is_the_password_a_viewer_would_type() {
         let password = Password::new();
         let current = password.current();
         let spaced = format!("{} {}", &current[..3], &current[3..]);
-        assert!(matches!(password.check(&spaced), Check::Accepted));
-        assert!(matches!(password.check(&current), Check::Accepted));
+        assert_eq!(
+            password.material().expect("material"),
+            Secret::OneTime.material(&spaced).expect("typed")
+        );
     }
 
     #[test]
     fn too_many_failures_replace_it() {
         let password = Password::new();
         let old = password.current();
-        let wrong = if old == "000000" { "111111" } else { "000000" };
         for _ in 1..MAX_FAILURES {
-            assert!(matches!(password.check(wrong), Check::Rejected));
+            assert!(matches!(password.rejected(), Verdict::Rejected(_)));
         }
-        let Check::Replaced(new) = password.check(wrong) else {
+        let Verdict::Replaced(new) = password.rejected() else {
             panic!("not replaced after {MAX_FAILURES} failures");
         };
         assert_eq!(new, password.current());
-        assert!(matches!(password.check(&old), Check::Rejected) || new == old);
+        // A draw can land on the same six digits; what matters is that the
+        // count started over.
+        assert!(matches!(password.rejected(), Verdict::Rejected(_)), "{old}");
     }
 
     #[test]
     fn a_renewed_password_replaces_the_old_one() {
         let password = Password::new();
-        let old = password.current();
         let new = password.renew();
         assert_eq!(new, password.current());
-        if new != old {
-            assert!(matches!(password.check(&old), Check::Rejected));
-        }
-        assert!(matches!(password.check(&new), Check::Accepted));
+        assert_eq!(password.material().expect("material"), new.into_bytes());
     }
 
     #[test]
     fn a_success_resets_the_count() {
         let password = Password::new();
         let current = password.current();
-        let wrong = if current == "000000" {
-            "111111"
-        } else {
-            "000000"
-        };
         for _ in 0..MAX_FAILURES * 3 {
-            assert!(matches!(password.check(wrong), Check::Rejected));
-            assert!(matches!(password.check(&current), Check::Accepted));
+            assert!(matches!(password.rejected(), Verdict::Rejected(_)));
+            password.accepted();
         }
+        assert_eq!(password.current(), current, "it was replaced after all");
     }
 }

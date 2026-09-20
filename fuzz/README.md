@@ -11,6 +11,7 @@ panic there is a machine that stops answering.
 | `video` | The reassembler, as a run of datagrams with the clock stepped between them |
 | `signature_file` | The two-line signature file beside a release package |
 | `signatures` | Checking a grant's and a release's signature, with the certificate, body and signature all arbitrary |
+| `access` | Both halves of the password exchange: the other side's message and its proof |
 
 `crates/core/tests/hostile.rs` is the same idea on stable, without
 coverage feedback: it runs in every build, in under a second. This

@@ -97,3 +97,56 @@ async fn another_agents_certificate_is_refused() {
     let client = client_endpoint(addr).expect("client");
     assert!(connect(&client, addr, genuine.fingerprint()).await.is_err());
 }
+
+/// The password exchange in `nearhand_core::access` is tied to one
+/// connection by keying material exported from its TLS session. What makes
+/// that worth anything is here: both ends of a connection derive the same
+/// bytes, and another connection — a server's own to each side, say —
+/// derives different ones.
+#[tokio::test]
+async fn keying_material_is_this_connection_and_no_other() {
+    let identity = Identity::generate().expect("identity");
+    let server = server_endpoint(loopback(), &identity).expect("server");
+    let addr = server.local_addr().expect("server address");
+
+    let accept = tokio::spawn(async move {
+        let mut bindings = Vec::new();
+        for _ in 0..2 {
+            let conn = server
+                .accept()
+                .await
+                .expect("incoming")
+                .await
+                .expect("handshake");
+            bindings.push(nearhand_transport::access::binding(&conn).expect("binding"));
+            // Held open: a closed connection exports nothing.
+            tokio::spawn(async move { conn.closed().await });
+        }
+        bindings
+    });
+
+    let client = client_endpoint(addr).expect("client");
+    let mut ours = Vec::new();
+    let mut connections = Vec::new();
+    for _ in 0..2 {
+        let conn = connect(&client, addr, identity.fingerprint())
+            .await
+            .expect("connect");
+        // A connection's keys are ready once it is, so a stream is not
+        // needed; open one anyway, as a session would.
+        let (mut send, _recv) = conn.open_bi().await.expect("stream");
+        send_message(&mut send, &Control::Bye).await.expect("send");
+        ours.push(nearhand_transport::access::binding(&conn).expect("binding"));
+        connections.push(conn);
+    }
+    let theirs = accept.await.expect("accepting");
+
+    assert_eq!(ours[0], theirs[0], "the two ends of one connection");
+    assert_eq!(ours[1], theirs[1], "the two ends of the other");
+    assert_ne!(ours[0], ours[1], "two connections, one binding");
+    assert_ne!(ours[0], [0; 32]);
+
+    for conn in connections {
+        conn.close(0u32.into(), b"done");
+    }
+}

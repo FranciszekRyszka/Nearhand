@@ -1,18 +1,31 @@
-//! What a viewer must say to be let in: the portable agent's one-time
+//! What a viewer must prove to be let in: the portable agent's one-time
 //! password, or an installed agent's access password.
+//!
+//! Neither is ever sent to the agent. The viewer proves it knows the
+//! password by running the exchange in `nearhand_core::access`, which needs
+//! the material behind it — for a one-time password the digits, for an
+//! access password the hash the agent stores — and this is where that comes
+//! from.
 
-/// Checks a password a viewer gave.
+use nearhand_core::access::Secret;
+
+/// Holds what a viewer must know, and counts the attempts.
 pub trait Gate: Send + Sync {
-    fn check(&self, attempt: &str) -> Verdict;
+    /// What the viewer is told to prepare.
+    fn secret(&self) -> Secret;
 
-    /// Whether a check takes long enough to belong off the async threads.
-    fn is_slow(&self) -> bool {
-        false
-    }
+    /// The material to run the exchange with, or why there will be no
+    /// exchange just now.
+    fn material(&self) -> Result<Vec<u8>, &'static str>;
+
+    /// The viewer proved it: forget the failures before it.
+    fn accepted(&self);
+
+    /// It did not, which may be one too many.
+    fn rejected(&self) -> Verdict;
 }
 
 pub enum Verdict {
-    Accepted,
     /// Refused, and why, for the viewer.
     Rejected(&'static str),
     /// Refused, and that was one too many: here is the new password, for the

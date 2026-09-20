@@ -7,7 +7,7 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
 /// Bumped on any incompatible change while we are pre-1.0.
-pub const PROTOCOL_VERSION: u16 = 5;
+pub const PROTOCOL_VERSION: u16 = 6;
 
 /// Video codec negotiated between viewer and agent.
 ///
@@ -63,12 +63,34 @@ pub enum Control {
     /// Agent to viewer, in place of [`Control::MonitorList`] after `Hello`:
     /// this agent takes viewers only with a password — its one-time or
     /// access password — or, if installed with a server, a grant from it.
-    AuthRequired,
-    /// Viewer to agent, answering [`Control::AuthRequired`]. A wrong one
-    /// closes the connection with [`close::AUTH_FAILED`]; right, and the agent
-    /// goes on with `MonitorList`. The agent checks it, never the server.
-    Authenticate {
-        password: String,
+    /// `secret` says which password, and how to prepare it; `None` means
+    /// this agent has none, and only a grant will do.
+    AuthRequired {
+        secret: Option<crate::access::Secret>,
+    },
+    /// Viewer to agent, answering [`Control::AuthRequired`]: the first
+    /// message of the password exchange ([`crate::access`]). The password
+    /// itself is never sent — not even to the agent, and so not to anything
+    /// between them.
+    AuthStart {
+        pake: Vec<u8>,
+    },
+    /// Agent to viewer: the other half of the exchange.
+    AuthAnswer {
+        pake: Vec<u8>,
+    },
+    /// Viewer to agent: proof that it reached the same key, and so knows
+    /// the password. Wrong, and the connection closes with
+    /// [`close::AUTH_FAILED`]; right, and the agent answers in kind and goes
+    /// on with `MonitorList`. The agent checks it, never the server.
+    AuthProve {
+        proof: Vec<u8>,
+    },
+    /// Agent to viewer: the same proof the other way. A viewer that cannot
+    /// check it closes: it reached something that does not know the
+    /// password.
+    AuthProved {
+        proof: Vec<u8>,
     },
     /// Viewer to agent, answering [`Control::AuthRequired`] instead of a
     /// password: a grant the server signed for this device
@@ -301,10 +323,24 @@ mod tests {
                 primary: true,
             }]),
             Control::Bye,
-            Control::AuthRequired,
-            Control::Authenticate {
-                password: "482913".to_owned(),
+            Control::AuthRequired {
+                secret: Some(crate::access::Secret::OneTime),
             },
+            Control::AuthRequired {
+                secret: Some(crate::access::Secret::Access {
+                    salt: vec![1; 16],
+                    iterations: 600_000,
+                }),
+            },
+            Control::AuthRequired { secret: None },
+            Control::AuthStart {
+                pake: vec![0x41; 33],
+            },
+            Control::AuthAnswer {
+                pake: vec![0x42; 33],
+            },
+            Control::AuthProve { proof: vec![7; 32] },
+            Control::AuthProved { proof: vec![8; 32] },
             Control::Present {
                 grant: crate::grant::SignedGrant {
                     grant: vec![1, 2, 3],

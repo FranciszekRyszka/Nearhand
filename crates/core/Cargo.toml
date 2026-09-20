@@ -7,8 +7,15 @@ repository.workspace = true
 
 [dependencies]
 bytes = { version = "1.12.1", features = ["serde"] }
+hkdf = "0.12"
+hmac = "0.12"
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
 postcard = { version = "1.1.3", features = ["use-std"] }
+rand_core = "0.6"
 serde = { version = "1.0.229", features = ["derive"] }
+sha2 = "0.10"
+spake2 = { version = "0.4", default-features = false }
+subtle = "2"
 thiserror = "2.0.20"
 
 [lints]

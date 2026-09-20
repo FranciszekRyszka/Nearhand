@@ -10,6 +10,7 @@
 //! would produce. The fuzzer proper is in `fuzz/`, on nightly and weekly;
 //! what it finds belongs here afterwards, as a case every build sees.
 
+use nearhand_core::access;
 use nearhand_core::grant::{Grant, Role, SignedGrant};
 use nearhand_core::release::{Package, Release, SignedRelease, Version};
 use nearhand_core::rendezvous::{Enrollment, FromServer, ToServer};
@@ -268,5 +269,45 @@ fn mangled_signature_files_are_errors_not_panics() {
         }
         let len = rng.below(200);
         let _ = SignedRelease::from_text(&String::from_utf8_lossy(&rng.bytes(len)));
+    }
+}
+
+/// The password exchange takes the other side's message, and then its
+/// proof, before anything about either is known.
+#[test]
+fn hostile_password_exchanges_are_errors_not_panics() {
+    let mut rng = Rng(0xA11C_E000_1234_5678);
+    let binding = [3u8; 32];
+    // A message as the other side really sends one, to mangle.
+    let (_, real) = access::Viewer::start(b"a password", &binding, access::Seed([1; 64]));
+    // Few rounds: a curve is slow to walk in a debug build, and the fuzzer
+    // in `fuzz/` does the long walk.
+    for round in 0..40 {
+        let bytes = if round % 2 == 0 {
+            let len = rng.below(80);
+            rng.bytes(len)
+        } else {
+            let mut message = real.clone();
+            let at = rng.below(message.len());
+            message[at] ^= (rng.next() as u8) | 1;
+            message
+        };
+        let seed = access::Seed([(round % 251) as u8; 64]);
+        // The agent's side: whatever arrives, it answers or refuses.
+        if let Ok((agent, _)) = access::Agent::answer(b"a password", &binding, seed.clone(), &bytes)
+        {
+            let len = rng.below(48);
+            let _ = agent.check(&rng.bytes(len));
+        }
+        // The viewer's side, on both the message and the proof.
+        let (viewer, _) = access::Viewer::start(b"a password", &binding, seed);
+        if let Ok((proven, _)) = viewer.prove(&bytes) {
+            let len = rng.below(48);
+            let guess = rng.bytes(len);
+            assert!(
+                proven.check(&guess).is_err(),
+                "a proof out of nowhere was accepted"
+            );
+        }
     }
 }
