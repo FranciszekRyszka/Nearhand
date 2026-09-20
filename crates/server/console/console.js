@@ -50,6 +50,19 @@ async function api(method, path, body) {
   return data;
 }
 
+/// Upload files to `path`, as a form: what `api()` does for JSON.
+async function upload(path, data) {
+  const response = await fetch("/api/v1" + path, {
+    method: "POST",
+    body: data,
+    credentials: "same-origin",
+  });
+  const text = await response.text();
+  const body = text ? JSON.parse(text) : null;
+  if (!response.ok) throw new ApiError(response.status, body);
+  return body;
+}
+
 function when(seconds) {
   if (!seconds) return "—";
   const date = new Date(seconds * 1000);
@@ -111,6 +124,7 @@ const state = { me: null, server: null };
 const tabs = [
   { id: "devices", title: "Devices" },
   { id: "enroll", title: "Enrollment", admin: true },
+  { id: "releases", title: "Agent updates", admin: true },
   { id: "users", title: "Users", admin: true },
   { id: "groups", title: "Groups & grants", admin: true },
   { id: "audit", title: "Audit log", admin: true },
@@ -327,6 +341,71 @@ const pages = {
           }),
         }, "Delete")),
       )), "None."),
+    );
+  },
+
+  async releases() {
+    const [releases, devices] = await Promise.all([
+      api("GET", "/releases"),
+      api("GET", "/devices"),
+    ]);
+    const offered = releases.find((r) => r.offered);
+    const older = (version) => {
+      const parts = (text) => String(text).split(".").map((n) => Number(n) || 0);
+      const [a, b] = [parts(version), parts(offered.version)];
+      return a[0] < b[0] || (a[0] === b[0] && (a[1] < b[1] || (a[1] === b[1] && a[2] < b[2])));
+    };
+    const behind = offered ? devices.filter((d) => older(d.version)).length : 0;
+    const size = (bytes) => bytes >= 1024 * 1024
+      ? `${(bytes / (1024 * 1024)).toFixed(1)} MB`
+      : `${Math.max(1, Math.round(bytes / 1024))} KB`;
+
+    const rows = releases.map((r) => h("tr", {},
+      h("td", {}, r.version),
+      h("td", {}, r.platform),
+      h("td", {}, r.package),
+      h("td", {}, size(r.size)),
+      h("td", {}, when(r.uploaded_at)),
+      h("td", {}, r.offered ? "offered" : ""),
+      h("td", {},
+        h("button", {
+          class: "link", onclick: () => attempt(async () => {
+            await api(r.offered ? "DELETE" : "POST", `/releases/${r.id}/offer`);
+            render();
+          }),
+        }, r.offered ? "Stop offering" : "Offer"),
+        r.offered ? null : h("button", {
+          class: "link danger", onclick: () => attempt(async () => {
+            await api("DELETE", `/releases/${r.id}`);
+            render();
+          }),
+        }, "Delete"),
+      ),
+    ));
+
+    return h("section", {},
+      h("h2", {}, "Agent updates"),
+      h("p", { class: "quiet" },
+        "Agents update themselves from this server, to the release offered here. " +
+        "They install only packages signed with the project's release key, never older " +
+        "than they run, and never while a session is on."),
+      form("row", [
+        field("Package (.msi)", h("input", { name: "package", type: "file", accept: ".msi", required: true })),
+        field("Signature (.release)", h("input", { name: "signature", type: "file", accept: ".release", required: true })),
+      ], "Upload", async (_values, el) => {
+        await upload("/releases", new FormData(el));
+        render();
+      }),
+      offered
+        ? h("p", {}, `Offering ${offered.version} for ${offered.platform}: `,
+            devices.length === 0
+              ? "no devices are enrolled yet."
+              : behind
+                ? `${behind} of ${devices.length} devices are older.`
+                : "every device is up to date.")
+        : h("p", { class: "quiet" }, "Nothing offered: agents stay as they are."),
+      table(["Version", "Platform", "Package", "Size", "Uploaded", "", ""], rows,
+        "No releases here yet. Upload the MSI and its .release file from the project's build."),
     );
   },
 

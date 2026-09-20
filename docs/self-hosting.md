@@ -171,12 +171,12 @@ valid for 24 hours; `nearhand-server admin-link` prints a new one.
 ### The web console
 
 `https://<public_url>/`: sign in, and administrators get the devices (with
-who is online), enrollment tokens, users, user and device groups, grants and
-the audit log; everyone gets the devices their grants reach, their password,
-two-step sign-in and API tokens. It is a page over the REST API below, so
-anything it does a script can do too. For the TOTP set-up, add the key it
-shows to the authenticator app by hand, or open the `otpauth://` link on the
-phone: the console draws no QR code.
+who is online), enrollment tokens, agent updates, users, user and device
+groups, grants and the audit log; everyone gets the devices their grants
+reach, their password, two-step sign-in and API tokens. It is a page over
+the REST API below, so anything it does a script can do too. For the TOTP
+set-up, add the key it shows to the authenticator app by hand, or open the
+`otpauth://` link on the phone: the console draws no QR code.
 
 ### The web viewer
 
@@ -288,7 +288,9 @@ you choose when your machines update, and to which release, and a server
 can do no more to them than that ([security](security.md#supply-chain)).
 
 Every Nearhand release comes as an MSI with a `.release` file beside it,
-both from the project's CI. Upload the pair, then offer it:
+both from the project's CI. Upload the pair in the console's **Agent
+updates**, and press **Offer**; it says how many devices are still older.
+The same over the API:
 
 ```bash
 api() { curl -s "https://desk.example.com/api/v1$1" -H "authorization: Bearer $ADMIN" "${@:2}"; }
