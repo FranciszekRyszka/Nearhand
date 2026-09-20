@@ -43,6 +43,11 @@ const MAX_PENDING: usize = 64;
 /// How many wholly missing frames one call to [`Reassembler::nacks`] asks for.
 const MAX_GAP_NACKS: u32 = 32;
 
+/// How many of those are remembered as asked for. Ids run in order, so the
+/// list clears itself as frames settle; a sender whose ids jump about — a
+/// broken one, or a hostile one — must not make it grow without end.
+const MAX_REMEMBERED_GAPS: usize = 4 * MAX_GAP_NACKS as usize;
+
 /// Split an encoded frame into chunks that each serialise to at most
 /// `max_datagram` bytes.
 ///
@@ -311,7 +316,22 @@ impl Reassembler {
                     if due(asked.map(|i| self.gap_nacks[i].1)) {
                         match asked {
                             Some(i) => self.gap_nacks[i].1 = now_us,
-                            None => self.gap_nacks.push((id, now_us)),
+                            None => {
+                                // The stalest goes: it was asked for
+                                // longest ago, so it is the least likely to
+                                // still be worth repairing.
+                                if self.gap_nacks.len() >= MAX_REMEMBERED_GAPS
+                                    && let Some(stalest) = self
+                                        .gap_nacks
+                                        .iter()
+                                        .enumerate()
+                                        .min_by_key(|(_, (_, asked))| *asked)
+                                        .map(|(i, _)| i)
+                                {
+                                    self.gap_nacks.swap_remove(stalest);
+                                }
+                                self.gap_nacks.push((id, now_us));
+                            }
                         }
                         out.push(Missing {
                             frame_id: id,
@@ -332,18 +352,31 @@ impl Reassembler {
     /// just as stuck.
     pub fn expire(&mut self, now_us: u64, timing: &Timing) {
         while let Some(expected) = self.expected() {
-            let stuck_since = match self.pending.iter().find(|p| p.frame_id == expected) {
-                Some(pending) => pending.last_chunk_us,
-                // Nothing of it arrived: stuck since a newer frame showed up.
-                None => match self.pending.iter().map(|p| p.first_us).min() {
-                    Some(first) => first,
+            let waiting = self.pending.iter().find(|p| p.frame_id == expected);
+            let (stuck_since, gap_to) = match waiting {
+                Some(pending) => (pending.last_chunk_us, None),
+                // Nothing of it arrived: stuck since the oldest frame
+                // waiting turned up, and every id between the two is gone
+                // with it. They are given up together — walking the gap one
+                // id at a time would be endless against a sender whose
+                // numbering jumps, whether it is broken or malicious.
+                None => match self.oldest_pending() {
+                    Some((id, first_us)) => (first_us, Some(id)),
                     None => return,
                 },
             };
             if now_us.saturating_sub(stuck_since) < timing.give_up_us {
                 return;
             }
-            self.give_up_expected();
+            match gap_to {
+                None => self.give_up_expected(),
+                Some(id) => {
+                    self.stats.incomplete += 1;
+                    self.settle(id.wrapping_sub(1));
+                    self.lost();
+                    self.drain();
+                }
+            }
         }
     }
 
@@ -408,6 +441,15 @@ impl Reassembler {
         }
     }
 
+    /// The frame waiting with the oldest id, and when the first of it
+    /// arrived.
+    fn oldest_pending(&self) -> Option<(u32, u64)> {
+        self.pending
+            .iter()
+            .map(|p| (p.frame_id, p.first_us))
+            .reduce(|a, b| if is_newer(a.0, b.0) { b } else { a })
+    }
+
     fn newest_pending(&self) -> Option<u32> {
         self.pending
             .iter()
@@ -428,9 +470,23 @@ impl Reassembler {
                 continue;
             }
             // Stuck on an older frame, but a complete keyframe is already
-            // here: it needs nothing before it, so skip straight to it.
-            if self.pending.iter().any(|p| p.keyframe && p.complete()) {
-                self.give_up_expected_quietly();
+            // here: it needs nothing before it, so skip straight to it — in
+            // one step, however far ahead its id is. Walking the ids
+            // between would be endless against a sender whose numbering
+            // jumps, whether it is broken or malicious.
+            if let Some(keyframe) = self
+                .pending
+                .iter()
+                .filter(|p| p.keyframe && p.complete())
+                .map(|p| p.frame_id)
+                .reduce(|a, b| if is_newer(a, b) { b } else { a })
+            {
+                let settled = keyframe.wrapping_sub(1);
+                let before = self.pending.len();
+                self.pending.retain(|p| is_newer(p.frame_id, settled));
+                // What was skipped is one loss, however many ids it spans.
+                self.stats.incomplete += (before - self.pending.len()).max(1) as u64;
+                self.settle(settled);
                 continue;
             }
             return;
@@ -802,6 +858,55 @@ mod tests {
         }
         assert_eq!(r.stats().incomplete, 1);
         assert!(r.take_keyframe_request());
+    }
+
+    /// A frame id far ahead of the last one leaves a gap of millions. It is
+    /// given up as one, not walked: walking it would hang the viewer.
+    #[test]
+    fn a_huge_gap_in_frame_ids_is_given_up_at_once() {
+        let mut r = Reassembler::new();
+        feed(&mut r, frame(7, true, 500).1).expect("start");
+        // The next frame the sender numbers is most of the id space away,
+        // and arrives whole.
+        let far = 7u32.wrapping_add(2_000_000_000);
+        let (data, chunks) = frame(far, true, 4_000);
+        for chunk in chunks {
+            r.push(chunk, 0);
+        }
+
+        let started = std::time::Instant::now();
+        r.expire(TIMING.give_up_us * 2, &TIMING);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "expire walked the gap"
+        );
+        // Everything in the gap counts as one frame lost, and the frame
+        // that did arrive is delivered rather than waited on for ever.
+        assert_eq!(r.stats().incomplete, 1);
+        assert_eq!(r.pop().expect("the far frame").data, data);
+    }
+
+    /// A sender whose frame ids jump about leaves gaps that are asked for
+    /// and never settle. What is remembered about them is bounded.
+    #[test]
+    fn scattered_frame_ids_do_not_grow_the_gap_list() {
+        let mut r = Reassembler::new();
+        feed(&mut r, frame(0, true, 500).1).expect("start");
+        let mut now = 0;
+        for round in 0..500u32 {
+            // Ids far apart, so each round leaves a fresh run of gaps.
+            let (_, chunks) = frame(round.wrapping_mul(10_000).wrapping_add(1), false, 4_000);
+            r.push(chunks[0].clone(), now);
+            now += TIMING.retry_us * 2;
+            let _ = r.nacks(now, &TIMING);
+            r.expire(now, &TIMING);
+        }
+        assert!(
+            r.gap_nacks.len() <= MAX_REMEMBERED_GAPS,
+            "gap list grew to {}",
+            r.gap_nacks.len()
+        );
+        assert!(r.pending.len() <= MAX_PENDING);
     }
 
     #[test]

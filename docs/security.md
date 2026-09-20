@@ -139,7 +139,13 @@ account (M5).
   - *Implemented:* a browser that cannot use UDP takes the same relay over a
     WebSocket (`/api/v1/relay`). That one is opened only for a signed-in
     account, and only from the console's own origin, so another site cannot
-    tunnel through this server with a visitor's cookie.
+    tunnel through this server with a visitor's cookie. What waits to go out
+    to a browser is bounded — a slow reader loses packets, as a datagram
+    carrier should, rather than filling the server's memory.
+  - *Known:* anyone with an account can open a tunnel to any device ID that
+    is online, as anyone can over WebTransport, and learn from the refusal
+    whether that ID exists here. The tunnel is useless without a grant — the
+    agent refuses the session — but it costs the server a little bandwidth.
   - *Not yet:* limits on how much one session may relay. Only an agent that
     accepted the session can receive its traffic, but a server open to
     everyone carries whatever that pair sends.
@@ -222,7 +228,12 @@ account (M5).
   update, and to which of the project's releases; it cannot make them run
   anything else.
 - `cargo-deny` and `cargo-audit` run in CI.
-- The protocol decoder gets fuzzed (`cargo-fuzz`) before 1.0.
+- Every decoder is fed random and mangled bytes on each build
+  (`crates/core/tests/hostile.rs`): messages, grants, releases, signature
+  files and video chunks, and the video reassembler is driven with chunks no
+  sane sender would produce. A malformed message must be an error, never a
+  panic and never an unbounded loop. `cargo-fuzz` on top of that is for
+  before 1.0.
 - External review before 1.0.
 
 ## Known limits

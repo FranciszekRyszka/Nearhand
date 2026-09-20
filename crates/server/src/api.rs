@@ -58,6 +58,9 @@ pub const RELAY_PATH: &str = "/api/v1/relay";
 const MAX_RELAYED: usize = 16 * 1024;
 /// How long a browser has to say which device it wants.
 const RELAY_FIRST_MESSAGE: std::time::Duration = std::time::Duration::from_secs(10);
+/// Packets waiting to go out to one browser. About a quarter of a megabyte
+/// of video, after which the newest are dropped rather than queued.
+const RELAY_QUEUE: usize = 200;
 
 pub struct AppState {
     pub accounts: Arc<Accounts>,
@@ -1201,9 +1204,12 @@ async fn tunnel(socket: WebSocket, state: Arc<AppState>, from: SocketAddr) -> an
     }
     writer.send(Message::Binary(answer.into())).await?;
 
-    let (out, sending) = mpsc::unbounded_channel();
+    // Bounded, and dropping what does not fit: a browser that reads slowly
+    // must not pile the agent's video up in this server's memory. Datagrams
+    // are droppable by definition — the viewer asks for the repair.
+    let (out, sending) = mpsc::channel(RELAY_QUEUE);
     let writing = tokio::spawn(async move {
-        let mut out: mpsc::UnboundedReceiver<Bytes> = sending;
+        let mut out: mpsc::Receiver<Bytes> = sending;
         while let Some(datagram) = out.recv().await {
             if writer.send(Message::Binary(datagram)).await.is_err() {
                 break;
@@ -1236,13 +1242,18 @@ fn framed<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> anyhow::Result<T> {
 
 /// A browser's WebSocket, as the viewer's side of a tunnel.
 struct OverTcp {
-    out: mpsc::UnboundedSender<Bytes>,
+    out: mpsc::Sender<Bytes>,
     incoming: tokio::sync::Mutex<futures_util::stream::SplitStream<WebSocket>>,
 }
 
 impl nearhand_transport::relay::Carrier for OverTcp {
     fn send_datagram(&self, datagram: Bytes) -> bool {
-        self.out.send(datagram).is_ok()
+        // Full means this browser is behind; the packet goes, not the
+        // tunnel. Closed means it has left.
+        !matches!(
+            self.out.try_send(datagram),
+            Err(mpsc::error::TrySendError::Closed(_))
+        )
     }
 
     fn read_datagram(

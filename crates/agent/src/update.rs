@@ -29,6 +29,10 @@ const FIRST_CHECK: Duration = Duration::from_secs(5 * 60);
 const EVERY: Duration = Duration::from_secs(6 * 3600);
 /// When a check failed, or a session was on, or the server was busy.
 const RETRY: Duration = Duration::from_secs(15 * 60);
+/// The largest package this will fetch. The release key signs the size, so
+/// this only bounds what a release could ask of a machine's memory —
+/// agent installers are a few MB.
+const MAX_PACKAGE: u64 = 256 * 1024 * 1024;
 
 /// What this agent is, for the server to answer about.
 pub fn this_version() -> Version {
@@ -217,6 +221,12 @@ fn suitable(release: &Release, platform: &str, current: Version) -> Result<()> {
         bail!(
             "the release is {}, and {current} is running",
             release.version
+        );
+    }
+    if release.size > MAX_PACKAGE {
+        bail!(
+            "the release is {} bytes: too large to install",
+            release.size
         );
     }
     Ok(())
