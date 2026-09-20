@@ -87,6 +87,7 @@ pub async fn checks(config: &Config) -> Vec<(&'static str, Finding)> {
     let mut checks = vec![("data folder", data_folder(&config.data.dir))];
     checks.push(("server key", key(config)));
     checks.push(("database", database(config).await));
+    checks.push(("audit log", audit(config)));
     checks.push(("releases", releases(config)));
     checks.push(("certificate", certificate(config)));
     checks.push(("UDP port", udp(config.quic.bind)));
@@ -205,6 +206,20 @@ async fn summary(pool: &SqlitePool) -> Result<Finding, sqlx::Error> {
     Ok(Finding::Good(format!(
         "{users} users, {devices} devices ({recent} seen this week), {grants} grants"
     )))
+}
+
+/// How long the record of who did what is kept.
+fn audit(config: &Config) -> Finding {
+    match config.audit.keep_days {
+        0 => Finding::Note(
+            "audit.keep_days = 0: entries are kept for ever, and nothing \
+             watches the disk"
+                .into(),
+        ),
+        days => Finding::Good(format!(
+            "entries older than {days} days are swept daily (audit.keep_days)"
+        )),
+    }
 }
 
 /// What agents would be offered, and what it costs on disk.

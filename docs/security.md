@@ -226,6 +226,10 @@ account (M5).
   happened, not what a server's administrator — or someone who took the
   server — chose to erase. Shipping it somewhere else as it is written is a
   possible later addition.
+- Entries are kept for a year by default and swept daily; `audit.keep_days`
+  sets the span, and 0 keeps them for ever. A server whose disk fills stops
+  being a server, so this is a setting rather than a promise to keep
+  everything.
 - What it does not see: sessions by password (the server never learns
   them), and what happens inside any session.
 - The **web viewer** runs the same session as the native one, compiled to

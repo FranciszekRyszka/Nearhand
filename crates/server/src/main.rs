@@ -15,6 +15,7 @@ mod db;
 mod devices;
 mod doctor;
 mod grants;
+mod housekeeping;
 mod https;
 #[cfg(test)]
 mod netsim;
@@ -156,6 +157,12 @@ async fn serve(config: Config, key: PathBuf) -> Result<()> {
     } else {
         None
     };
+    // Rows nobody will read again: expired sessions, the setup link, and
+    // audit entries past their keeping.
+    tokio::spawn(housekeeping::keep_tidy(
+        pool.clone(),
+        config.audit.keep_days,
+    ));
     let devices = Arc::new(Devices::new(pool.clone()));
     let grants = Arc::new(Grants::new(pool.clone()));
     let audit = Arc::new(audit::Audit::new(pool.clone()));

@@ -10,6 +10,9 @@
 //! bind = "0.0.0.0:443"           # UDP: agents, viewers, relay
 //! public_address = "desk.example.com:443"   # how agents reach it
 //!
+//! [audit]
+//! keep_days = 365                # 0 keeps the audit log for ever
+//!
 //! [http]
 //! bind = "0.0.0.0:443"           # TCP: REST API and console
 //! tls = "self-signed"            # or "none" behind a reverse proxy,
@@ -31,12 +34,28 @@ pub struct Config {
     pub data: Data,
     pub quic: Quic,
     pub http: Http,
+    pub audit: Audit,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Data {
     pub dir: PathBuf,
+}
+
+/// The audit log's one setting: how long to keep it.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Audit {
+    /// Days to keep entries for. 0 keeps them for ever — which is a
+    /// choice, on a machine whose disk nobody watches.
+    pub keep_days: u32,
+}
+
+impl Default for Audit {
+    fn default() -> Self {
+        Self { keep_days: 365 }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -127,7 +146,7 @@ impl Config {
             else {
                 continue;
             };
-            if !matches!(section.as_str(), "data" | "quic" | "http") {
+            if !matches!(section.as_str(), "data" | "quic" | "http" | "audit") {
                 continue;
             }
             let entry = table
@@ -136,7 +155,15 @@ impl Config {
             let Some(section_table) = entry.as_table_mut() else {
                 bail!("[{section}] is not a section");
             };
-            section_table.insert(key, toml::Value::String(value));
+            // The environment has only strings; TOML has types. A
+            // setting that is a number in the file has to be one here too,
+            // or it would not parse.
+            let value = match (value.parse::<i64>(), value.parse::<bool>()) {
+                (Ok(number), _) => toml::Value::Integer(number),
+                (_, Ok(yes_no)) => toml::Value::Boolean(yes_no),
+                _ => toml::Value::String(value),
+            };
+            section_table.insert(key, value);
         }
         let config: Self = toml::Value::Table(table)
             .try_into()
@@ -226,10 +253,27 @@ mod tests {
     fn nothing_given_means_defaults() {
         let config = Config::parse("", env(&[])).expect("parse");
         assert_eq!(config.data.dir, PathBuf::from("."));
+        assert_eq!(config.audit.keep_days, 365);
         assert_eq!(config.quic.bind.port(), 443);
         assert_eq!(config.http.tls, Tls::SelfSigned);
         assert_eq!(config.public_url(), "https://localhost");
         assert_eq!(config.public_address(), "localhost:443");
+    }
+
+    /// How long the audit log is kept is a setting like any other, and 0
+    /// means for ever.
+    #[test]
+    fn the_audit_log_is_kept_for_a_year_unless_told_otherwise() {
+        let set = Config::parse(
+            "[audit]
+keep_days = 30
+",
+            env(&[]),
+        )
+        .expect("parse");
+        assert_eq!(set.audit.keep_days, 30);
+        let forever = Config::parse("", env(&[("NEARHAND_AUDIT_KEEP_DAYS", "0")])).expect("parse");
+        assert_eq!(forever.audit.keep_days, 0);
     }
 
     #[test]

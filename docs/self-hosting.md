@@ -119,7 +119,14 @@ tls = "self-signed"            # made on first start; browsers warn about it
 # key = "/etc/letsencrypt/live/desk.example.com/privkey.pem"
 # tls = "none"                 # plain HTTP behind a reverse proxy; bind to 127.0.0.1
 public_url = "https://desk.example.com"   # for the links the server prints
+
+[audit]
+keep_days = 365               # 0 keeps the audit log for ever
 ```
+
+Every setting can come from the environment instead:
+`NEARHAND_AUDIT_KEEP_DAYS=30`, `NEARHAND_HTTP_BIND=0.0.0.0:8443`, and so
+on — which is how the Docker image is usually configured.
 
 The HTTPS certificate is separate from the server key agents and viewers pin:
 browsers do not accept the Ed25519 certificate that key makes. Built-in ACME

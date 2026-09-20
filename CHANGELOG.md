@@ -67,6 +67,16 @@ how agents get to this version.
   can be short of the most recent writes.
 - [docs/troubleshooting.md](docs/troubleshooting.md).
 
+### Changed
+
+- The server sweeps daily: console sessions and setup links past their
+  time, and audit entries older than `audit.keep_days` — a year by
+  default, 0 to keep them for ever. Nothing pruned them before, on a
+  server meant to run for years on one small machine.
+- Settings from the environment may be numbers and true/false, not only
+  text: `NEARHAND_AUDIT_KEEP_DAYS=30` works as the file's `keep_days = 30`
+  does.
+
 ### Fixed
 
 - A device's version in the console followed it after a self-update: an
