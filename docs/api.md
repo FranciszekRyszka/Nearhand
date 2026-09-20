@@ -58,6 +58,11 @@ Errors are `{"error": "..."}` with a fitting status code.
 | `POST /devices/{id}/grant` | signed in | a grant for the caller on that device, for the web viewer: `{device_id, fingerprint, role, grant}`, `grant` the signed grant in hex; 404 without one |
 | `GET /webtransport` | signed in | `{url, certificate_hashes}`: where the web viewer's WebTransport goes, and the SHA-256 (hex) of the certificate to accept when it is self-signed |
 | `GET /audit?before=&limit=` | administrators | newest first, `limit` up to 500 (100 unless given); `before`, an entry's id, pages back: `{id, at, actor, address, action, target, detail}` |
+| `GET /releases` | administrators | agent releases held: `{id, product, platform, version, package, sha256, size, uploaded_at, offered}` |
+| `POST /releases` | administrators | `multipart/form-data` with fields `package` (the MSI) and `signature` (its `.release` file); 400 unless the project's release key signed it and the package is the one signed |
+| `POST /releases/{id}/offer` | administrators | offers it to agents of its product and platform older than it, in place of any other |
+| `DELETE /releases/{id}/offer` | administrators | stops offering it |
+| `DELETE /releases/{id}` | administrators | deletes it and its package; not while it is offered |
 
 Connecting with a grant is not over this API: the viewer asks on the QUIC
 side, with an API token (`docs/protocol.md`).

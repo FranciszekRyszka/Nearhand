@@ -16,6 +16,7 @@ mod grants;
 mod https;
 #[cfg(test)]
 mod netsim;
+mod releases;
 mod rendezvous;
 mod totp;
 mod webtransport;
@@ -143,19 +144,27 @@ async fn serve(config: Config, key: PathBuf) -> Result<()> {
     let devices = Arc::new(Devices::new(pool.clone()));
     let grants = Arc::new(Grants::new(pool.clone()));
     let audit = Arc::new(audit::Audit::new(pool.clone()));
-    let registry = Arc::new(rendezvous::Registry::new(devices.clone()).with_access(
-        rendezvous::Access {
-            accounts: accounts.clone(),
-            grants: grants.clone(),
-            identity: identity.clone(),
-            audit: audit.clone(),
-        },
+    let releases = Arc::new(releases::Releases::new(
+        pool.clone(),
+        config.releases_dir(),
+        nearhand_core::release::KEY,
     ));
+    let registry = Arc::new(
+        rendezvous::Registry::new(devices.clone())
+            .with_access(rendezvous::Access {
+                accounts: accounts.clone(),
+                grants: grants.clone(),
+                identity: identity.clone(),
+                audit: audit.clone(),
+            })
+            .with_releases(releases.clone()),
+    );
     let state = Arc::new(api::AppState {
         accounts,
         devices,
         grants,
         audit,
+        releases,
         identity: identity.clone(),
         web,
         registry: registry.clone(),

@@ -22,6 +22,14 @@
 //! on a connection of its own, `Enroll` ──▶ and ◀── `Enrolled`. That puts it
 //! in the server's device list; it registers as above either way.
 //!
+//! An installed agent asks for updates the same way, on a connection of its
+//! own: `Update` ──▶ and ◀── `Offered`, with the release the server's
+//! administrators offer, if it is newer than the agent. To take it, the
+//! agent sends `Fetch` ──▶, and the server sends the package's bytes on the
+//! stream, then finishes it. The agent installs it only if the release key
+//! built into it signed the release and the package is the one signed
+//! (`crate::release`).
+//!
 //! The server vouches for which key belongs to an ID, and nothing else: it
 //! never sees a session's contents or its password. Everything after `Peer`
 //! runs between viewer and agent on the peer protocol, [`crate::ALPN`].
@@ -33,6 +41,7 @@ use std::str::FromStr;
 use serde::{Deserialize, Serialize};
 
 use crate::grant::SignedGrant;
+use crate::release::{SignedRelease, Version};
 
 /// Application-layer protocol name for connections to the server.
 pub const SERVER_ALPN: &[u8] = b"nearhand-server/1";
@@ -130,6 +139,15 @@ pub enum ToServer {
         addresses: Vec<SocketAddr>,
         token: String,
     },
+    /// First message from an agent, with its certificate, asking whether
+    /// there is a newer release of `product` for `platform` than `version`.
+    Update {
+        product: String,
+        platform: String,
+        version: Version,
+    },
+    /// After `Offered` with a release: send its package.
+    Fetch,
 }
 
 /// What an agent sends to enroll.
@@ -173,6 +191,8 @@ pub enum FromServer {
     /// To a viewer that sent `ConnectAs`, before `Peer`: the grant to
     /// present to the device.
     Granted(SignedGrant),
+    /// To an agent that sent `Update`: the release to update to, or none.
+    Offered(Option<SignedRelease>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -197,6 +217,8 @@ pub enum Refusal {
     NotSignedIn,
     /// The user has no grant for that device.
     NotAllowed,
+    /// The server is busy sending packages to other agents; ask later.
+    Busy,
 }
 
 impl fmt::Display for Refusal {
@@ -211,6 +233,7 @@ impl fmt::Display for Refusal {
             Refusal::Enrollment => "the enrollment token is wrong, expired or used up",
             Refusal::NotSignedIn => "the server does not know that API token",
             Refusal::NotAllowed => "you have no grant for that device",
+            Refusal::Busy => "the server is busy; try again later",
         })
     }
 }

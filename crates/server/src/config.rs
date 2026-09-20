@@ -167,6 +167,11 @@ impl Config {
         self.data.dir.join("nearhand.db")
     }
 
+    /// Where agent release packages are kept.
+    pub fn releases_dir(&self) -> PathBuf {
+        self.data.dir.join("releases")
+    }
+
     /// How agents reach the QUIC side, for the install commands the server
     /// hands out.
     pub fn public_address(&self) -> String {

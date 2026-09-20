@@ -36,6 +36,7 @@ use std::time::Duration;
 use nearhand_core::ALPN;
 use nearhand_core::grant::SignedGrant;
 use nearhand_core::proto::close;
+use nearhand_core::release::{SignedRelease, Version};
 use nearhand_core::rendezvous::{DeviceId, Enrollment, FromServer, ToServer};
 use quinn::{Connection, Endpoint};
 
@@ -184,6 +185,80 @@ pub async fn enroll(
     .await;
     conn.close(close::NORMAL.into(), b"enrolled");
     answer
+}
+
+/// A release the server offers this agent, not yet fetched: its connection
+/// stays open until [`Offered::fetch`], or until this is dropped.
+pub struct Offered {
+    /// Unchecked: the caller verifies it before fetching, and the package
+    /// after.
+    pub signed: SignedRelease,
+    conn: Connection,
+    send: quinn::SendStream,
+    recv: quinn::RecvStream,
+}
+
+impl Offered {
+    /// The package, at most `size` bytes: the size the verified release
+    /// gives. A server sending more is cut off.
+    pub async fn fetch(mut self, size: u64) -> Result<Vec<u8>> {
+        send_message(&mut self.send, &ToServer::Fetch).await?;
+        let limit = usize::try_from(size).unwrap_or(usize::MAX);
+        let package = self
+            .recv
+            .read_to_end(limit)
+            .await
+            .map_err(|e| Error::Unexpected(format!("fetching the package: {e}")))?;
+        self.conn.close(close::NORMAL.into(), b"fetched");
+        Ok(package)
+    }
+}
+
+impl Drop for Offered {
+    fn drop(&mut self) {
+        self.conn.close(close::NORMAL.into(), b"done");
+    }
+}
+
+/// Ask the server whether there is a release of `product` for `platform`
+/// newer than `version`, as the agent with `identity`.
+pub async fn check_update(
+    endpoint: &Endpoint,
+    server: SocketAddr,
+    server_fingerprint: Fingerprint,
+    identity: &Identity,
+    product: &str,
+    platform: &str,
+    version: Version,
+) -> Result<Option<Offered>> {
+    let conn = connect_server(endpoint, server, server_fingerprint, Some(identity)).await?;
+    let (mut send, mut recv) = conn.open_bi().await?;
+    let asked = ToServer::Update {
+        product: product.to_owned(),
+        platform: platform.to_owned(),
+        version,
+    };
+    let answer = async {
+        send_message(&mut send, &asked).await?;
+        recv_message::<FromServer>(&mut recv).await
+    }
+    .await;
+    match answer {
+        Ok(Some(FromServer::Offered(Some(signed)))) => Ok(Some(Offered {
+            signed,
+            conn,
+            send,
+            recv,
+        })),
+        other => {
+            conn.close(close::NORMAL.into(), b"done");
+            match other? {
+                Some(FromServer::Offered(None)) => Ok(None),
+                Some(FromServer::Refused(refusal)) => Err(Error::Refused(refusal)),
+                other => Err(Error::Unexpected(format!("{other:?}"))),
+            }
+        }
+    }
 }
 
 /// Ask the server to introduce this viewer to device `id`, then connect to it

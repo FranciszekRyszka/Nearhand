@@ -20,7 +20,9 @@ use std::net::{IpAddr, SocketAddr};
 use std::ops::Deref;
 use std::sync::Arc;
 
-use axum::extract::{ConnectInfo, FromRequestParts, Path, Query, State};
+use axum::extract::{
+    ConnectInfo, DefaultBodyLimit, FromRequestParts, Multipart, Path, Query, State,
+};
 use axum::http::header::{AUTHORIZATION, COOKIE, HOST, ORIGIN, SET_COOKIE};
 use axum::http::request::Parts;
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
@@ -35,6 +37,7 @@ use crate::accounts::{Accounts, Refused, User};
 use crate::audit::{Audit, Entry, Event};
 use crate::devices::{Device, Devices, EnrollToken, Group};
 use crate::grants::{GrantRule, Grants, UserGroup};
+use crate::releases::{self, Listed, Releases};
 use crate::rendezvous::Registry;
 use crate::webtransport::Web;
 use nearhand_core::grant::Role;
@@ -47,6 +50,8 @@ pub struct AppState {
     pub devices: Arc<Devices>,
     pub grants: Arc<Grants>,
     pub audit: Arc<Audit>,
+    /// Agent releases, and which one agents are offered.
+    pub releases: Arc<Releases>,
     /// The server's key, which signs grants.
     pub identity: Arc<Identity>,
     /// What browsers need to reach the QUIC side.
@@ -126,6 +131,18 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/grants", get(list_grants).post(set_grant))
         .route("/api/v1/grants/{id}", delete(delete_grant))
         .route("/api/v1/audit", get(audit_log))
+        .route(
+            "/api/v1/releases",
+            get(list_releases)
+                .post(upload_release)
+                // A package, and room for the form around it.
+                .layer(DefaultBodyLimit::max(releases::MAX_PACKAGE + 64 * 1024)),
+        )
+        .route("/api/v1/releases/{id}", delete(delete_release))
+        .route(
+            "/api/v1/releases/{id}/offer",
+            post(offer_release).delete(withdraw_release),
+        )
         .route("/api/v1/devices/{id}/grant", post(device_grant))
         .route("/api/v1/webtransport", get(webtransport))
         .merge(console)
@@ -1104,6 +1121,97 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+// --- Releases -------------------------------------------------------------------------
+
+async fn list_releases(
+    State(state): State<Arc<AppState>>,
+    _admin: Admin,
+) -> ApiResult<Json<Vec<Listed>>> {
+    Ok(Json(state.releases.list().await?))
+}
+
+/// A package and its signature file, as `multipart/form-data` fields
+/// `package` and `signature`: taken only if the release key signed it.
+async fn upload_release(
+    State(state): State<Arc<AppState>>,
+    admin: Admin,
+    mut form: Multipart,
+) -> ApiResult<(StatusCode, Json<Listed>)> {
+    let unreadable = |e: axum::extract::multipart::MultipartError| {
+        Refused::Invalid(format!("the upload could not be read: {}", e.body_text()))
+    };
+    let mut package = None;
+    let mut signature = None;
+    while let Some(field) = form.next_field().await.map_err(unreadable)? {
+        match field.name() {
+            Some("package") => package = Some(field.bytes().await.map_err(unreadable)?),
+            Some("signature") => signature = Some(field.text().await.map_err(unreadable)?),
+            _ => {}
+        }
+    }
+    let (Some(package), Some(signature)) = (package, signature) else {
+        return Err(Refused::Invalid(
+            "send the package and its signature file, as the fields `package` and `signature`"
+                .into(),
+        )
+        .into());
+    };
+    let release = state.releases.add(&package, &signature).await?;
+    state
+        .record(
+            &admin,
+            "release.upload",
+            &release_name(&release),
+            Some(release.sha256.clone()),
+        )
+        .await;
+    Ok((StatusCode::CREATED, Json(release)))
+}
+
+async fn offer_release(
+    State(state): State<Arc<AppState>>,
+    admin: Admin,
+    Path(id): Path<i64>,
+) -> ApiResult<Json<Listed>> {
+    let release = state.releases.offer(id).await?;
+    state
+        .record(&admin, "release.offer", &release_name(&release), None)
+        .await;
+    Ok(Json(release))
+}
+
+async fn withdraw_release(
+    State(state): State<Arc<AppState>>,
+    admin: Admin,
+    Path(id): Path<i64>,
+) -> ApiResult<Json<Listed>> {
+    let release = state.releases.withdraw(id).await?;
+    state
+        .record(&admin, "release.withdraw", &release_name(&release), None)
+        .await;
+    Ok(Json(release))
+}
+
+async fn delete_release(
+    State(state): State<Arc<AppState>>,
+    admin: Admin,
+    Path(id): Path<i64>,
+) -> ApiResult<StatusCode> {
+    let release = state.releases.delete(id).await?;
+    state
+        .record(&admin, "release.delete", &release_name(&release), None)
+        .await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `nearhand-agent 0.2.0 (windows-x86_64)`, for the audit log.
+fn release_name(release: &Listed) -> String {
+    format!(
+        "{} {} ({})",
+        release.product, release.version, release.platform
+    )
+}
+
 // --- Audit log ----------------------------------------------------------------------
 
 #[derive(Deserialize)]
@@ -1140,6 +1248,9 @@ mod tests {
         setup_token: String,
         devices: Arc<Devices>,
         accounts: Arc<Accounts>,
+        /// The release key this server takes releases from.
+        signer: crate::releases::tests::Signer,
+        _releases: crate::releases::tests::tempdir::Dir,
     }
 
     async fn api() -> Api {
@@ -1147,11 +1258,18 @@ mod tests {
         let accounts = Arc::new(Accounts::new(pool.clone()));
         let setup_token = accounts.new_setup_token().await.expect("token");
         let devices = Arc::new(Devices::new(pool.clone()));
+        let signer = crate::releases::tests::Signer::new();
+        let releases_dir = crate::releases::tests::tempdir::Dir::new();
         let state = AppState {
             accounts: accounts.clone(),
             registry: Arc::new(Registry::new(devices.clone())),
             devices: devices.clone(),
             grants: Arc::new(Grants::new(pool.clone())),
+            releases: Arc::new(Releases::new(
+                pool.clone(),
+                releases_dir.path().to_path_buf(),
+                signer.public,
+            )),
             audit: Arc::new(Audit::new(pool)),
             identity: Arc::new(Identity::generate().expect("server key")),
             web: Web::new(&crate::config::Config::default()).expect("web certificate"),
@@ -1167,6 +1285,8 @@ mod tests {
             setup_token,
             devices,
             accounts,
+            signer,
+            _releases: releases_dir,
         }
     }
 
@@ -1212,6 +1332,54 @@ mod tests {
                 status,
                 headers,
                 body,
+            }
+        }
+
+        /// Upload a package and its signature file, as the console's form
+        /// does.
+        async fn upload(&self, auth: &[(&str, &str)], package: &[u8], signature: &str) -> Answer {
+            const BOUNDARY: &str = "nearhand-test-boundary";
+            let mut body = Vec::new();
+            body.extend_from_slice(
+                format!(
+                    "--{BOUNDARY}\r\ncontent-disposition: form-data; name=\"package\"; \
+                     filename=\"nearhand-agent.msi\"\r\ncontent-type: application/octet-stream\r\n\r\n"
+                )
+                .as_bytes(),
+            );
+            body.extend_from_slice(package);
+            body.extend_from_slice(
+                format!(
+                    "\r\n--{BOUNDARY}\r\ncontent-disposition: form-data; name=\"signature\"\r\n\r\n\
+                     {signature}\r\n--{BOUNDARY}--\r\n"
+                )
+                .as_bytes(),
+            );
+            let mut request = Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/releases")
+                .header(HOST, "desk.example.com")
+                .header(
+                    "content-type",
+                    format!("multipart/form-data; boundary={BOUNDARY}"),
+                );
+            for (name, value) in auth {
+                request = request.header(*name, *value);
+            }
+            let request = request.body(Body::from(body)).expect("request");
+            let response = self.app.clone().oneshot(request).await.expect("response");
+            let status = response.status();
+            let headers = response.headers().clone();
+            let bytes = response
+                .into_body()
+                .collect()
+                .await
+                .expect("body")
+                .to_bytes();
+            Answer {
+                status,
+                headers,
+                body: serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
             }
         }
 
@@ -1843,6 +2011,108 @@ mod tests {
             )
             .await;
         assert_eq!(older.body.as_array().expect("older").len(), 3);
+    }
+
+    #[tokio::test]
+    async fn administrators_upload_offer_and_withdraw_releases() {
+        let api = api().await;
+        let cookie = api.admin_cookie().await;
+        let admin = [("cookie", cookie.as_str())];
+        let (package, signature) = api.signer.package("0.2.0");
+
+        // Signed by some other key: refused, whoever uploads it.
+        let (other, other_signature) = crate::releases::tests::Signer::new().package("0.2.0");
+        let refused = api.upload(&admin, &other, &other_signature).await;
+        assert_eq!(refused.status, StatusCode::BAD_REQUEST, "{}", refused.body);
+        let refused = api.upload(&admin, b"not it", &signature).await;
+        assert_eq!(refused.status, StatusCode::BAD_REQUEST, "{}", refused.body);
+
+        let uploaded = api.upload(&admin, &package, &signature).await;
+        assert_eq!(uploaded.status, StatusCode::CREATED, "{}", uploaded.body);
+        assert_eq!(uploaded.body["version"], "0.2.0");
+        assert_eq!(uploaded.body["offered"], false);
+        let id = uploaded.body["id"].as_i64().expect("id");
+
+        let offered = api
+            .call(
+                Method::POST,
+                &format!("/api/v1/releases/{id}/offer"),
+                &admin,
+                None,
+            )
+            .await;
+        assert_eq!(offered.status, StatusCode::OK, "{}", offered.body);
+        assert_eq!(offered.body["offered"], true);
+        let deleted = api
+            .call(
+                Method::DELETE,
+                &format!("/api/v1/releases/{id}"),
+                &admin,
+                None,
+            )
+            .await;
+        assert_eq!(deleted.status, StatusCode::BAD_REQUEST, "not while offered");
+        let listed = api
+            .call(Method::GET, "/api/v1/releases", &admin, None)
+            .await;
+        assert_eq!(listed.body.as_array().map(Vec::len), Some(1));
+        assert_eq!(listed.body[0]["offered"], true);
+
+        let withdrawn = api
+            .call(
+                Method::DELETE,
+                &format!("/api/v1/releases/{id}/offer"),
+                &admin,
+                None,
+            )
+            .await;
+        assert_eq!(withdrawn.body["offered"], false);
+        let deleted = api
+            .call(
+                Method::DELETE,
+                &format!("/api/v1/releases/{id}"),
+                &admin,
+                None,
+            )
+            .await;
+        assert_eq!(deleted.status, StatusCode::NO_CONTENT);
+
+        // Administrators only.
+        let made = api
+            .call(
+                Method::POST,
+                "/api/v1/users",
+                &admin,
+                Some(json!({ "name": "bob", "password": "bobs long password" })),
+            )
+            .await;
+        assert_eq!(made.status, StatusCode::CREATED);
+        let bob = api.sign_in("bob", "bobs long password").await;
+        let not_his = api.upload(&[("cookie", &bob)], &package, &signature).await;
+        assert_eq!(not_his.status, StatusCode::FORBIDDEN);
+        let not_his = api
+            .call(Method::GET, "/api/v1/releases", &[("cookie", &bob)], None)
+            .await;
+        assert_eq!(not_his.status, StatusCode::FORBIDDEN);
+
+        let log = api.call(Method::GET, "/api/v1/audit", &admin, None).await;
+        let actions: Vec<&str> = log
+            .body
+            .as_array()
+            .expect("entries")
+            .iter()
+            .filter_map(|e| e["action"].as_str())
+            .filter(|a| a.starts_with("release."))
+            .collect();
+        assert_eq!(
+            actions,
+            [
+                "release.delete",
+                "release.withdraw",
+                "release.offer",
+                "release.upload"
+            ]
+        );
     }
 
     #[tokio::test]

@@ -34,19 +34,26 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use nearhand_core::grant::SignedGrant;
+use nearhand_core::release::Version;
 use nearhand_core::rendezvous::{DeviceId, Enrollment, FromServer, Refusal, ToServer};
 use nearhand_transport::relay::{Carrier, tag, untag};
 use nearhand_transport::{Fingerprint, Identity, peer_fingerprint, recv_message, send_message};
 use quinn::{Connection, Endpoint, SendStream};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Semaphore, mpsc, oneshot};
 
 use crate::accounts::Accounts;
 use crate::audit::{Audit, Event};
 use crate::devices::Devices;
 use crate::grants::Grants;
+use crate::releases::Releases;
 
 /// How long a client has to say what it wants.
 const FIRST_MESSAGE: Duration = Duration::from_secs(10);
+/// Packages sent at once, at most: each is megabytes, and agents ask again
+/// later when told the server is busy.
+const DOWNLOADS: usize = 8;
+/// The longest one package may take to send.
+const DOWNLOAD_TIME: Duration = Duration::from_secs(15 * 60);
 /// How long a viewer waits for the agent to open its way.
 const AGENT_ANSWER: Duration = Duration::from_secs(10);
 /// Addresses taken from any one client. A few interfaces' worth; more would
@@ -77,6 +84,18 @@ pub struct Registry {
     /// Who may connect to what; without it, viewers with an account are
     /// refused.
     access: Option<Access>,
+    /// The releases agents are offered; without them, none are.
+    releases: Option<Arc<Releases>>,
+    downloads: Downloads,
+}
+
+/// Room for [`DOWNLOADS`] packages being sent at once.
+struct Downloads(Semaphore);
+
+impl Default for Downloads {
+    fn default() -> Self {
+        Self(Semaphore::new(DOWNLOADS))
+    }
 }
 
 /// What it takes to hand out grants.
@@ -167,6 +186,14 @@ async fn handle(conn: Connection, registry: &Registry) -> Result<()> {
             token,
         }) => introduce(&conn, &mut send, registry, id, addresses, Some(token)).await,
         Some(ToServer::Enroll(enrollment)) => enroll(&conn, &mut send, registry, enrollment).await,
+        Some(ToServer::Update {
+            product,
+            platform,
+            version,
+        }) => {
+            let asked = (product.as_str(), platform.as_str(), version);
+            update(&conn, (&mut send, &mut recv), registry, asked).await
+        }
         _ => refuse(&conn, &mut send, Refusal::Protocol).await,
     }
 }
@@ -567,6 +594,68 @@ async fn enroll(
     }
 }
 
+/// An agent asks whether there is a newer release for it, and fetches it
+/// if there is.
+async fn update(
+    conn: &Connection,
+    (send, recv): (&mut SendStream, &mut quinn::RecvStream),
+    registry: &Registry,
+    (product, platform, version): (&str, &str, Version),
+) -> Result<()> {
+    // Agents only: an installed agent always has its key.
+    if peer_fingerprint(conn).is_none() {
+        return refuse(conn, send, Refusal::NoCertificate).await;
+    }
+    let offer = match &registry.releases {
+        Some(releases) => releases
+            .offer_for(product, platform, version)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "could not look up the release on offer");
+                None
+            }),
+        None => None,
+    };
+    let Some(offer) = offer else {
+        send_message(send, &FromServer::Offered(None)).await?;
+        goodbye(conn, send).await;
+        return Ok(());
+    };
+    // Room to send it, before offering: once the package is on its way,
+    // there is no saying no.
+    let Ok(_sending) = registry.downloads.0.try_acquire() else {
+        return refuse(conn, send, Refusal::Busy).await;
+    };
+    send_message(send, &FromServer::Offered(Some(offer.signed.clone()))).await?;
+    match tokio::time::timeout(FIRST_MESSAGE, recv_message::<ToServer>(recv)).await {
+        Ok(Ok(Some(ToServer::Fetch))) => {}
+        // The agent did not want it after all.
+        _ => {
+            goodbye(conn, send).await;
+            return Ok(());
+        }
+    }
+    let sent = tokio::time::timeout(DOWNLOAD_TIME, async {
+        let mut package = tokio::fs::File::open(&offer.path)
+            .await
+            .with_context(|| format!("opening {}", offer.path.display()))?;
+        tokio::io::copy(&mut package, send)
+            .await
+            .context("sending the package")
+    })
+    .await
+    .context("the package took too long to send")??;
+    tracing::info!(
+        remote = %conn.remote_address(),
+        product,
+        version = %offer.release.version,
+        bytes = sent,
+        "sent a release"
+    );
+    goodbye(conn, send).await;
+    Ok(())
+}
+
 async fn refuse(conn: &Connection, send: &mut SendStream, refusal: Refusal) -> Result<()> {
     tracing::debug!(remote = %conn.remote_address(), ?refusal, "refused");
     send_message(send, &FromServer::Refused(refusal)).await?;
@@ -596,6 +685,14 @@ impl Registry {
     pub fn with_access(self, access: Access) -> Self {
         Self {
             access: Some(access),
+            ..self
+        }
+    }
+
+    /// And that offers agents the releases in `releases`.
+    pub fn with_releases(self, releases: Arc<Releases>) -> Self {
+        Self {
+            releases: Some(releases),
             ..self
         }
     }
@@ -963,6 +1060,81 @@ mod tests {
         .expect("the agent registers");
         assert!(lock(&registry.agents)[&id].enrolled);
         registering.abort();
+        server.close(0u32.into(), b"done");
+    }
+
+    /// An agent asks, is offered the release on offer only if it is newer,
+    /// and fetches the package whole; a busy server says so before
+    /// offering.
+    #[tokio::test]
+    async fn agents_are_offered_newer_releases_and_fetch_them() {
+        use crate::releases::tests::{Signer, releases};
+        use nearhand_core::release::{AGENT, WINDOWS_X86_64};
+        use nearhand_transport::rendezvous::check_update;
+        use nearhand_transport::{Error, rendezvous_endpoint, server_endpoint};
+
+        let signer = Signer::new();
+        let (releases, _dir) = releases(&signer).await;
+        let (package, signature) = signer.package("0.3.0");
+        let id = releases.add(&package, &signature).await.expect("add").id;
+        let releases = Arc::new(releases);
+
+        let server_identity = Identity::generate().expect("server key");
+        let server = rendezvous_endpoint(([127, 0, 0, 1], 0).into(), &server_identity)
+            .expect("server endpoint");
+        let server_addr = server.local_addr().expect("addr");
+        let registry = Arc::new(Registry::default().with_releases(releases.clone()));
+        tokio::spawn(serve(server.clone(), registry.clone()));
+
+        let identity = Identity::generate().expect("agent key");
+        let agent = server_endpoint(([127, 0, 0, 1], 0).into(), &identity).expect("agent");
+        let fp = server_identity.fingerprint();
+        let ask = |version: &str| {
+            check_update(
+                &agent,
+                server_addr,
+                fp,
+                &identity,
+                AGENT,
+                WINDOWS_X86_64,
+                version.parse().expect("version"),
+            )
+        };
+
+        assert!(
+            ask("0.1.0").await.expect("ask").is_none(),
+            "nothing offered"
+        );
+        releases.offer(id).await.expect("offer");
+        assert!(ask("0.3.0").await.expect("ask").is_none(), "not newer");
+
+        let offered = ask("0.1.0").await.expect("ask").expect("offered");
+        let release = nearhand_transport::release::verify(&offered.signed, &signer.public)
+            .expect("signed by the release key");
+        assert_eq!(release.version.to_string(), "0.3.0");
+        let fetched = offered.fetch(release.size).await.expect("fetch");
+        assert_eq!(fetched, package);
+
+        // All sending slots taken: refused, rather than offered and stalled.
+        // (The fetch's slot is free once the server has said goodbye.)
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while registry.downloads.0.available_permits() < DOWNLOADS {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the fetch's slot comes back");
+        let _taken = registry
+            .downloads
+            .0
+            .try_acquire_many(DOWNLOADS as u32)
+            .expect("slots");
+        let busy = ask("0.1.0").await;
+        assert!(
+            matches!(busy, Err(Error::Refused(Refusal::Busy))),
+            "{:?}",
+            busy.err()
+        );
         server.close(0u32.into(), b"done");
     }
 

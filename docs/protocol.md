@@ -83,6 +83,16 @@ agent            server             viewer
   `Enrolled { id }` or `Refused(Enrollment)`. That records the device in the
   server's list; it registers as above either way. An enrolled device takes
   its ID from another key holding it.
+* An installed agent asks for updates the same way, with its certificate:
+  `Update { product, platform, version }` ──▶, answered by `Offered(None)`,
+  or `Offered(Some(signed release))` when the server's administrators offer
+  a release newer than `version` (`core::release`). To take it, the agent
+  sends `Fetch` ──▶, and the server writes the package's bytes on the stream
+  and finishes it. The agent reads at most the size the signed release
+  gives, and installs the package only if the release key built into it
+  signed the release, the package's SHA-256 matches, and it is newer than
+  what runs. A server sending packages to eight agents already answers
+  `Refused(Busy)` instead of offering.
 
 ### Through NATs
 
