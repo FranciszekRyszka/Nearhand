@@ -4,7 +4,19 @@ A self-hosted, open-source remote desktop — an alternative to TeamViewer, AnyD
 
 There is no Nearhand-run infrastructure. Every install points at a server you run yourself.
 
-> **Status: pre-alpha, M2 done pending a test across real networks.** On Windows, the agent streams the screen to the viewer over QUIC with hardware encode and decode end to end: **12.5 ms capture-to-present p50** at 2560×1440 on loopback, against an 80 ms target ([details](docs/performance.md)). The viewer now controls the host's keyboard and mouse, shows the host's pointer as its own, syncs clipboard text both ways, switches between the host's monitors (Ctrl+Shift+F2), repairs lost video, and adapts bitrate and frame rate to the link. A portable agent can now be reached by its device ID and a one-time password through a self-hosted server ([how](docs/self-hosting.md)); it connects directly through most home NATs, and through the server's relay where it cannot. Its window asks the person at the machine before letting anyone in, and shows for as long as a session lasts that the computer is being controlled. M3 has started: on Windows, the agent installs as a service, reachable with an access password ([how](docs/self-hosting.md#unattended-access-windows)), follows the user onto the sign-in screen and UAC prompts (Ctrl+Alt+End sends Ctrl+Alt+Del), shows the person at the machine when a session is on, and comes as an MSI — all waiting for a test in a VM. M5 has started: the server has user accounts (Argon2id passwords, TOTP, API tokens) behind a REST API, installed agents enroll into its device list with groups and presence ([how](docs/self-hosting.md#enrollment)), users reach them with grants the agent checks against the server's key ([how](docs/self-hosting.md#grants)), and a web console and audit log cover it all ([how](docs/self-hosting.md#the-web-console)). M6 has started: a browser can now watch a device — the same QUIC session compiled to WebAssembly, carried over WebTransport through the server's relay and still end-to-end encrypted to the agent, decoded with WebCodecs, with keyboard, mouse, clipboard text and the device's pointer ([how](docs/self-hosting.md#the-web-viewer)). The server comes as a Docker image too ([how](docs/self-hosting.md#in-docker)). No macOS yet — see the roadmap below.
+> **Status: pre-alpha.** Windows works end to end; macOS has not started. Use it for testing, not for anything that matters.
+
+What works today, on Windows:
+
+- **The session.** Capture, hardware encode, QUIC, hardware decode: **12.5 ms capture-to-present p50** at 2560×1440 on loopback, against an 80 ms target ([details](docs/performance.md)). Keyboard and mouse, the host's pointer drawn locally, clipboard text both ways, multiple monitors (Ctrl+Shift+F2), lost video repaired, bitrate and frame rate following the link. Machines without a hardware encoder — a VM — encode in software instead.
+- **Quick support.** A portable agent shows an ID and a one-time password, asks the person at the machine before letting anyone in, and says on screen for as long as a session lasts that the computer is being controlled ([how](docs/self-hosting.md)). It connects directly through most home NATs, and through the server's relay where it cannot.
+- **Unattended access.** The agent installs as a Windows service from an MSI, reachable with an access password ([how](docs/self-hosting.md#unattended-access-windows)). It follows the user onto the sign-in screen and UAC prompts (Ctrl+Alt+End sends Ctrl+Alt+Del), and shows an indicator for every session.
+- **Managed devices.** Accounts with Argon2id passwords, TOTP and API tokens; agents enroll into a device list with groups and presence ([how](docs/self-hosting.md#enrollment)); users reach them with grants the agent checks against the server's key ([how](docs/self-hosting.md#grants)); a web console and an audit log cover it all ([how](docs/self-hosting.md#the-web-console)).
+- **From a browser.** The same QUIC session compiled to WebAssembly, end-to-end encrypted to the agent, decoded with WebCodecs, with keyboard, mouse, clipboard text and the device's pointer ([how](docs/self-hosting.md#the-web-viewer)). It runs over WebTransport, or over a WebSocket where UDP does not get through.
+- **Updates.** Releases are signed with the project's key; you upload one to your server and choose when to offer it, and agents install it themselves — never a package they cannot verify, and never during a session ([how](docs/self-hosting.md#updating-agents)).
+- **The server.** One binary, or a Docker image with one volume ([how](docs/self-hosting.md#in-docker)).
+
+Not there yet: macOS, and the security review before 1.0.
 
 ## Targets
 
@@ -81,15 +93,15 @@ cargo build -p nearhand-server
 
 Ordered so the biggest unknown — end-to-end latency — is proven first.
 
-| # | Milestone | Done when |
-| --- | --- | --- |
-| M0 | Latency proof of concept | Windows capture → HW encode → QUIC → native viewer on LAN, measured < 80 ms |
-| M1 | Usable session | Mouse, keyboard, local cursor, clipboard text, multi-monitor, adaptive bitrate |
-| M2 | Server + connectivity | Signaling, hole punching, relay, key pinning, attended quick-support |
-| M3 | Windows unattended | Service, session switching, UAC + login screen, signed MSI |
-| M4 | macOS agent + viewer | ScreenCaptureKit, VideoToolbox, permissions flow, notarized PKG |
-| M5 | Managed devices | Accounts, TOTP, enrollment, groups, grants, audit log, console, REST API |
-| M6 | Web viewer + v1.0 | WASM + WebCodecs over WebTransport, auto-update, Docker image, security review |
+| # | Milestone | Done when | State |
+| --- | --- | --- | --- |
+| M0 | Latency proof of concept | Windows capture → HW encode → QUIC → native viewer on LAN, measured < 80 ms | done |
+| M1 | Usable session | Mouse, keyboard, local cursor, clipboard text, multi-monitor, adaptive bitrate | done |
+| M2 | Server + connectivity | Signaling, hole punching, relay, key pinning, attended quick-support | done |
+| M3 | Windows unattended | Service, session switching, UAC + login screen, signed MSI | done but for Authenticode signing |
+| M4 | macOS agent + viewer | ScreenCaptureKit, VideoToolbox, permissions flow, notarized PKG | not started |
+| M5 | Managed devices | Accounts, TOTP, enrollment, groups, grants, audit log, console, REST API | done |
+| M6 | Web viewer + v1.0 | WASM + WebCodecs over WebTransport, auto-update, Docker image, security review | security review left |
 
 If M0 cannot get under about 80 ms on LAN, the pipeline is revisited before anything is built on top of it.
 

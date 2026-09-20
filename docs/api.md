@@ -1,7 +1,8 @@
 # REST API
 
-> **Status: M5.** Accounts, tokens, devices, groups, enrollment, grants and
-> the audit log. The web console at `/` is built on this API alone.
+> **Status: M5–M6.** Accounts, tokens, devices, groups, enrollment, grants,
+> the audit log, agent releases, and the web viewer's way in. The web
+> console at `/` is built on this API alone.
 
 Everything is under `/api/v1` on the server's HTTPS port, JSON in and out.
 Errors are `{"error": "..."}` with a fitting status code.

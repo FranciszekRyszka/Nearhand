@@ -1,11 +1,13 @@
 # Security
 
-> **Status: partly implemented.** Device keys, pinning, the relay, the
+> **Status: built, not yet reviewed.** Device keys, pinning, the relay, the
 > portable agent's one-time password and accept prompt, the installed
 > agent's access password, session indicators for both, server accounts
-> (Argon2id, TOTP, API tokens), enrollment, signed grants, the audit log
-> and the web console exist; signed releases do not yet.
-> Track the gap against the roadmap in the README.
+> (Argon2id, TOTP, API tokens), enrollment, signed grants, the audit log,
+> the web console and signed releases all exist. What is left before 1.0 is
+> the outside review, the fuzzing of the protocol decoder, and Authenticode
+> signing for the MSI. Each section below says what is implemented and what
+> is not.
 
 Nearhand hands one machine full control of another. The threat model is built in
 from the start rather than bolted on, because retrofitting any of it would mean

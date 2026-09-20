@@ -254,6 +254,10 @@ Then grants, with the VM enrolled into a device group (make the token with
   (the button) shows the VM's secure screen. Copy text in the VM: it pastes
   on the host; copy on the host and click the picture: it pastes in the
   VM.
+* Adding `&transport=tcp` to that page's address takes the WebSocket
+  instead of WebTransport: the same picture, and "over TCP" beside the
+  frame rate. That is the way in for browsers without WebTransport, and
+  the one to check on a network that blocks UDP.
 
 ## Updates
 

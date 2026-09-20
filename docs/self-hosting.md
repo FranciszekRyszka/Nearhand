@@ -3,8 +3,8 @@
 > **Status: early.** The server introduces agents to viewers by device ID,
 > relays sessions that cannot go direct, has user accounts behind a REST API,
 > enrolls installed agents into a device list with groups, lets users at
-> them with grants, keeps an audit log, and has a web console for all of it.
-> It runs as a binary or in Docker.
+> them with grants, keeps an audit log, holds the releases its agents update
+> to, and has a web console for all of it. It runs as a binary or in Docker.
 
 ## What works today
 

@@ -149,6 +149,25 @@ packets leave, never what they say.
 Known limit: a queue that stands for more than 10 s becomes the new baseline.
 Loss and the send backlog still catch the overflow, but later than delay would.
 
+## In a browser
+
+The web viewer has not been measured the way the native one has: the page
+cannot see when a frame reaches the glass, so there is no capture-to-present
+figure for it. What the page reports, on loopback against a debug build of
+the agent, watching a 2560×1440 desktop:
+
+| Way in | Frame rate | Round trip |
+| --- | --- | --- |
+| WebTransport | 27–51 fps | 5–8 ms |
+| WebSocket (the TCP fallback) | 22–38 fps | 5 ms |
+
+Both go through the server's relay, so they carry the video twice over the
+loopback. Read them as "the browser keeps up", not as latency numbers. The
+gap between the two will be wider on a lossy link than it is here, because
+TCP holds later packets back until it has resent what was lost, while
+WebTransport drops them the way the native viewer's QUIC does and asks for
+a repair.
+
 ## Reproducing
 
 ```bash
