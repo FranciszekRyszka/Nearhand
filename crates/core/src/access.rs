@@ -98,6 +98,52 @@ impl Secret {
     }
 }
 
+/// What an agent asks of a viewer before it shows anything.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Required {
+    /// This password, or a grant from the agent's server: either alone.
+    Either(Secret),
+    /// This password. The agent takes no grants: it was installed without
+    /// a server's token, so no server can open it.
+    Password(Secret),
+    /// A grant from the agent's server. The agent has no password.
+    Grant,
+    /// A grant *and* this password. A server that was taken over can sign
+    /// itself a grant for every machine enrolled with it, but it does not
+    /// know their passwords (`docs/security.md`).
+    Both(Secret),
+}
+
+impl Required {
+    /// The password to prove, if any.
+    pub fn secret(&self) -> Option<&Secret> {
+        match self {
+            Self::Either(secret) | Self::Password(secret) | Self::Both(secret) => Some(secret),
+            Self::Grant => None,
+        }
+    }
+
+    /// Whether a password alone gets a viewer in.
+    pub fn password_is_enough(&self) -> bool {
+        matches!(self, Self::Either(_) | Self::Password(_))
+    }
+
+    /// Whether a grant alone does.
+    pub fn grant_is_enough(&self) -> bool {
+        matches!(self, Self::Either(_) | Self::Grant)
+    }
+
+    /// Whether this agent takes grants at all.
+    pub fn takes_grants(&self) -> bool {
+        !matches!(self, Self::Password(_))
+    }
+
+    /// Whether a grant must be followed by the password.
+    pub fn password_after_grant(&self) -> bool {
+        matches!(self, Self::Both(_))
+    }
+}
+
 /// Why an exchange ended without a session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum Refused {

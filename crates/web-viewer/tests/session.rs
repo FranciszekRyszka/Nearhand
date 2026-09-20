@@ -36,7 +36,7 @@ async fn let_in(
     send_message(
         send,
         &Control::AuthRequired {
-            secret: Some(secret()),
+            required: access::Required::Either(secret()),
         },
     )
     .await
@@ -234,7 +234,10 @@ async fn a_session_authenticates_and_receives_a_whole_frame() {
     let socket = UdpSocket::bind("127.0.0.1:0").await.expect("socket");
     let mut session = Session::new(
         *identity.fingerprint().as_bytes(),
-        Auth::Password(PASSWORD.to_owned()),
+        Auth {
+            grant: None,
+            password: Some(PASSWORD.to_owned()),
+        },
         60,
     )
     .expect("session");
@@ -275,7 +278,10 @@ async fn a_session_pinned_to_another_key_never_connects() {
     let other = Identity::generate().expect("another key");
     let mut session = Session::new(
         *other.fingerprint().as_bytes(),
-        Auth::Password(PASSWORD.to_owned()),
+        Auth {
+            grant: None,
+            password: Some(PASSWORD.to_owned()),
+        },
         60,
     )
     .expect("session");
@@ -382,7 +388,10 @@ async fn input_clipboard_and_pointer_travel_both_ways() {
     let socket = UdpSocket::bind("127.0.0.1:0").await.expect("socket");
     let mut session = Session::new(
         *identity.fingerprint().as_bytes(),
-        Auth::Password(PASSWORD.to_owned()),
+        Auth {
+            grant: None,
+            password: Some(PASSWORD.to_owned()),
+        },
         60,
     )
     .expect("session");

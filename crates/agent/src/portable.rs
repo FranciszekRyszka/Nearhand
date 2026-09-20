@@ -51,6 +51,9 @@ pub fn run(options: Options) -> Result<()> {
         gate: Some(password.clone()),
         grants: None,
         host: Some(host.clone()),
+        // A portable agent takes no grants, so there is nothing to ask for
+        // alongside the one-time password.
+        password_with_grant: false,
     });
     let id = identity.device_id();
     runtime.spawn(serve(

@@ -51,6 +51,12 @@ async function main() {
   const granted = await api("POST", `/devices/${encodeURIComponent(device)}/grant`);
   $("device").textContent = `${granted.device_id} · ${granted.role}`;
 
+  await connect(granted);
+}
+
+/// Reach the device and start a session, with the grant and — where the
+/// device asks for both — its access password as well.
+async function connect(granted, password) {
   status("Reaching the device…");
   link = await reach(granted.device_id);
   // The server names the key; the grant says which one it must be.
@@ -59,9 +65,9 @@ async function main() {
     throw new Error("The server answered with another device's key.");
   }
 
-  viewer = new Viewer(link.fingerprint, granted.grant, undefined, 60);
+  viewer = new Viewer(link.fingerprint, granted.grant, password, 60);
   status("Connecting to the device…");
-  run(link, viewer, granted.role);
+  run(link, viewer, granted);
 }
 
 /// Reach the device through the server's relay: over WebTransport where
@@ -158,7 +164,8 @@ function join(parts) {
   return whole;
 }
 
-function run(link, viewer, role) {
+function run(link, viewer, granted) {
+  const role = granted.role;
   const decoder = new Decoder(viewer);
   const clipboard = new ClipboardSync(viewer);
   let timer = null;
@@ -211,6 +218,23 @@ function run(link, viewer, role) {
         $("screen").hidden = true;
         link.close();
         break;
+      case "password_needed": {
+        // The device wants its access password as well as the grant, and
+        // nothing has been presented yet — so the grant is still good, and
+        // asking here costs only this connection.
+        closed = true;
+        link.close();
+        const password = window.prompt(
+          "This device asks for its access password as well as your access to it.",
+        );
+        if (!password) {
+          status("This device needs its access password as well as a grant.", true);
+          break;
+        }
+        status("Connecting again, with the password…");
+        connect(granted, password).catch((e) => status(e.message, true));
+        break;
+      }
     }
   };
 

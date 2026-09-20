@@ -33,7 +33,8 @@ pub struct Viewer {
 impl Viewer {
     /// A session with the agent whose certificate fingerprint is
     /// `fingerprint` (hex), proving itself with `grant` (hex, from the
-    /// REST API) or else `password`.
+    /// REST API), with `password`, or — where the device asks for both —
+    /// with each of them.
     #[wasm_bindgen(constructor)]
     pub fn new(
         fingerprint: &str,
@@ -44,15 +45,18 @@ impl Viewer {
         let fingerprint: [u8; 32] = hex(fingerprint)?
             .try_into()
             .map_err(|_| JsError::new("a fingerprint is 32 bytes"))?;
-        let auth = match (grant, password) {
-            (Some(grant), _) => {
-                let grant: SignedGrant = postcard::from_bytes(&hex(&grant)?)
-                    .map_err(|_| JsError::new("the grant cannot be read"))?;
-                Auth::Grant(grant)
-            }
-            (None, Some(password)) => Auth::Password(password),
-            (None, None) => return Err(JsError::new("a grant or a password is needed")),
+        let grant = match grant {
+            Some(grant) => Some(
+                postcard::from_bytes::<SignedGrant>(&hex(&grant)?)
+                    .map_err(|_| JsError::new("the grant cannot be read"))?,
+            ),
+            None => None,
         };
+        if grant.is_none() && password.is_none() {
+            return Err(JsError::new("a grant or a password is needed"));
+        }
+        // Both, where a device asks for both (`docs/security.md`).
+        let auth = Auth { grant, password };
         let session =
             Session::new(fingerprint, auth, max_fps).map_err(|e| JsError::new(&e.to_string()))?;
         Ok(Viewer { session })
@@ -95,6 +99,8 @@ impl Viewer {
     /// * `cursor_visible`, with `visible`
     /// * `clipboard`, with `text`: copied on the device
     /// * `closed`, with `reason`
+    /// * `password_needed`: the device asks for its access password as
+    ///   well as a grant; the grant is unused, so ask and connect again
     pub fn event(&mut self) -> Result<JsValue, JsValue> {
         let Some(event) = self.session.event() else {
             return Ok(JsValue::NULL);
@@ -163,6 +169,9 @@ impl Viewer {
             Event::Closed(reason) => {
                 set("type", "closed".into())?;
                 set("reason", reason.into())?;
+            }
+            Event::PasswordAlsoNeeded => {
+                set("type", "password_needed".into())?;
             }
         }
         Ok(object.into())

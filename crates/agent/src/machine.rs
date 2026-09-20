@@ -80,6 +80,13 @@ pub struct Config {
     /// agent does it when it can, and then forgets the token.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enrollment: Option<Enrollment>,
+    /// Ask for the access password as well as a grant, rather than instead
+    /// of one. A server that was taken over can sign itself a grant for
+    /// every machine enrolled with it, but it does not know their
+    /// passwords (`docs/security.md`). Needs both a password and
+    /// `managed`; off unless set.
+    #[serde(default)]
+    pub password_with_grant: bool,
     /// Install newer releases this machine's own server offers, signed by
     /// the project's release key (`crate::update`). On unless set false.
     #[serde(default = "yes")]
@@ -268,6 +275,7 @@ mod tests {
                 name: None,
             }),
             managed: true,
+            password_with_grant: false,
             updates: true,
         }
     }

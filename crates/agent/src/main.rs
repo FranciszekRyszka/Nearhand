@@ -88,6 +88,12 @@ enum Command {
         /// given.
         #[arg(long, requires = "token")]
         name: Option<String>,
+        /// Ask for the access password *as well as* a grant, rather than
+        /// instead of one: then a server that was taken over cannot open
+        /// this computer on its own, because it does not know the
+        /// password. Needs --token and a password.
+        #[arg(long, requires = "token")]
+        password_with_grant: bool,
     },
     /// `install` without the service, which the MSI registers itself.
     #[command(hide = true)]
@@ -104,6 +110,8 @@ enum Command {
         token: Option<String>,
         #[arg(long)]
         name: Option<String>,
+        #[arg(long)]
+        password_with_grant: bool,
     },
     /// Remove the service, as administrator.
     Uninstall {
@@ -121,6 +129,13 @@ enum Command {
         /// anyone in.
         #[arg(long, conflicts_with = "password")]
         none: bool,
+        /// From now on, ask for this password as well as a grant from the
+        /// server, rather than instead of one.
+        #[arg(long, conflicts_with = "none")]
+        with_grant: bool,
+        /// From now on, let either the password or a grant in on its own.
+        #[arg(long, conflicts_with_all = ["none", "with_grant"])]
+        either: bool,
     },
     /// Show whether the service runs, and this computer's ID.
     Status,
@@ -187,6 +202,7 @@ fn main() -> Result<()> {
                 gate: None,
                 grants: None,
                 host: None,
+                password_with_grant: false,
             };
             runtime.block_on(listen(bind, config))
         }
@@ -210,6 +226,7 @@ fn main() -> Result<()> {
             bitrate_kbps,
             token,
             name,
+            password_with_grant,
         } => setup::install(setup::Install {
             server,
             server_fingerprint,
@@ -217,6 +234,7 @@ fn main() -> Result<()> {
             bitrate_kbps,
             token,
             name,
+            password_with_grant,
         }),
         Command::Configure {
             server,
@@ -225,6 +243,7 @@ fn main() -> Result<()> {
             bitrate_kbps,
             token,
             name,
+            password_with_grant,
         } => setup::configure(setup::Install {
             server,
             server_fingerprint,
@@ -232,6 +251,7 @@ fn main() -> Result<()> {
             bitrate_kbps,
             token,
             name,
+            password_with_grant,
         })
         .map(|identity| {
             println!(
@@ -240,7 +260,20 @@ fn main() -> Result<()> {
             )
         }),
         Command::Uninstall { purge } => setup::uninstall(purge),
-        Command::SetPassword { password, none } => setup::set_password(password, none),
+        Command::SetPassword {
+            password,
+            none,
+            with_grant,
+            either,
+        } => setup::set_password(
+            password,
+            none,
+            match (with_grant, either) {
+                (true, _) => Some(true),
+                (_, true) => Some(false),
+                _ => None,
+            },
+        ),
         Command::Status => setup::status(),
         Command::Run { stop_event, dir } => {
             unattended::run(dir.unwrap_or_else(machine::dir), stop_event)

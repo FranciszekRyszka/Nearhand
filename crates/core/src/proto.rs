@@ -61,12 +61,10 @@ pub enum Control {
     },
     MonitorList(Vec<Monitor>),
     /// Agent to viewer, in place of [`Control::MonitorList`] after `Hello`:
-    /// this agent takes viewers only with a password — its one-time or
-    /// access password — or, if installed with a server, a grant from it.
-    /// `secret` says which password, and how to prepare it; `None` means
-    /// this agent has none, and only a grant will do.
+    /// what this agent asks for before it shows anything — a password, a
+    /// grant from its server, either, or both ([`crate::access::Required`]).
     AuthRequired {
-        secret: Option<crate::access::Secret>,
+        required: crate::access::Required,
     },
     /// Viewer to agent, answering [`Control::AuthRequired`]: the first
     /// message of the password exchange ([`crate::access`]). The password
@@ -324,15 +322,17 @@ mod tests {
             }]),
             Control::Bye,
             Control::AuthRequired {
-                secret: Some(crate::access::Secret::OneTime),
+                required: crate::access::Required::Either(crate::access::Secret::OneTime),
             },
             Control::AuthRequired {
-                secret: Some(crate::access::Secret::Access {
+                required: crate::access::Required::Both(crate::access::Secret::Access {
                     salt: vec![1; 16],
                     iterations: 600_000,
                 }),
             },
-            Control::AuthRequired { secret: None },
+            Control::AuthRequired {
+                required: crate::access::Required::Grant,
+            },
             Control::AuthStart {
                 pake: vec![0x41; 33],
             },

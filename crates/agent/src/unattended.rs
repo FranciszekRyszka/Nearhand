@@ -49,6 +49,17 @@ pub fn run(dir: PathBuf, stop_event: Option<String>) -> Result<()> {
     if config.access.is_none() && !config.managed {
         anyhow::bail!("agent.toml sets no access password and takes no grants: set a password");
     }
+    // Asking for both, with only one of them, would let nobody in either.
+    if config.password_with_grant && (config.access.is_none() || !config.managed) {
+        anyhow::bail!(
+            "agent.toml asks for a grant and the access password together,              but this machine has {}",
+            if config.access.is_none() {
+                "no password"
+            } else {
+                "no server to take grants from"
+            }
+        );
+    }
     let address = config.server.address.clone();
     tracing::info!(id = %identity.device_id(), server = %address, "unattended agent starting");
 
@@ -64,6 +75,7 @@ pub fn run(dir: PathBuf, stop_event: Option<String>) -> Result<()> {
             .managed
             .then(|| Arc::new(Grants::new(server_fingerprint, identity.fingerprint()))),
         host: Some(host.clone()),
+        password_with_grant: config.password_with_grant,
     });
     let updates = config
         .updates

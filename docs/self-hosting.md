@@ -286,6 +286,34 @@ and lets the viewer in with the grant's role, without asking the server. See
 [security](security.md#authorisation) for what that trusts the server
 with.
 
+### A grant *and* the password
+
+That trust can be cut down: a machine can ask for its access password as
+well as a grant, rather than instead of one. Then a server that was taken
+over can sign itself all the grants it likes and still not get in, because
+it has never seen the password — passwords are proved, never sent.
+
+```bash
+# At install, with a token and a password:
+nearhand-agent install --server desk.example.com --server-fingerprint <hex> \
+    --token nhe_... --password '<at least 10 characters>' --password-with-grant
+
+# Or later, on a machine already installed:
+nearhand-agent set-password --with-grant     # ask for both from now on
+nearhand-agent set-password --either         # back to one or the other
+nearhand-agent status                        # says which it is
+```
+
+For a silent rollout, the MSI takes `PASSWORD_WITH_GRANT=1` alongside
+`ACCESS_PASSWORD` and `ENROLL_TOKEN`.
+
+Viewers then need both: the native viewer asks for the password after
+presenting the grant (or takes `--password`), and the browser viewer asks
+for it and connects again. The grant still decides what the session may do,
+and a viewer that has only one of the two is told so before its grant is
+spent. The cost is a password typed at every session, which is why it is
+not the default.
+
 ## Updating agents
 
 Installed agents update themselves from **this** server, and from nowhere

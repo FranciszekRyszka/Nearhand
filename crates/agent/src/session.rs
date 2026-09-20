@@ -92,6 +92,11 @@ pub struct SessionConfig {
     /// The person at this machine, who allows each session and sees it for
     /// as long as it lasts, when there is one to ask.
     pub host: Option<Arc<Host>>,
+    /// Ask for the password as well as a grant, rather than instead of
+    /// one. A server that was taken over can sign itself a grant for every
+    /// machine enrolled with it; it cannot know their passwords
+    /// (`docs/security.md`).
+    pub password_with_grant: bool,
 }
 
 /// What one video stream sent, for the log.
@@ -489,12 +494,12 @@ struct Admitted {
     role: Role,
 }
 
-/// Have the viewer prove the password, and prove it back. Neither side ever
-/// sends the password: they run the exchange in `nearhand_core::access`,
-/// tied to this connection, so a server that stood in the middle of the
-/// introduction cannot pass it through. A wrong password ends the
-/// connection — each guess costs a whole handshake, and a few wrong ones
-/// replace the password.
+/// Let a viewer in, or do not: a grant from this agent's server, the
+/// password, either, or both ([`access::Required`]).
+///
+/// Neither side ever sends the password. They run the exchange in
+/// `nearhand_core::access`, tied to this connection, so a server that
+/// stood in the middle of the introduction cannot pass it through.
 async fn authenticate(
     conn: &Connection,
     send: &mut quinn::SendStream,
@@ -505,31 +510,90 @@ async fn authenticate(
         conn.close(close::AUTH_FAILED.into(), reason.as_bytes());
         anyhow::anyhow!("{reason}")
     };
+    let required = required(config);
     send_message(
         send,
         &Control::AuthRequired {
-            secret: config.gate.as_ref().map(|gate| gate.secret()),
+            required: required.clone(),
         },
     )
     .await?;
-    let started = match recv_message::<Control>(recv).await? {
-        Some(Control::AuthStart { pake }) => pake,
+    match recv_message::<Control>(recv).await? {
         Some(Control::Present { grant }) => {
             let Some(grants) = &config.grants else {
                 return Err(refuse("this device takes a password, not a grant"));
             };
-            return match grants.check(&grant) {
-                Ok(grant) => Ok(Admitted {
-                    user: Some(grant.user),
-                    role: grant.role,
-                }),
-                Err(reason) => Err(refuse(reason)),
-            };
+            let grant = grants.check(&grant).map_err(refuse)?;
+            // A grant is the server's say-so. Where this machine asks for
+            // both, the password follows: a server that was taken over can
+            // sign itself a grant, and still gets no further.
+            if required.password_after_grant() {
+                match recv_message::<Control>(recv).await? {
+                    Some(Control::AuthStart { pake }) => {
+                        prove(conn, send, recv, config, &pake).await?;
+                    }
+                    other => {
+                        conn.close(
+                            close::AUTH_FAILED.into(),
+                            b"this device needs its access password as well as a grant",
+                        );
+                        bail!("expected AuthStart after the grant, got {other:?}");
+                    }
+                }
+            }
+            Ok(Admitted {
+                user: Some(grant.user),
+                role: grant.role,
+            })
+        }
+        Some(Control::AuthStart { pake }) => {
+            if !required.password_is_enough() {
+                return Err(refuse(
+                    "this device needs a grant from its server as well as its password",
+                ));
+            }
+            prove(conn, send, recv, config, &pake).await?;
+            // A password is the device's own say-so: everything a session
+            // can do.
+            Ok(Admitted {
+                user: None,
+                role: Role::Full,
+            })
         }
         other => {
-            conn.close(close::PROTOCOL.into(), b"expected AuthStart");
-            bail!("expected AuthStart, got {other:?}");
+            conn.close(close::PROTOCOL.into(), b"expected AuthStart or Present");
+            bail!("expected AuthStart or Present, got {other:?}");
         }
+    }
+}
+
+/// What this agent asks a viewer for.
+fn required(config: &SessionConfig) -> access::Required {
+    let Some(gate) = &config.gate else {
+        return access::Required::Grant;
+    };
+    let secret = gate.secret();
+    match (config.grants.is_some(), config.password_with_grant) {
+        (true, true) => access::Required::Both(secret),
+        (true, false) => access::Required::Either(secret),
+        (false, _) => access::Required::Password(secret),
+    }
+}
+
+/// The rest of the password exchange, from the viewer's first message:
+/// answer it, check the proof it sends back, and prove the password in
+/// turn. A wrong one ends the connection — each guess costs a whole
+/// handshake, and a few wrong ones replace a one-time password.
+async fn prove(
+    conn: &Connection,
+    send: &mut quinn::SendStream,
+    recv: &mut RecvStream,
+    config: &SessionConfig,
+    started: &[u8],
+) -> Result<()> {
+    let refuse = |reason: &str| {
+        conn.close(close::AUTH_FAILED.into(), reason.as_bytes());
+        anyhow::anyhow!("{reason}")
     };
     let Some(gate) = &config.gate else {
         return Err(refuse(
@@ -541,7 +605,7 @@ async fn authenticate(
         .map_err(|_| refuse("this connection cannot carry a password exchange"))?;
     let seed = nearhand_transport::access::seed()
         .map_err(|_| refuse("this machine's random number generator failed"))?;
-    let (pending, answer) = access::Agent::answer(&material, &binding, seed, &started)
+    let (pending, answer) = access::Agent::answer(&material, &binding, seed, started)
         .map_err(|_| refuse("that is not the start of a password exchange"))?;
     send_message(send, &Control::AuthAnswer { pake: answer }).await?;
     let proof = match recv_message::<Control>(recv).await? {
@@ -563,12 +627,7 @@ async fn authenticate(
                 },
             )
             .await?;
-            // A password is the device's own say-so: everything a session
-            // can do.
-            Ok(Admitted {
-                user: None,
-                role: Role::Full,
-            })
+            Ok(())
         }
         Err(_) => match gate.rejected() {
             Verdict::Rejected(reason) => {
@@ -1024,10 +1083,18 @@ mod tests {
     /// Both ends of a QUIC connection over loopback: the agent's, the
     /// viewer's, and the endpoints that keep them up.
     async fn connected() -> (Connection, Connection, [quinn::Endpoint; 2]) {
-        use nearhand_transport::{Identity, client_endpoint, connect, server_endpoint};
-        let identity = Identity::generate().expect("identity");
+        let identity = nearhand_transport::Identity::generate().expect("identity");
+        connected_as(&identity).await
+    }
+
+    /// The same, with the agent presenting `identity` — for a test that
+    /// needs to sign a grant for this device.
+    async fn connected_as(
+        identity: &nearhand_transport::Identity,
+    ) -> (Connection, Connection, [quinn::Endpoint; 2]) {
+        use nearhand_transport::{client_endpoint, connect, server_endpoint};
         let loopback = "127.0.0.1:0".parse().expect("address");
-        let agent = server_endpoint(loopback, &identity).expect("agent endpoint");
+        let agent = server_endpoint(loopback, identity).expect("agent endpoint");
         let address = agent.local_addr().expect("agent address");
         let viewer = client_endpoint(address).expect("viewer endpoint");
         let (agent_side, viewer_side) = tokio::join!(
@@ -1080,6 +1147,7 @@ mod tests {
             gate: Some(Arc::new(crate::password::Password::new())),
             grants: None,
             host: None,
+            password_with_grant: false,
         });
         let shown = config
             .gate
@@ -1115,12 +1183,12 @@ mod tests {
             )
             .await
             .expect("hello");
-            let Some(Control::AuthRequired {
-                secret: Some(secret),
-            }) = recv_message(&mut recv).await.expect("what to prove")
+            let Some(Control::AuthRequired { required }) =
+                recv_message(&mut recv).await.expect("what to prove")
             else {
-                panic!("expected AuthRequired with a password");
+                panic!("expected AuthRequired");
             };
+            let secret = required.secret().expect("a password to prove").clone();
             let material = secret.material(&typed).expect("material");
             let binding = nearhand_transport::access::binding(&viewer_conn).expect("binding");
             let seed = nearhand_transport::access::seed().expect("seed");
@@ -1149,6 +1217,172 @@ mod tests {
         let (agent_side, proved) = tokio::join!(agent_side, viewer_side);
         let (admitted, ..) = agent_side.expect("the agent's side");
         (admitted, proved.expect("the viewer's side"))
+    }
+
+    /// A viewer with a grant from this agent's server, against a machine
+    /// that may also ask for its access password: what the agent asked
+    /// for, and what it made of the answer. `typed` is what the person at
+    /// the viewer types when asked, or `None` for a viewer that has no
+    /// password to give.
+    async fn grant_and_password(
+        password_with_grant: bool,
+        typed: Option<&str>,
+    ) -> (access::Required, Result<Admitted>) {
+        use nearhand_core::access;
+        use nearhand_core::grant::{Grant, LIFETIME_SECS, Role};
+        use nearhand_transport::Identity;
+
+        let server = Identity::generate().expect("server key");
+        let device = Identity::generate().expect("device key");
+        let (agent_conn, viewer_conn, _endpoints) = connected_as(&device).await;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("a clock after 1970")
+            .as_secs();
+        let signed = server
+            .sign_grant(&Grant {
+                device: *device.fingerprint().as_bytes(),
+                user: "ada".into(),
+                role: Role::Control,
+                issued_at: now,
+                expires_at: now + LIFETIME_SECS,
+                nonce: [5; 16],
+            })
+            .expect("sign");
+        let config = Arc::new(SessionConfig {
+            bitrate_kbps: 4000,
+            gate: Some(Arc::new(crate::password::Password::new())),
+            grants: Some(Arc::new(Grants::new(
+                server.fingerprint(),
+                device.fingerprint(),
+            ))),
+            host: None,
+            password_with_grant,
+        });
+        let shown = String::from_utf8(
+            config
+                .gate
+                .as_ref()
+                .expect("a gate")
+                .material()
+                .expect("the password it shows"),
+        )
+        .expect("digits");
+        let typed = typed.map(|typed| typed.replace("{shown}", &shown));
+
+        let agent_side = tokio::spawn(async move {
+            let (mut send, mut recv) = agent_conn.accept_bi().await.expect("stream");
+            let _: Option<Control> = recv_message(&mut recv).await.expect("hello");
+            let outcome = authenticate(&agent_conn, &mut send, &mut recv, &config).await;
+            (outcome, agent_conn, send, recv)
+        });
+
+        let viewer_side = tokio::spawn(async move {
+            let (mut send, mut recv) = viewer_conn.open_bi().await.expect("stream");
+            // The streams are held to the end, as a viewer holds them:
+            // one dropped unfinished is reset, and the message on it with
+            // it.
+            let required = async {
+                send_message(
+                    &mut send,
+                    &Control::Hello {
+                        version: PROTOCOL_VERSION,
+                        caps: Caps {
+                            codecs: Vec::new(),
+                            max_width: 0,
+                            max_height: 0,
+                            max_fps: 0,
+                        },
+                    },
+                )
+                .await
+                .expect("hello");
+                let Some(Control::AuthRequired { required }) =
+                    recv_message(&mut recv).await.expect("what is asked for")
+                else {
+                    panic!("expected AuthRequired");
+                };
+                // A viewer with no password to give stops here rather than
+                // spending its grant, as the browser's does — and says so by
+                // closing, rather than leaving the agent waiting.
+                if required.password_after_grant() && typed.is_none() {
+                    viewer_conn.close(close::NORMAL.into(), b"a password is needed as well");
+                    return required;
+                }
+                send_message(&mut send, &Control::Present { grant: signed })
+                    .await
+                    .expect("grant");
+                if let (true, Some(secret), Some(typed)) = (
+                    required.password_after_grant(),
+                    required.secret(),
+                    typed.as_deref(),
+                ) {
+                    let material = secret.material(typed).expect("material");
+                    let binding =
+                        nearhand_transport::access::binding(&viewer_conn).expect("binding");
+                    let seed = nearhand_transport::access::seed().expect("seed");
+                    let (viewer, start) = access::Viewer::start(&material, &binding, seed);
+                    send_message(&mut send, &Control::AuthStart { pake: start })
+                        .await
+                        .expect("start");
+                    let Ok(Some(Control::AuthAnswer { pake })) = recv_message(&mut recv).await
+                    else {
+                        return required;
+                    };
+                    let (_, proof) = viewer.prove(&pake).expect("prove");
+                    let _ = send_message(
+                        &mut send,
+                        &Control::AuthProve {
+                            proof: proof.to_vec(),
+                        },
+                    )
+                    .await;
+                    let _: std::result::Result<Option<Control>, _> = recv_message(&mut recv).await;
+                }
+                required
+            }
+            .await;
+            (required, viewer_conn, send, recv)
+        });
+        let (agent_side, viewer_side) = tokio::join!(agent_side, viewer_side);
+        let (admitted, ..) = agent_side.expect("the agent's side");
+        let (required, ..) = viewer_side.expect("the viewer's side");
+        (required, admitted)
+    }
+
+    /// Where a machine asks for either, a grant alone lets a viewer in, as
+    /// before.
+    #[tokio::test]
+    async fn a_grant_alone_is_enough_unless_the_password_is_asked_for_too() {
+        let (required, admitted) = grant_and_password(false, None).await;
+        assert!(matches!(required, access::Required::Either(_)));
+        let admitted = admitted.expect("let in");
+        assert_eq!(admitted.user.as_deref(), Some("ada"));
+        assert!(matches!(admitted.role, Role::Control));
+    }
+
+    /// Where it asks for both, a server that signed itself a grant gets no
+    /// further: it does not know the password.
+    #[tokio::test]
+    async fn a_grant_without_the_password_is_not_enough_where_both_are_asked_for() {
+        let (required, admitted) = grant_and_password(true, None).await;
+        assert!(matches!(required, access::Required::Both(_)));
+        assert!(admitted.is_err(), "let in with a grant alone");
+    }
+
+    #[tokio::test]
+    async fn a_grant_and_the_password_together_are_let_in() {
+        let (_, admitted) = grant_and_password(true, Some("{shown}")).await;
+        let admitted = admitted.expect("let in");
+        assert_eq!(admitted.user.as_deref(), Some("ada"));
+        // The grant still says what the session may do.
+        assert!(matches!(admitted.role, Role::Control));
+    }
+
+    #[tokio::test]
+    async fn a_grant_with_the_wrong_password_is_not() {
+        let (_, admitted) = grant_and_password(true, Some("000000 is not it")).await;
+        assert!(admitted.is_err(), "let in with the wrong password");
     }
 
     /// The password is proved, never sent, and both sides end up sure of

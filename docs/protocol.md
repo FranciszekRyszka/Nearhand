@@ -175,12 +175,12 @@ bidirectional stream for control and speaks first:
 viewer                         agent
   Hello { version, caps }  ──▶
                            ◀──  Hello { version, caps }
-                           ◀──  AuthRequired { secret } (portable and installed agents)
+                           ◀──  AuthRequired { required }
+  Present { grant }        ──▶                          (installed with a token)
   AuthStart { pake }       ──▶                          (proving a password)
                            ◀──  AuthAnswer { pake }
   AuthProve { proof }      ──▶
                            ◀──  AuthProved { proof }
-    or Present { grant }   ──▶                          (installed with a token)
                            ◀──  AwaitingApproval       (when someone at the host decides)
                            ◀──  MonitorList
   StartVideo               ──▶
@@ -192,9 +192,17 @@ viewer                         agent
   (own stream) Clipboard … ◀─▶  Clipboard …  (own stream)
 ```
 
+`AuthRequired` says what this agent asks for: `Either`, `Password`, `Grant`
+or `Both` — a password, a grant from its server, either alone, or a grant
+*and* the password. Only a machine installed with both, and told to ask for
+both, sends `Both`; then the grant comes first and the password exchange
+follows it on the same stream, and the grant's role still limits the
+session. A viewer that has only one of the two stops before presenting
+anything, so its grant is not spent.
+
 A password is never sent — not to the agent, and so not to anything between
-the two. `AuthRequired` says what the password is and how to prepare it:
-`OneTime` for the six digits a portable agent shows, used as they are read
+the two. The `secret` inside `AuthRequired` says what the password is and
+how to prepare it: `OneTime` for the six digits a portable agent shows, used as they are read
 out, or `Access { salt, iterations }` for an installed agent, which holds
 only a PBKDF2-HMAC-SHA256 hash of its access password and so runs the
 exchange with that hash; the viewer stretches what was typed the same way.
@@ -210,9 +218,6 @@ The agent checks the viewer's proof first — a wrong one closes with code 5,
 and counts against the agent's lockouts — and answers with its own, which
 the viewer checks before it shows anything: without that, a viewer would
 know the password reached *something*, not that it reached the device.
-`secret` is `None` when an agent has no password at all, and only a grant
-will do.
-
 `Present` carries a grant the server signed (`core::grant`): the agent checks
 it against the server key it pinned, and the grant's role limits the session
 (`docs/security.md`).

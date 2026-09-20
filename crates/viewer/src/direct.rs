@@ -229,20 +229,44 @@ pub async fn run(options: Options) -> Result<()> {
         Err(e) => return Err(explain(&conn, e.into())),
     };
     let mut next = recv_message::<Control>(&mut recv).await;
-    if let Ok(Some(Control::AuthRequired { secret })) = next {
+    if let Ok(Some(Control::AuthRequired { required })) = next {
         match grant {
-            Some(grant) => send_message(&mut send, &Control::Present { grant }).await?,
+            Some(grant) => {
+                if !required.takes_grants() {
+                    bail!("this device takes a password, not a grant from a server");
+                }
+                send_message(&mut send, &Control::Present { grant }).await?;
+                // Where a machine asks for both, the grant is only half of
+                // it: its password follows (`docs/security.md`).
+                if let Some(secret) = required
+                    .secret()
+                    .filter(|_| required.password_after_grant())
+                {
+                    println!("this device asks for its access password as well as a grant");
+                    let typed = match options.password.clone() {
+                        Some(password) => password,
+                        None => ask_password().await?,
+                    };
+                    prove(&conn, &mut send, &mut recv, secret, &typed).await?;
+                }
+            }
             None => {
+                let secret = required.secret().filter(|_| required.password_is_enough());
                 let Some(secret) = secret else {
                     bail!(
-                        "this device lets nobody in with a password; sign in to its server instead"
+                        "this device needs a grant from its server{}; sign in to it first",
+                        if required.secret().is_some() {
+                            " as well as its password"
+                        } else {
+                            ""
+                        }
                     );
                 };
                 let typed = match options.password.clone() {
                     Some(password) => password,
                     None => ask_password().await?,
                 };
-                prove(&conn, &mut send, &mut recv, &secret, &typed).await?;
+                prove(&conn, &mut send, &mut recv, secret, &typed).await?;
             }
         }
         next = recv_message::<Control>(&mut recv).await;

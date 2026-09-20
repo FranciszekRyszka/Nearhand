@@ -16,6 +16,8 @@ pub struct Install {
     pub bitrate_kbps: u32,
     /// An enrollment token, to join the server's managed devices.
     pub token: Option<String>,
+    /// Ask for the password as well as a grant, rather than instead of one.
+    pub password_with_grant: bool,
     /// The name to list this computer under, instead of its computer name.
     pub name: Option<String>,
 }
@@ -62,6 +64,15 @@ pub fn configure(options: Install) -> Result<Identity> {
         (None, None) => Some(Stored::new(&new_password()?)?),
     };
 
+    if options.password_with_grant {
+        if access.is_none() {
+            bail!("--password-with-grant needs a password to ask for");
+        }
+        if enrollment.is_none() {
+            bail!("--password-with-grant needs --token: there are no grants to ask for besides");
+        }
+    }
+
     let dir = machine::dir();
     machine::prepare_dir(&dir)?;
     let mut config = machine::Config {
@@ -73,6 +84,7 @@ pub fn configure(options: Install) -> Result<Identity> {
         access,
         managed: enrollment.is_some(),
         enrollment,
+        password_with_grant: options.password_with_grant,
         updates: true,
     };
     config.save(&dir)?;
@@ -128,7 +140,9 @@ pub fn uninstall(purge: bool) -> Result<()> {
     Ok(())
 }
 
-pub fn set_password(password: Option<String>, none: bool) -> Result<()> {
+/// Change the access password, and whether it is asked for alongside a
+/// grant or instead of one. `with_grant` is `None` to leave that as it is.
+pub fn set_password(password: Option<String>, none: bool, with_grant: Option<bool>) -> Result<()> {
     supported()?;
     let dir = machine::dir();
     let mut config = machine::Config::load(&dir)?;
@@ -136,6 +150,9 @@ pub fn set_password(password: Option<String>, none: bool) -> Result<()> {
         bail!(
             "this machine takes no grants from its server: without a password, no one could connect"
         );
+    }
+    if with_grant == Some(true) && !config.managed {
+        bail!("this machine takes no grants from its server: there is nothing to ask for besides");
     }
     config.access = if none {
         None
@@ -146,6 +163,8 @@ pub fn set_password(password: Option<String>, none: bool) -> Result<()> {
         };
         Some(Stored::new(&password)?)
     };
+    // Without a password there is nothing to ask for alongside a grant.
+    config.password_with_grant = !none && with_grant.unwrap_or(config.password_with_grant);
     config.save(&dir)?;
     #[cfg(windows)]
     crate::service::restart()?;
@@ -153,6 +172,13 @@ pub fn set_password(password: Option<String>, none: bool) -> Result<()> {
         println!("Access password removed: only grants from the server let anyone in.");
     } else {
         println!("Access password changed.");
+        println!(
+            "{}",
+            match config.password_with_grant {
+                true => "It is asked for as well as a grant from the server.",
+                false => "It lets a viewer in on its own.",
+            }
+        );
     }
     Ok(())
 }
@@ -175,9 +201,15 @@ pub fn status() -> Result<()> {
                 }
                 println!(
                     "access:  {}",
-                    match (config.managed, config.access.is_some()) {
-                        (true, true) => "grants from the server, or the access password",
-                        (true, false) => "grants from the server only",
+                    match (
+                        config.managed,
+                        config.access.is_some(),
+                        config.password_with_grant
+                    ) {
+                        (true, true, true) =>
+                            "a grant from the server and the access password together",
+                        (true, true, false) => "grants from the server, or the access password",
+                        (true, false, _) => "grants from the server only",
                         _ => "the access password only",
                     }
                 );

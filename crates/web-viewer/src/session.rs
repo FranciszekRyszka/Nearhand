@@ -68,12 +68,12 @@ pub enum Error {
     Protocol(#[from] nearhand_core::Error),
 }
 
-/// How the viewer proves it may watch.
-pub enum Auth {
-    /// A grant from the server, for this device.
-    Grant(SignedGrant),
-    /// The password the agent shows, or its access password.
-    Password(String),
+/// How the viewer proves it may watch: a grant from the server, the
+/// password the agent shows or its access password — or, where the device
+/// asks for both, a grant and the password together.
+pub struct Auth {
+    pub grant: Option<SignedGrant>,
+    pub password: Option<String>,
 }
 
 /// What the page is told.
@@ -99,6 +99,10 @@ pub enum Event {
     Clipboard(String),
     /// The session is over, and why.
     Closed(String),
+    /// The device asks for its access password as well as a grant, and
+    /// this viewer was given only the grant. Nothing has been presented,
+    /// so the grant is still good: ask for the password and start again.
+    PasswordAlsoNeeded,
 }
 
 pub struct Session {
@@ -525,16 +529,7 @@ impl Session {
                 self.fail("the agent offers no H.264 encoder");
             }
             Control::Hello { .. } => {}
-            Control::AuthRequired { secret } => match self.auth.take() {
-                Some(Auth::Grant(grant)) => self.send_control(&Control::Present { grant }),
-                Some(Auth::Password(password)) => match secret {
-                    Some(secret) => self.start_proving(&secret, &password),
-                    None => self.fail(
-                        "this device lets nobody in with a password; sign in to its server instead",
-                    ),
-                },
-                None => self.fail("the agent asked twice to be let in"),
-            },
+            Control::AuthRequired { required } => self.asked_for(required),
             Control::AuthAnswer { pake } => self.prove(&pake),
             Control::AuthProved { proof } => self.check_the_agent(&proof),
             Control::AwaitingApproval => self.events.push_back(Event::AwaitingApproval),
@@ -574,6 +569,53 @@ impl Session {
                 frame_id: missing.frame_id,
                 chunks: missing.chunks,
             });
+        }
+    }
+
+    /// Answer what the agent asks for: a grant from its server, the
+    /// password, either, or both (`nearhand_core::access::Required`).
+    fn asked_for(&mut self, required: access::Required) {
+        let Some(auth) = self.auth.take() else {
+            return self.fail("the agent asked twice to be let in");
+        };
+        match (auth.grant, auth.password) {
+            (Some(grant), password) => {
+                if !required.takes_grants() {
+                    return self.fail("this device takes a password, not a grant from a server");
+                }
+                // Nothing is presented until the viewer can finish: a grant
+                // is good once, and this one is still unused.
+                if required.password_after_grant() && password.is_none() {
+                    self.closed = true;
+                    self.conn.close(
+                        Instant::now(),
+                        VarInt::from_u32(close::NORMAL),
+                        Bytes::from_static(b"a password is needed as well"),
+                    );
+                    return self.events.push_back(Event::PasswordAlsoNeeded);
+                }
+                self.send_control(&Control::Present { grant });
+                if let (true, Some(secret), Some(password)) = (
+                    required.password_after_grant(),
+                    required.secret(),
+                    password.as_deref(),
+                ) {
+                    let secret = secret.clone();
+                    self.start_proving(&secret, password);
+                }
+            }
+            (None, Some(password)) => {
+                match required.secret().filter(|_| required.password_is_enough()) {
+                    Some(secret) => {
+                        let secret = secret.clone();
+                        self.start_proving(&secret, &password);
+                    }
+                    None => {
+                        self.fail("this device needs a grant from its server; sign in to it first")
+                    }
+                }
+            }
+            (None, None) => self.fail("nothing to be let in with"),
         }
     }
 

@@ -99,6 +99,14 @@ account (M5).
   - Only machines installed with an enrollment token take grants. One
     installed with only an access password never does, so its server
     alone cannot open it, as before.
+  - *Implemented:* a machine can ask for **both** — a grant *and* its
+    access password (`install --password-with-grant`, or `set-password
+    --with-grant` later; `PASSWORD_WITH_GRANT=1` for the MSI). Then a
+    server that was taken over gets no further than the grant it signed
+    itself: it has never seen the password, and the exchange that proves
+    it cannot be replayed or relayed. The grant still decides what the
+    session may do. A viewer with only one of the two is told so before it
+    presents anything, so its grant is not spent.
   - A grant is for connecting, not a lease: removing someone's grant stops
     their next connection, not a session they already have. The person at
     the machine sees whose session it is and can end it.
@@ -275,13 +283,15 @@ that something is wrong, but only after the attempt. A viewer that connects
 with a grant rather than a password is in the same position as before: the
 grant proves the server's say-so, not the device's.
 
-A **fully compromised management server** could issue itself a grant, and
-open every machine enrolled with it. Machines installed with only an access
-password, which the server never learns, are out of its reach; the audit log
-shows what happened, unless the attacker erased it. Requiring a grant *and* the password on
-the same machine is a possible later option. This is stated rather than
-solved; a server you do not trust is a server you should not enroll
-against.
+A **fully compromised management server** can issue itself a grant, and open
+every machine enrolled with it that takes grants alone. Machines installed
+with only an access password, which the server never learns, are out of its
+reach, and so now are machines told to ask for a grant *and* the password
+(`--password-with-grant` above): the server can sign itself the grant and
+still not know the password. The audit log shows what happened, unless the
+attacker erased it. Asking for both costs a password at every session, which
+is why it is not the default; a server you do not trust is still a server you
+should not enroll against.
 
 ## Reporting a vulnerability
 

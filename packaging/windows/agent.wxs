@@ -10,11 +10,17 @@
     msiexec /i nearhand-agent.msi /qn SERVER=desk.example.com
             SERVER_FINGERPRINT=<hex> ACCESS_PASSWORD=<password>
             [ENROLL_TOKEN=nhe_...] [DEVICE_NAME=<name>]
+            [PASSWORD_WITH_GRANT=1]
 
   ENROLL_TOKEN, from the server's administrator, adds the machine to the
   server's managed devices; the agent enrolls when the server can be reached.
   People the server grants access then reach the machine, and
   ACCESS_PASSWORD becomes optional: without one, grants are the only way in.
+
+  PASSWORD_WITH_GRANT=1 asks for the access password *as well as* a grant,
+  rather than instead of one, so that a server which was taken over cannot
+  open the machine on its own. It needs both ACCESS_PASSWORD and
+  ENROLL_TOKEN.
 
   An upgrade or repair on a configured machine needs none of them: the
   configuration and key in %ProgramData%\Nearhand are kept, and so is the ID.
@@ -51,6 +57,10 @@
     <Property Id="SERVER" Secure="yes" />
     <Property Id="SERVER_FINGERPRINT" Secure="yes" />
     <Property Id="DEVICE_NAME" Secure="yes" />
+    <!-- Ask for the access password as well as a grant from the server,
+         rather than instead of one; needs both ACCESS_PASSWORD and
+         ENROLL_TOKEN. -->
+    <Property Id="PASSWORD_WITH_GRANT" Secure="yes" />
 
     <Launch Condition="Installed OR CONFIGURED OR (SERVER AND SERVER_FINGERPRINT AND (ACCESS_PASSWORD OR ENROLL_TOKEN))"
             Message="Install with SERVER, SERVER_FINGERPRINT and ACCESS_PASSWORD or ENROLL_TOKEN, for example: msiexec /i nearhand-agent.msi SERVER=desk.example.com SERVER_FINGERPRINT=... ACCESS_PASSWORD=..." />
@@ -90,8 +100,13 @@
          if there is a token. Only when the properties are given; the command
          line, which holds the password and token, is kept out of the logs.
          Empty ACCESS_PASSWORD, ENROLL_TOKEN and DEVICE_NAME mean none. -->
+    <SetProperty Id="WITH_GRANT"
+                 Value=" --password-with-grant"
+                 Before="SetConfigure"
+                 Sequence="execute"
+                 Condition="PASSWORD_WITH_GRANT AND ACCESS_PASSWORD AND ENROLL_TOKEN" />
     <SetProperty Id="Configure"
-                 Value="&quot;[#AgentExe]&quot; configure --server &quot;[SERVER]&quot; --server-fingerprint &quot;[SERVER_FINGERPRINT]&quot; --password &quot;[ACCESS_PASSWORD]&quot; --token &quot;[ENROLL_TOKEN]&quot; --name &quot;[DEVICE_NAME]&quot;"
+                 Value="&quot;[#AgentExe]&quot; configure --server &quot;[SERVER]&quot; --server-fingerprint &quot;[SERVER_FINGERPRINT]&quot; --password &quot;[ACCESS_PASSWORD]&quot; --token &quot;[ENROLL_TOKEN]&quot; --name &quot;[DEVICE_NAME]&quot;[WITH_GRANT]"
                  Before="Configure"
                  Sequence="execute"
                  Condition="(ACCESS_PASSWORD OR ENROLL_TOKEN) AND NOT REMOVE" />
