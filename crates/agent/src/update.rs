@@ -200,8 +200,12 @@ impl Updates {
     }
 
     #[cfg(not(windows))]
-    fn install(&self, _package: &Path) -> Result<()> {
-        bail!("installing updates is for Windows so far")
+    fn install(&self, package: &Path) -> Result<()> {
+        bail!(
+            "installing {} is for Windows so far; its log would be {}",
+            package.display(),
+            self.log.display()
+        )
     }
 }
 
