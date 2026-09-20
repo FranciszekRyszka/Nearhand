@@ -69,6 +69,10 @@ how agents get to this version.
 
 ### Changed
 
+- The relay carries at most `relay.max_gb` for one session — 100 GB by
+  default, both directions together, 0 to lift it — and then lets the
+  tunnel go. A session at the agent's default bitrate would take a day to
+  reach that; an endless one run through someone else's server cannot.
 - The server sweeps daily: console sessions and setup links past their
   time, and audit entries older than `audit.keep_days` — a year by
   default, 0 to keep them for ever. Nothing pruned them before, on a

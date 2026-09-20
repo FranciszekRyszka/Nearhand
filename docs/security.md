@@ -187,9 +187,12 @@ account (M5).
     is online, as anyone can over WebTransport, and learn from the refusal
     whether that ID exists here. The tunnel is useless without a grant — the
     agent refuses the session — but it costs the server a little bandwidth.
-  - *Not yet:* limits on how much one session may relay. Only an agent that
-    accepted the session can receive its traffic, but a server open to
-    everyone carries whatever that pair sends.
+  - *Implemented:* a ceiling on what one relayed session may carry, both
+    directions counted together — `relay.max_gb`, 100 GB by default, 0 to
+    lift it. Past it the server lets the tunnel go. A session at the
+    agent's default 10 Mbps would take a day to reach it, so no honest one
+    does; the point is that an endless one cannot be run through someone
+    else's server.
 
 ## Exposure
 

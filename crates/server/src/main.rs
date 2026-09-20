@@ -173,6 +173,7 @@ async fn serve(config: Config, key: PathBuf) -> Result<()> {
     ));
     let registry = Arc::new(
         rendezvous::Registry::new(devices.clone())
+            .with_ceiling(config.relay.ceiling())
             .with_access(rendezvous::Access {
                 accounts: accounts.clone(),
                 grants: grants.clone(),

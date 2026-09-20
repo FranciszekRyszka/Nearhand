@@ -122,6 +122,9 @@ public_url = "https://desk.example.com"   # for the links the server prints
 
 [audit]
 keep_days = 365               # 0 keeps the audit log for ever
+
+[relay]
+max_gb = 100                  # per relayed session, both ways; 0 lifts it
 ```
 
 Every setting can come from the environment instead:

@@ -13,6 +13,9 @@
 //! [audit]
 //! keep_days = 365                # 0 keeps the audit log for ever
 //!
+//! [relay]
+//! max_gb = 100                   # per relayed session; 0 lifts the ceiling
+//!
 //! [http]
 //! bind = "0.0.0.0:443"           # TCP: REST API and console
 //! tls = "self-signed"            # or "none" behind a reverse proxy,
@@ -35,12 +38,39 @@ pub struct Config {
     pub quic: Quic,
     pub http: Http,
     pub audit: Audit,
+    pub relay: Relay,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Data {
     pub dir: PathBuf,
+}
+
+/// What the relay will carry for one session.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Relay {
+    /// Gigabytes one relayed session may carry, both directions counted
+    /// together, before the server stops carrying it. 0 lifts the ceiling.
+    ///
+    /// A session at the agent's default 10 Mbps takes a day to reach the
+    /// default, so no honest one meets it; it is there so that a server
+    /// open to accounts cannot be turned into a tunnel without limit.
+    pub max_gb: u64,
+}
+
+impl Default for Relay {
+    fn default() -> Self {
+        Self { max_gb: 100 }
+    }
+}
+
+impl Relay {
+    /// The ceiling in bytes; 0 means none.
+    pub fn ceiling(&self) -> u64 {
+        self.max_gb.saturating_mul(1024 * 1024 * 1024)
+    }
 }
 
 /// The audit log's one setting: how long to keep it.
@@ -146,7 +176,10 @@ impl Config {
             else {
                 continue;
             };
-            if !matches!(section.as_str(), "data" | "quic" | "http" | "audit") {
+            if !matches!(
+                section.as_str(),
+                "data" | "quic" | "http" | "audit" | "relay"
+            ) {
                 continue;
             }
             let entry = table
@@ -254,6 +287,7 @@ mod tests {
         let config = Config::parse("", env(&[])).expect("parse");
         assert_eq!(config.data.dir, PathBuf::from("."));
         assert_eq!(config.audit.keep_days, 365);
+        assert_eq!(config.relay.ceiling(), 100 * 1024 * 1024 * 1024);
         assert_eq!(config.quic.bind.port(), 443);
         assert_eq!(config.http.tls, Tls::SelfSigned);
         assert_eq!(config.public_url(), "https://localhost");

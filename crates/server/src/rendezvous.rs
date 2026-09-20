@@ -28,7 +28,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -72,6 +72,53 @@ struct Relay {
     viewer: Arc<dyn Carrier>,
     /// Bytes relayed to the viewer.
     to_viewer: Arc<AtomicU64>,
+    /// What this session may still carry, both directions together.
+    ceiling: Ceiling,
+}
+
+/// How much one relayed session may carry. A server that introduces
+/// strangers to each other carries whatever they send, so there is a
+/// ceiling; it is high enough that no honest session meets it, and the
+/// point is that an endless one cannot.
+#[derive(Clone)]
+struct Ceiling {
+    /// Bytes, both directions together; 0 lifts it.
+    limit: u64,
+    carried: Arc<AtomicU64>,
+    said: Arc<AtomicBool>,
+    session: u64,
+}
+
+impl Ceiling {
+    fn new(limit: u64, session: u64) -> Self {
+        Self {
+            limit,
+            carried: Arc::new(AtomicU64::new(0)),
+            said: Arc::new(AtomicBool::new(false)),
+            session,
+        }
+    }
+
+    /// Count `bytes` and say whether to carry them. Once the ceiling is
+    /// reached it stays reached, and is logged once.
+    fn allows(&self, bytes: usize) -> bool {
+        let carried = self
+            .carried
+            .fetch_add(bytes as u64, Ordering::Relaxed)
+            .saturating_add(bytes as u64);
+        if self.limit == 0 || carried <= self.limit {
+            return true;
+        }
+        if !self.said.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                session = self.session,
+                carried_mb = carried / (1024 * 1024),
+                limit_mb = self.limit / (1024 * 1024),
+                "a relayed session reached the ceiling; carrying no more of it"
+            );
+        }
+        false
+    }
 }
 
 #[derive(Default)]
@@ -87,6 +134,8 @@ pub struct Registry {
     /// The releases agents are offered; without them, none are.
     releases: Option<Arc<Releases>>,
     downloads: Downloads,
+    /// Bytes one relayed session may carry; 0 lifts the ceiling.
+    ceiling: u64,
 }
 
 /// Room for [`DOWNLOADS`] packages being sent at once.
@@ -276,8 +325,11 @@ async fn register(
             };
             let relay = lock(&relays)
                 .get(&session)
-                .map(|r| (r.viewer.clone(), r.to_viewer.clone()));
-            if let Some((viewer, count)) = relay {
+                .map(|r| (r.viewer.clone(), r.to_viewer.clone(), r.ceiling.clone()));
+            if let Some((viewer, count, ceiling)) = relay {
+                if !ceiling.allows(packet.len()) {
+                    continue;
+                }
                 count.fetch_add(packet.len() as u64, Ordering::Relaxed);
                 // A full queue drops the oldest datagrams; the connection
                 // inside recovers, as from any loss.
@@ -349,10 +401,12 @@ async fn introduce(
         send_message(send, &message).await?;
     }
     let _ = send.finish();
+    let ceiling = introduction.ceiling;
     relay(
         Arc::new(conn.clone()),
         &introduction.agent,
         introduction.session,
+        ceiling,
     )
     .await;
     Ok(())
@@ -364,6 +418,8 @@ pub(crate) struct Introduction {
     session: u64,
     /// The user and the grant signed for them, when they came with a token.
     grant: Option<(String, SignedGrant)>,
+    /// What this session may carry, from the server's configuration.
+    ceiling: u64,
 }
 
 impl Introduction {
@@ -385,7 +441,7 @@ impl Introduction {
 
     /// Relay between `viewer` and the agent until the viewer goes.
     pub(crate) async fn relay(self, viewer: Arc<dyn Carrier>) {
-        relay(viewer, &self.agent, self.session).await;
+        relay(viewer, &self.agent, self.session, self.ceiling).await;
     }
 }
 
@@ -435,23 +491,29 @@ pub(crate) async fn arrange(
         agent,
         session,
         grant,
+        ceiling: registry.ceiling,
     })
 }
 
 /// Forward the viewer's datagrams to the agent, and the agent's for this
 /// session back, until the viewer closes its connection: at once when it
 /// connected directly, at the end of the session when it did not.
-async fn relay(viewer: Arc<dyn Carrier>, agent: &Agent, session: u64) {
+async fn relay(viewer: Arc<dyn Carrier>, agent: &Agent, session: u64, limit: u64) {
     let to_viewer = Arc::new(AtomicU64::new(0));
+    let ceiling = Ceiling::new(limit, session);
     lock(&agent.relays).insert(
         session,
         Relay {
             viewer: viewer.clone(),
             to_viewer: to_viewer.clone(),
+            ceiling: ceiling.clone(),
         },
     );
     let mut to_agent = 0u64;
     while let Some(datagram) = viewer.read_datagram().await {
+        if !ceiling.allows(datagram.len()) {
+            break;
+        }
         to_agent += datagram.len() as u64;
         let _ = agent.conn.send_datagram(tag(session, &datagram));
     }
@@ -706,6 +768,11 @@ impl Registry {
     }
 
     /// And that offers agents the releases in `releases`.
+    /// What one relayed session may carry, in bytes (`config::Relay`).
+    pub fn with_ceiling(self, ceiling: u64) -> Self {
+        Self { ceiling, ..self }
+    }
+
     pub fn with_releases(self, releases: Arc<Releases>) -> Self {
         Self {
             releases: Some(releases),
@@ -1283,6 +1350,11 @@ mod tests {
 
     impl World {
         async fn new(agent: Place, punch: bool) -> Self {
+            Self::with_ceiling(agent, punch, 0).await
+        }
+
+        /// The same, with a ceiling on what one relayed session may carry.
+        async fn with_ceiling(agent: Place, punch: bool, ceiling: u64) -> Self {
             let net = Net::new();
             let server_identity = Identity::generate().expect("identity");
             let server_addr = public(100, 443);
@@ -1292,7 +1364,7 @@ mod tests {
                 None,
                 Some(rendezvous_server_config(&server_identity).expect("config")),
             );
-            let registry = Arc::new(Registry::default());
+            let registry = Arc::new(Registry::default().with_ceiling(ceiling));
             tokio::spawn(serve(server, registry.clone()));
             let server_fp = server_identity.fingerprint();
 
@@ -1519,6 +1591,53 @@ mod tests {
         })
         .await
         .expect("the server lets the session go");
+    }
+
+    /// Counting is the whole of it: up to the ceiling, through; past it,
+    /// not.
+    #[test]
+    fn a_ceiling_lets_through_what_is_under_it() {
+        let ceiling = Ceiling::new(10, 1);
+        assert!(ceiling.allows(4));
+        assert!(ceiling.allows(6), "ten is not over ten");
+        assert!(!ceiling.allows(1));
+        // It stays reached.
+        assert!(!ceiling.allows(0));
+
+        let none = Ceiling::new(0, 2);
+        assert!(none.allows(usize::MAX));
+        assert!(none.allows(usize::MAX), "0 lifts it");
+    }
+
+    /// A server that introduces strangers carries what they send, so there
+    /// is a ceiling. Past it the tunnel is let go, rather than carrying an
+    /// endless session for whoever opened it.
+    #[tokio::test]
+    async fn a_relayed_session_is_let_go_at_the_ceiling() {
+        // Room for the handshake inside the tunnel, and little more.
+        let world = World::with_ceiling(Place::Behind(NatKind::Symmetric), true, 64 * 1024).await;
+        let reached = world.reach(Place::Internet).await.expect("reached");
+        assert_eq!(path_of(reached.remote), Path::Relayed);
+        assert_eq!(world.relayed_sessions(), 1);
+
+        // Push more than the ceiling through it.
+        tokio::spawn(async move {
+            if let Ok((mut send, _recv)) = reached.conn.open_bi().await {
+                let block = vec![0u8; 16 * 1024];
+                for _ in 0..40 {
+                    if send.write_all(&block).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while world.relayed_sessions() > 0 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the server stops carrying the session");
     }
 
     /// A viewer that connects directly closes its introduction, and with it
