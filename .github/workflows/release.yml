@@ -39,6 +39,12 @@ jobs:
             echo "the tag is $tag, the agent is $version" >&2
             exit 1
           fi
+          # A release whose changes nobody wrote down is one nobody can
+          # decide whether to take.
+          if ! grep -q "^## $version " CHANGELOG.md; then
+            echo "CHANGELOG.md has no '## $version <date>' section" >&2
+            exit 1
+          fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
   # The agent's installer, without an Authenticode signature until there is
@@ -213,7 +219,15 @@ jobs:
           ls -l
       - env:
           GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.version.outputs.version }}
         run: |
+          # What this release changed, from the changelog: its section,
+          # down to the next version's.
+          awk -v want="## $VERSION " '
+            index($0, want) == 1 { inside = 1; next }
+            inside && /^## / { exit }
+            inside { print }
+          ' CHANGELOG.md > changes.md
           cat > notes.md <<'NOTES'
           Pre-alpha. Windows only; see the README for what works.
 
@@ -232,8 +246,9 @@ jobs:
           # a shell that expanded them would read their backticks as
           # commands.
           sed -i "s|IMAGE|ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/nearhand-server|" notes.md
-          sed -i "s|VERSION|${{ needs.version.outputs.version }}|" notes.md
-          gh release create "v${{ needs.version.outputs.version }}" release/* \
+          sed -i "s|VERSION|$VERSION|" notes.md
+          cat changes.md notes.md > release-notes.md
+          gh release create "v$VERSION" release/* \
             --draft --prerelease \
-            --title "Nearhand ${{ needs.version.outputs.version }}" \
-            --notes-file notes.md
+            --title "Nearhand $VERSION" \
+            --notes-file release-notes.md

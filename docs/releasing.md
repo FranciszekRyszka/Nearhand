@@ -6,21 +6,27 @@ signing protects against, [security](security.md#supply-chain).
 
 ## Cutting one
 
-1. Set the version in the crates that carry it — the agent's is the one
+1. Move the **Unreleased** section of [CHANGELOG.md](../CHANGELOG.md) under
+   a heading for this version — `## 0.3.0 — 2026-09-21` — saying what
+   changed and, where it matters, in what order to upgrade.
+2. Set the version in the crates that carry it — the agent's is the one
    releases are named after — and commit that on `main`.
-2. Tag it and push the tag:
+3. Tag it and push the tag:
 
    ```bash
-   git tag v0.2.0
-   git push origin v0.2.0
+   git tag v0.3.0
+   git push origin v0.3.0
    ```
 
-3. CI builds everything, signs the installer, and leaves a **draft**
-   release. Look it over and publish it when it reads right.
+4. CI builds everything, signs the installer, and leaves a **draft**
+   release whose notes are that changelog section followed by what each
+   file is. Look it over and publish it when it reads right.
 
-The tag and the agent's version must match, or the build stops before it
-makes anything: agents compare versions to decide whether to update, and a
-release whose name disagrees with its contents would make that a lie.
+The tag and the agent's version must match, and the changelog must have a
+section for it, or the build stops before it makes anything: agents compare
+versions to decide whether to update, and a release whose name disagrees
+with its contents would make that a lie — while one whose changes nobody
+wrote down is one nobody can decide whether to take.
 
 `workflow_dispatch` on the same workflow rehearses all of it for a tag that
 exists already, up to the draft.

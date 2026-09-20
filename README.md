@@ -57,6 +57,7 @@ One Cargo workspace:
 - [docs/self-hosting.md](docs/self-hosting.md) — running your own server
 - [docs/performance.md](docs/performance.md) — latency measurements and how they were taken
 - [docs/api.md](docs/api.md) — the REST API the console is built on
+- [CHANGELOG.md](CHANGELOG.md) — what changed in each release, and what to upgrade first
 - [docs/troubleshooting.md](docs/troubleshooting.md) — what to do when a session will not start
 - [docs/releasing.md](docs/releasing.md) — how a release is built and signed
 
