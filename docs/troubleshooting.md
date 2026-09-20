@@ -135,6 +135,16 @@ See [self-hosting](self-hosting.md#updating-agents) for the server's side.
 
 ## The server
 
+```bash
+nearhand-server --config /etc/nearhand/nearhand.toml doctor
+```
+
+It prints the fingerprint agents pin — which otherwise only appears in the
+log at startup — and looks at the data folder, the key, the database, the
+certificate, both ports and the address agents are told to come back to. It
+neither migrates the database nor holds the ports, so it is safe to run on
+a server that is serving.
+
 - **Ports.** UDP 443 for agents, viewers and the relay; TCP 443 for the API
   and the console. Both, on the same port number by default.
 - **Behind a reverse proxy.** The TCP side proxies like any HTTPS service.

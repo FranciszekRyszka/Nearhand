@@ -349,6 +349,11 @@ against the release key before you upload it.
 
 ## When something does not work
 
+`nearhand-server doctor` looks at this end: the fingerprint agents pin, the
+data folder, the database, the certificate, both ports, and whether the
+address agents are told to come back to is one they could use. It changes
+nothing, so it is safe on a server that is serving.
+
 `nearhand-agent doctor`, on the machine being helped, walks through the
 usual reasons a session will not start — the service, UDP, the server's
 name and key — and shows the end of the agent's log. It registers

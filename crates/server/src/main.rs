@@ -12,6 +12,7 @@ mod config;
 mod console;
 mod db;
 mod devices;
+mod doctor;
 mod grants;
 mod https;
 #[cfg(test)]
@@ -74,6 +75,9 @@ enum Command {
     Relay,
     /// Create or update the database schema, and stop.
     Migrate,
+    /// Look at this server without changing it: its key's fingerprint, the
+    /// data folder, the database, the certificate and the two ports.
+    Doctor,
     /// Print a new one-time link for creating the first administrator.
     AdminLink,
 }
@@ -105,6 +109,7 @@ fn main() -> Result<()> {
             println!("database up to date: {}", config.database_path().display());
             Ok(())
         }),
+        Command::Doctor => runtime.block_on(doctor::run(config, &cli.config)),
         Command::AdminLink => runtime.block_on(async {
             prepare_data_dir(&config)?;
             let accounts = Accounts::new(db::open(&config.database_path()).await?);
