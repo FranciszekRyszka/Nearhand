@@ -8,6 +8,7 @@
 //! own.
 
 mod access;
+mod doctor;
 mod elevation;
 mod enroll;
 mod gate;
@@ -136,6 +137,13 @@ enum Command {
         /// From now on, let either the password or a grant in on its own.
         #[arg(long, conflicts_with_all = ["none", "with_grant"])]
         either: bool,
+    },
+    /// Look for what is in the way of a session: the configuration, the
+    /// key, the service, the server — and show the end of the logs.
+    Doctor {
+        /// Another folder than the installed one, for testing.
+        #[arg(long, hide = true)]
+        dir: Option<PathBuf>,
     },
     /// Show whether the service runs, and this computer's ID.
     Status,
@@ -274,6 +282,7 @@ fn main() -> Result<()> {
                 _ => None,
             },
         ),
+        Command::Doctor { dir } => doctor::run(dir.unwrap_or_else(machine::dir)),
         Command::Status => setup::status(),
         Command::Run { stop_event, dir } => {
             unattended::run(dir.unwrap_or_else(machine::dir), stop_event)

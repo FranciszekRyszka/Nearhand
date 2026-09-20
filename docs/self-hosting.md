@@ -347,6 +347,15 @@ rollout — takes `updates = false` in its `agent.toml`.
 `nearhand-release verify nearhand-agent-0.2.0-x64.msi` checks a package
 against the release key before you upload it.
 
+## When something does not work
+
+`nearhand-agent doctor`, on the machine being helped, walks through the
+usual reasons a session will not start — the service, UDP, the server's
+name and key — and shows the end of the agent's log. It registers
+nothing and changes nothing, so it is safe to run during a session.
+[Troubleshooting](troubleshooting.md) covers the rest, including the
+browser viewer, grants and clocks, and updates that do not arrive.
+
 ## Backup
 
 The data folder: the SQLite file (`nearhand.db`, with its `-wal` file while
