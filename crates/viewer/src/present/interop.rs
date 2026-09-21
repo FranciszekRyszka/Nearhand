@@ -54,6 +54,9 @@ pub struct DecodeSide {
 
 /// The D3D12 half, owned by the render thread.
 pub struct RenderSide {
+    /// Both devices, kept so the ring can be built again bigger.
+    device11: ID3D11Device,
+    device12: ID3D12Device,
     pub queue: ID3D12CommandQueue,
     pub slots: Vec<wgpu::Texture>,
     pub decode_fence: ID3D12Fence,
@@ -73,6 +76,25 @@ impl RenderSide {
     pub fn frame_done(&self, value: u64) -> Result<()> {
         unsafe { self.queue.Signal(&self.render_fence, value) }.context("queue Signal")
     }
+
+    /// Replace the ring with one of `size` pixels per slot, on the same
+    /// devices and fences, and return its D3D11 half for the decode side.
+    /// The old slots are dropped here; `wgpu` keeps them alive until work
+    /// already submitted is done with them.
+    pub fn rebuild(&mut self, device: &wgpu::Device, size: (u32, u32)) -> Result<Ring> {
+        let (slots11, slots12) = ring(&self.device11, &self.device12, device, size)?;
+        self.slots = slots12;
+        Ok(Ring {
+            slots: slots11,
+            size,
+        })
+    }
+}
+
+/// A ring built after the first, on its way to the decode side.
+pub struct Ring {
+    pub slots: Vec<ID3D11Texture2D>,
+    pub size: (u32, u32),
 }
 
 /// Build the ring on the adapter `wgpu` chose, `size` pixels per slot.
@@ -101,25 +123,7 @@ pub fn create(
         .cast::<ID3D11DeviceContext4>()
         .context("ID3D11DeviceContext4")?;
 
-    let bind = (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32;
-    let misc = (D3D11_RESOURCE_MISC_SHARED.0 | D3D11_RESOURCE_MISC_SHARED_NTHANDLE.0) as u32;
-    let mut slots11 = Vec::with_capacity(SLOTS);
-    let mut slots12 = Vec::with_capacity(SLOTS);
-    for index in 0..SLOTS {
-        let texture = create_texture(&device11, size, DXGI_FORMAT_B8G8R8A8_UNORM, bind, misc)
-            .context("creating a shared slot")?;
-        let handle = unsafe {
-            texture.cast::<IDXGIResource1>()?.CreateSharedHandle(
-                None,
-                DXGI_SHARED_RESOURCE_READ.0 | DXGI_SHARED_RESOURCE_WRITE.0,
-                PCWSTR::null(),
-            )
-        }
-        .context("sharing a slot")?;
-        let resource: ID3D12Resource = open_shared(&device12, handle)?;
-        slots12.push(wrap_for_wgpu(device, resource, size, index));
-        slots11.push(texture);
-    }
+    let (slots11, slots12) = ring(&device11, &device12, device, size)?;
 
     // Decode fence: made on D3D11, opened on D3D12.
     let decode11: ID3D11Fence = unsafe {
@@ -147,19 +151,51 @@ pub fn create(
 
     Ok((
         DecodeSide {
-            device: device11,
+            device: device11.clone(),
             context,
             slots: slots11,
             decode_fence: decode11,
             render_fence: render11,
         },
         RenderSide {
+            device11,
+            device12,
             queue: queue12,
             slots: slots12,
             decode_fence: decode12,
             render_fence: render12,
         },
     ))
+}
+
+/// The slots themselves: made on D3D11 as shared, opened on D3D12 and
+/// wrapped for `wgpu`.
+fn ring(
+    device11: &ID3D11Device,
+    device12: &ID3D12Device,
+    device: &wgpu::Device,
+    size: (u32, u32),
+) -> Result<(Vec<ID3D11Texture2D>, Vec<wgpu::Texture>)> {
+    let bind = (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32;
+    let misc = (D3D11_RESOURCE_MISC_SHARED.0 | D3D11_RESOURCE_MISC_SHARED_NTHANDLE.0) as u32;
+    let mut slots11 = Vec::with_capacity(SLOTS);
+    let mut slots12 = Vec::with_capacity(SLOTS);
+    for index in 0..SLOTS {
+        let texture = create_texture(device11, size, DXGI_FORMAT_B8G8R8A8_UNORM, bind, misc)
+            .context("creating a shared slot")?;
+        let handle = unsafe {
+            texture.cast::<IDXGIResource1>()?.CreateSharedHandle(
+                None,
+                DXGI_SHARED_RESOURCE_READ.0 | DXGI_SHARED_RESOURCE_WRITE.0,
+                PCWSTR::null(),
+            )
+        }
+        .context("sharing a slot")?;
+        let resource: ID3D12Resource = open_shared(device12, handle)?;
+        slots12.push(wrap_for_wgpu(device, resource, size, index));
+        slots11.push(texture);
+    }
+    Ok((slots11, slots12))
 }
 
 /// Open an NT handle on D3D12 and close the handle, whatever happens.

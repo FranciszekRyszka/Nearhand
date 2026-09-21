@@ -3,7 +3,9 @@
 //! The slots are sized for the host's largest monitor, and a picture from a
 //! smaller one fills only their top-left corner. The quad samples just that
 //! corner, so switching monitors changes two numbers here rather than
-//! rebuilding textures shared between two graphics APIs.
+//! rebuilding textures shared between two graphics APIs. Only a picture
+//! bigger than every one before it — a new resolution, or a session come
+//! back to at another size — rebuilds them, and this renderer with them.
 //!
 //! Both the slots and the swap chain are plain (non-sRGB) BGRA, so sampling
 //! and writing pass pixel values straight through with no gamma conversion —

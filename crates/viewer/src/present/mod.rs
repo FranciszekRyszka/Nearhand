@@ -25,7 +25,7 @@ mod overlay;
 mod render;
 
 use std::sync::Arc;
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{Receiver, Sender};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -42,7 +42,7 @@ use winit::window::{CustomCursor, Window, WindowId};
 use crate::direct::{Received, Shared};
 use decode::FrameReady;
 use input::Forwarder;
-use interop::RenderSide;
+use interop::{RenderSide, Ring};
 use overlay::Latency;
 use render::VideoRenderer;
 
@@ -54,6 +54,8 @@ const REPORT_EVERY: Duration = Duration::from_secs(2);
 pub enum UserEvent {
     Frame(FrameReady),
     Failed(String),
+    /// A picture does not fit the frame slots; build them this big.
+    Grow((u32, u32)),
     /// The host's pointer changed; shapes are already checked.
     Cursor(Cursor),
 }
@@ -62,7 +64,8 @@ pub struct Options {
     pub title: String,
     /// The first monitor's size. Others may differ, up to `slot_size`.
     pub video_size: (u32, u32),
-    /// The host's largest monitor, which the frame slots are sized for.
+    /// The host's largest monitor, which the frame slots are sized for at
+    /// first; they grow if a bigger picture comes.
     pub slot_size: (u32, u32),
     /// Where requests to watch another monitor go.
     pub switch: UnboundedSender<u8>,
@@ -133,6 +136,11 @@ struct Gpu {
     video_size: (u32, u32),
     switch: UnboundedSender<u8>,
     interop: RenderSide,
+    /// Bigger rings, on their way to the decode thread.
+    rings: Sender<Ring>,
+    /// Which ring the window draws from; frames from an older one are not
+    /// drawn.
+    ring: u32,
     shared: Arc<Shared>,
     egui_ctx: egui::Context,
     egui_state: egui_winit::State,
@@ -243,11 +251,13 @@ impl App {
         let egui_renderer =
             egui_wgpu::Renderer::new(&device, format, egui_wgpu::RendererOptions::default());
 
+        let (rings, rings_rx) = std::sync::mpsc::channel();
         self.decode_thread = Some(decode::spawn(
             decode_side,
             options.video_size,
             options.slot_size,
             options.frames,
+            rings_rx,
             self.proxy.clone(),
             options.shared.clone(),
         )?);
@@ -262,6 +272,8 @@ impl App {
             video_size: options.video_size,
             switch: options.switch,
             interop,
+            rings,
+            ring: 0,
             shared: options.shared,
             egui_ctx,
             egui_state,
@@ -276,6 +288,16 @@ impl App {
             return Ok(());
         };
         let net = gpu.shared.snapshot();
+
+        // Written into a ring since replaced: its slot is not ours to draw,
+        // but its fence value is still owed to the decode side.
+        let fresh = match fresh {
+            Some(frame) if frame.ring != gpu.ring => {
+                gpu.interop.frame_done(frame.fence_value)?;
+                None
+            }
+            fresh => fresh,
+        };
 
         let target = match gpu.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(texture)
@@ -385,6 +407,35 @@ impl App {
             self.shown = Some(frame);
         }
         self.last_draw = Instant::now();
+        Ok(())
+    }
+
+    /// Build the frame slots `size` pixels big and hand the decode side its
+    /// half. What is on screen was in the old ring, so the picture stays
+    /// black until the first frame in the new one.
+    fn grow(&mut self, size: (u32, u32)) -> Result<()> {
+        let Some(gpu) = self.gpu.as_mut() else {
+            return Ok(());
+        };
+        let limit = gpu.device.limits().max_texture_dimension_2d;
+        if size.0 > limit || size.1 > limit {
+            anyhow::bail!(
+                "the host's screen is {}x{}, more than this GPU can show ({limit} pixels a side)",
+                size.0,
+                size.1
+            );
+        }
+        tracing::info!(?size, "rebuilding the frame slots");
+        let ring = gpu.interop.rebuild(&gpu.device, size)?;
+        let mut video =
+            VideoRenderer::new(&gpu.device, gpu.config.format, &gpu.interop.slots, size);
+        video.set_content(&gpu.queue, gpu.video_size);
+        video.resize(&gpu.queue, (gpu.config.width, gpu.config.height));
+        gpu.video = video;
+        gpu.ring += 1;
+        self.shown = None;
+        // The decode thread has ended if this fails, and says why itself.
+        let _ = gpu.rings.send(ring);
         Ok(())
     }
 
@@ -536,6 +587,11 @@ impl ApplicationHandler<UserEvent> for App {
             // once it is drawn releases every slot before it too.
             UserEvent::Frame(frame) => self.latest = Some(frame),
             UserEvent::Failed(error) => self.fail(event_loop, anyhow!(error)),
+            UserEvent::Grow(size) => {
+                if let Err(e) = self.grow(size) {
+                    self.fail(event_loop, e);
+                }
+            }
             UserEvent::Cursor(Cursor::Shape(shape)) => {
                 tracing::debug!(width = shape.width, height = shape.height, "pointer shape");
                 match custom_cursor(event_loop, shape) {

@@ -10,6 +10,12 @@
 //! it, so a slow renderer made decoding crawl while frames piled up in
 //! memory — and once the window closed, the release never came and this
 //! thread hung for good.
+//!
+//! A picture bigger than the slots — the host changed its resolution, or the
+//! viewer came back to a session whose screen is bigger — is not shown; the
+//! window is asked for a bigger ring instead, which arrives on `rings` and
+//! is written into from then on. The decoder and the fences stay, so the
+//! stream carries on without waiting for a keyframe.
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -23,7 +29,7 @@ use nearhand_codec::{Decoder, EncodedFrame};
 use winit::event_loop::EventLoopProxy;
 
 use super::UserEvent;
-use super::interop::{DecodeSide, SLOTS};
+use super::interop::{DecodeSide, Ring, SLOTS};
 use crate::direct::{Received, Shared};
 
 /// A frame converted into a slot and ready to draw once the decode fence
@@ -41,22 +47,26 @@ pub struct FrameReady {
     pub skipped: u32,
     /// The picture's size: the top-left corner of the slot it fills.
     pub size: (u32, u32),
+    /// Which ring `slot` is in: 0 for the first, one more per rebuild.
+    pub ring: u32,
 }
 
 /// `size` is the first picture's, for setting up; later pictures may differ,
-/// when the viewer switches monitors, but none may exceed `slot_size`.
+/// when the viewer switches monitors; one that exceeds `slot_size` is held
+/// back until a ring big enough for it arrives on `rings`.
 pub fn spawn(
     side: DecodeSide,
     size: (u32, u32),
     slot_size: (u32, u32),
     frames: Receiver<Received>,
+    rings: Receiver<Ring>,
     proxy: EventLoopProxy<UserEvent>,
     shared: Arc<Shared>,
 ) -> Result<JoinHandle<()>> {
     std::thread::Builder::new()
         .name("nearhand-decode".to_owned())
         .spawn(move || {
-            if let Err(e) = run(side, size, slot_size, frames, &proxy, &shared) {
+            if let Err(e) = run(side, size, slot_size, frames, &rings, &proxy, &shared) {
                 let _ = proxy.send_event(UserEvent::Failed(format!("{e:#}")));
             }
         })
@@ -64,10 +74,11 @@ pub fn spawn(
 }
 
 fn run(
-    side: DecodeSide,
+    mut side: DecodeSide,
     size: (u32, u32),
-    slot_size: (u32, u32),
+    mut slot_size: (u32, u32),
     frames: Receiver<Received>,
+    rings: &Receiver<Ring>,
     proxy: &EventLoopProxy<UserEvent>,
     shared: &Shared,
 ) -> Result<()> {
@@ -79,6 +90,9 @@ fn run(
     let mut next_value = 1u64;
     // Decoded frames not shown since the last one that was.
     let mut unshown = 0u32;
+    let mut ring = 0u32;
+    // The slot size last asked of the window, so it is asked once.
+    let mut asked = None;
 
     // Blocks until the network side hangs up.
     while let Ok(first) = frames.recv() {
@@ -114,15 +128,32 @@ fn run(
             continue;
         };
 
+        // A bigger ring, asked for earlier. The window holds none of its
+        // slots yet, and fence values keep counting up across rings.
+        while let Ok(bigger) = rings.try_recv() {
+            tracing::info!(size = ?bigger.size, "frame slots rebuilt");
+            side.slots = bigger.slots;
+            slot_size = bigger.size;
+            slot_values = [0; SLOTS];
+            ring += 1;
+            asked = None;
+        }
+
         // A new monitor: the decoder follows the stream by itself, the
         // converter is rebuilt for the new output size.
         let picture = (decoded.width, decoded.height);
-        if picture.0 > slot_size.0 || picture.1 > slot_size.1 {
-            tracing::warn!(
-                ?picture,
-                ?slot_size,
-                "picture larger than the slots; not shown"
-            );
+        if let Some(wanted) = wanted(slot_size, picture) {
+            if asked != Some(wanted) {
+                tracing::info!(
+                    ?picture,
+                    ?slot_size,
+                    "picture larger than the slots; asking for bigger ones"
+                );
+                if proxy.send_event(UserEvent::Grow(wanted)).is_err() {
+                    return Ok(()); // The window is gone.
+                }
+                asked = Some(wanted);
+            }
             unshown += skipped + 1;
             continue;
         }
@@ -175,10 +206,33 @@ fn run(
             decoded_us: nearhand_capture::clock::now_us(),
             skipped: skipped + std::mem::take(&mut unshown),
             size: picture,
+            ring,
         };
         if proxy.send_event(UserEvent::Frame(ready)).is_err() {
             return Ok(()); // The window is gone.
         }
     }
     Ok(())
+}
+
+/// The slot size a `picture` needs, if the slots are too small for it: never
+/// smaller than they are in either direction, so switching back to an
+/// earlier monitor needs no rebuild.
+fn wanted(slots: (u32, u32), picture: (u32, u32)) -> Option<(u32, u32)> {
+    (picture.0 > slots.0 || picture.1 > slots.1)
+        .then(|| (slots.0.max(picture.0), slots.1.max(picture.1)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn slots_grow_only_for_a_picture_that_does_not_fit() {
+        assert_eq!(wanted((1920, 1080), (1920, 1080)), None);
+        assert_eq!(wanted((1920, 1080), (1280, 1024)), None);
+        assert_eq!(wanted((1920, 1080), (2560, 1440)), Some((2560, 1440)));
+        // Taller but narrower keeps the width it had.
+        assert_eq!(wanted((1920, 1080), (1080, 1920)), Some((1920, 1920)));
+    }
 }

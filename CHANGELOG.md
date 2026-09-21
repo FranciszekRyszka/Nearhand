@@ -93,6 +93,11 @@ how agents get to this version.
 - A device's version in the console followed it after a self-update: an
   agent now reports what it runs every time it registers, rather than only
   at enrollment.
+- The native viewer showed nothing — the last picture, or black — once the
+  host's screen grew bigger than any of its monitors had been at the start:
+  a change of resolution, or a session come back to at another size. It
+  now rebuilds its frame slots for the new size and carries on, without
+  waiting for a keyframe.
 
 ## 0.2.0 — 2026-09-20
 

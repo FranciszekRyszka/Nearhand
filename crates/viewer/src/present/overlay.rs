@@ -269,6 +269,7 @@ mod tests {
             decoded_us: decoded,
             skipped: 0,
             size: (1920, 1080),
+            ring: 0,
         }
     }
 
