@@ -240,6 +240,7 @@ itself. Close codes (`core::proto::close`) travel with a readable reason:
 | 5 | Wrong password, or a grant refused; the reason says why |
 | 6 | The person at the host declined, or did not answer |
 | 7 | The person at the host ended the session |
+| 8 | The agent is stopping, and another may be along shortly — the service moving it to the session someone just signed in to, or restarting. Viewers try again for two minutes; after any other close, they do not |
 
 Every certificate is self-signed over an Ed25519 key. The viewer pins the
 agent's certificate by its SHA-256 fingerprint, which the server reports (or,

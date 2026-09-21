@@ -286,14 +286,16 @@ async fn a_session_pinned_to_another_key_never_connects() {
     )
     .expect("session");
     let seen = run_until(&mut session, &socket, agent, |e| {
-        matches!(e, Event::Closed(_))
+        matches!(e, Event::Closed { .. })
     })
     .await;
     assert!(!seen.contains(&Event::Connected), "{seen:?}");
-    let Some(Event::Closed(why)) = seen.last() else {
+    let Some(Event::Closed { reason, may_return }) = seen.last() else {
         panic!("not closed");
     };
-    assert!(!why.is_empty());
+    assert!(!reason.is_empty());
+    // Another key than the one pinned is not something to try again.
+    assert!(!may_return, "{reason}");
 }
 
 /// An agent that lets the viewer in, then sends a pointer shape and

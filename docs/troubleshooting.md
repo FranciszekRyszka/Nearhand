@@ -95,8 +95,14 @@ other files (`%LOCALAPPDATA%\Nearhand` on Windows).
   capture and taking a new one. It recovers by itself, and says so in
   `logs\agent.log`: "followed the input desktop", then "capture source
   changed; continuing".
-- **The session ends when someone signs out.** The service starts a new
-  agent in the next console session; the viewer reconnects.
+- **Someone signs out, or in, or the service restarts** (`set-password`
+  restarts it, for one). The service stops the agent and starts another in
+  whichever session is at the console now. The old one says it is going away rather than goodbye, so both
+  viewers try again — every few seconds, for two minutes — and pick the
+  session up where the new agent is. The browser asks the server for a new
+  grant each time, since a grant is good once. A viewer that was refused, or
+  told goodbye, does not come back; nor does one that never got as far as a
+  picture, which says what went wrong instead.
 - **The picture freezes but the mouse still works.** That is capture, not
   the connection: the log says why. Send the last few hundred lines of
   `agent.log` — it names the display adapter and what it did.

@@ -204,7 +204,7 @@ fn windowed(mut options: direct::Options) -> Result<()> {
     options.clipboard = true;
     let (switch_tx, switch_rx) = tokio::sync::mpsc::unbounded_channel();
     options.switch = Some(switch_rx);
-    options.cursor = Some(Box::new(move |change| {
+    options.cursor = Some(Arc::new(move |change| {
         let _ = proxy.send_event(present::UserEvent::Cursor(change));
     }));
     let (frames_tx, frames_rx) = std::sync::mpsc::channel();

@@ -97,8 +97,11 @@ pub enum Event {
     CursorVisible(bool),
     /// Text copied on the device.
     Clipboard(String),
-    /// The session is over, and why.
-    Closed(String),
+    /// The session is over, and why. `may_return` when the agent went
+    /// away saying it may be back — the service moving it to a new session,
+    /// an update — or the connection was simply lost: worth trying again,
+    /// where a refusal is not.
+    Closed { reason: String, may_return: bool },
     /// The device asks for its access password as well as a grant, and
     /// this viewer was given only the grant. Nothing has been presented,
     /// so the grant is still good: ask for the password and start again.
@@ -706,21 +709,28 @@ impl Session {
     }
 
     fn lost(&mut self, reason: ConnectionError) {
-        let why = match reason {
+        let (why, may_return) = match reason {
             ConnectionError::ApplicationClosed(close) => {
                 let text = String::from_utf8_lossy(&close.reason).into_owned();
-                if u64::from(close.error_code) == u64::from(close::NORMAL) {
-                    format!("the session ended ({text})")
+                let code = u64::from(close.error_code);
+                if code == u64::from(close::NORMAL) {
+                    (format!("the session ended ({text})"), false)
+                } else if code == u64::from(close::GOING_AWAY) {
+                    (format!("the agent went away ({text})"), true)
                 } else {
-                    format!("the agent closed the connection: {text}")
+                    (format!("the agent closed the connection: {text}"), false)
                 }
             }
-            ConnectionError::TimedOut => "the agent stopped answering".to_owned(),
-            ConnectionError::LocallyClosed => "the session ended".to_owned(),
-            other => other.to_string(),
+            ConnectionError::TimedOut => ("the agent stopped answering".to_owned(), true),
+            ConnectionError::Reset => ("the connection was reset".to_owned(), true),
+            ConnectionError::LocallyClosed => ("the session ended".to_owned(), false),
+            other => (other.to_string(), false),
         };
         self.closed = true;
-        self.events.push_back(Event::Closed(why));
+        self.events.push_back(Event::Closed {
+            reason: why,
+            may_return,
+        });
     }
 
     fn fail(&mut self, why: &str) {
@@ -733,7 +743,10 @@ impl Session {
             Bytes::copy_from_slice(why.as_bytes()),
         );
         self.closed = true;
-        self.events.push_back(Event::Closed(why.to_owned()));
+        self.events.push_back(Event::Closed {
+            reason: why.to_owned(),
+            may_return: false,
+        });
     }
 }
 

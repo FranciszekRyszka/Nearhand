@@ -271,6 +271,11 @@ pub mod close {
     pub const DECLINED: u32 = 6;
     /// The person at the host ended the session.
     pub const ENDED_BY_HOST: u32 = 7;
+    /// The agent is stopping, and another may be along shortly: the service
+    /// moving it to the session someone just signed in to, or restarting
+    /// being installed. A viewer tries again; after any other close, it
+    /// does not.
+    pub const GOING_AWAY: u32 = 8;
 }
 
 #[cfg(test)]

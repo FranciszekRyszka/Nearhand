@@ -172,7 +172,10 @@ pub fn run(dir: PathBuf, stop_event: Option<String>) -> Result<()> {
         let _ = stopping.wait_for(|stop| *stop).await;
         let endpoint = opened.lock().unwrap_or_else(|p| p.into_inner()).take();
         if let Some(endpoint) = endpoint {
-            endpoint.close(close::NORMAL.into(), b"agent stopping");
+            // The service stops this agent to start another — in the session
+            // someone just signed in to, or after a restart — so a viewer
+            // should come back rather than give up.
+            endpoint.close(close::GOING_AWAY.into(), b"agent stopping");
             let _ = tokio::time::timeout(Duration::from_secs(2), endpoint.wait_idle()).await;
         }
     });

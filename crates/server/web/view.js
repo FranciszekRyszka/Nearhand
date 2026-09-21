@@ -37,9 +37,12 @@ const hexBytes = (hex) => new Uint8Array(hex.match(/../g).map((b) => parseInt(b,
 
 let viewer = null;
 let link = null;
+/// The console's row for the device, from the page's address: what a new
+/// grant is asked for with.
+let device = null;
 
 async function main() {
-  const device = new URLSearchParams(location.search).get("device");
+  device = new URLSearchParams(location.search).get("device");
   if (!device) throw new Error("No device given: open the viewer from the console's device list.");
   if (!("VideoDecoder" in window)) {
     throw new Error("This browser lacks WebCodecs; use a current Chrome, Edge or Firefox, or the native viewer.");
@@ -72,7 +75,36 @@ async function connect(granted, password) {
 
   viewer = new Viewer(link.fingerprint, granted.grant, password, 60);
   status("Connecting to the device…");
-  run(link, viewer, granted);
+  run(link, viewer, granted, password);
+}
+
+/// How long to keep trying to get back to a device that went away. The
+/// service moving its agent to the session someone just signed in to takes
+/// seconds; a restart of the service, a few more.
+const COME_BACK_FOR_MS = 120_000;
+
+/// The agent went away saying it may be back — the service moving it to a
+/// new session, or restarting — or the link was lost. Ask the server for a
+/// new grant, since each is good once, and connect again, for a while.
+async function comeBack(password, reason) {
+  const until = Date.now() + COME_BACK_FOR_MS;
+  let wait = 1000;
+  for (;;) {
+    status(`${reason[0].toUpperCase()}${reason.slice(1)} — trying again…`);
+    await new Promise((resolve) => setTimeout(resolve, wait));
+    try {
+      const granted = await api("POST", `/devices/${encodeURIComponent(device)}/grant`);
+      await connect(granted, password);
+      return;
+    } catch (e) {
+      if (Date.now() >= until) {
+        $("screen").hidden = true;
+        status(`Could not get back to the device: ${e.message}`, true);
+        return;
+      }
+      wait = Math.min(wait * 2, 10_000);
+    }
+  }
 }
 
 /// A device's ID is made from its key, but ten digits are not many: a
@@ -211,8 +243,11 @@ function join(parts) {
   return whole;
 }
 
-function run(link, viewer, granted) {
+function run(link, viewer, granted, password) {
   const role = granted.role;
+  // This session got as far as the picture: a loss after that is worth
+  // coming back from; a failure before it is reported as it is.
+  let established = false;
   const decoder = new Decoder(viewer);
   const clipboard = new ClipboardSync(viewer);
   let timer = null;
@@ -245,6 +280,7 @@ function run(link, viewer, granted) {
         status("Waiting for the person at the device to allow the session…");
         break;
       case "monitors":
+        established = true;
         showMonitors(event.monitors, viewer, pump);
         break;
       case "frame":
@@ -263,9 +299,14 @@ function run(link, viewer, granted) {
         break;
       case "closed":
         closed = true;
+        link.close();
+        if (event.may_return && established) {
+          // The last picture stays up while the device comes back.
+          comeBack(password, event.reason);
+          break;
+        }
         status(event.reason, !/ended/.test(event.reason));
         $("screen").hidden = true;
-        link.close();
         break;
       case "password_needed": {
         // The device wants its access password as well as the grant, and

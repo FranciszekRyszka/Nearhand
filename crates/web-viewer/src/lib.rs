@@ -98,7 +98,9 @@ impl Viewer {
     ///   agent's pointer, to show as the local one over the picture
     /// * `cursor_visible`, with `visible`
     /// * `clipboard`, with `text`: copied on the device
-    /// * `closed`, with `reason`
+    /// * `closed`, with `reason`, and `may_return` when trying again could
+    ///   work: the agent went away saying it may be back, or the connection
+    ///   was lost
     /// * `password_needed`: the device asks for its access password as
     ///   well as a grant; the grant is unused, so ask and connect again
     pub fn event(&mut self) -> Result<JsValue, JsValue> {
@@ -166,9 +168,10 @@ impl Viewer {
                 set("type", "clipboard".into())?;
                 set("text", text.into())?;
             }
-            Event::Closed(reason) => {
+            Event::Closed { reason, may_return } => {
                 set("type", "closed".into())?;
                 set("reason", reason.into())?;
+                set("may_return", may_return.into())?;
             }
             Event::PasswordAlsoNeeded => {
                 set("type", "password_needed".into())?;

@@ -144,7 +144,7 @@ pub struct Options {
     pub input: Option<mpsc::UnboundedReceiver<Input>>,
     /// Where the host's pointer changes go, if anywhere. Shapes are checked
     /// before they get here.
-    pub cursor: Option<Box<dyn Fn(Cursor) + Send + Sync>>,
+    pub cursor: Option<Arc<dyn Fn(Cursor) + Send + Sync>>,
     /// Keep this machine's clipboard in step with the agent's.
     pub clipboard: bool,
     /// Requests to watch another of the host's monitors, by id.
@@ -155,7 +155,112 @@ pub struct Options {
     pub trust_new_key: bool,
 }
 
-pub async fn run(options: Options) -> Result<()> {
+/// How long to keep trying to get back to an agent that went away. The
+/// service moving an agent to the session someone just signed in to takes
+/// seconds; a restart of the service, a few more.
+const RECONNECT_FOR: Duration = Duration::from_secs(120);
+const RECONNECT_FIRST: Duration = Duration::from_secs(1);
+const RECONNECT_MAX: Duration = Duration::from_secs(10);
+
+/// An error that trying again will not fix: the agent or the person at it
+/// decided, or the two ends do not fit. A lost connection is not one of
+/// these, and is tried again.
+#[derive(Debug)]
+struct Refusal(String);
+
+impl std::fmt::Display for Refusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Refusal {}
+
+fn refusal(text: impl Into<String>) -> anyhow::Error {
+    Refusal(text.into()).into()
+}
+
+/// What outlives one session and carries into the next.
+struct Carried {
+    input: Option<Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<Input>>>>,
+    recording: Option<BufWriter<File>>,
+    /// When `--seconds` runs out, across every session.
+    deadline: Option<Instant>,
+    /// This attempt got as far as the picture. A loss after that is worth
+    /// coming back from; a failure before it is reported as it is.
+    reached: bool,
+}
+
+/// Watch the target until told to stop: across agent restarts, not only
+/// for one connection. An installed agent that goes away saying it may be
+/// back — the service moving it to a new session, or restarting — is reached
+/// again, and so is one whose connection was lost; anything the agent or
+/// its person decided is final.
+pub async fn run(mut options: Options) -> Result<()> {
+    let recording = match &options.record {
+        Some(path) => Some(BufWriter::new(
+            File::create(path).with_context(|| format!("creating {}", path.display()))?,
+        )),
+        None => None,
+    };
+    let mut carried = Carried {
+        input: options
+            .input
+            .take()
+            .map(|input| Arc::new(tokio::sync::Mutex::new(input))),
+        recording,
+        deadline: options
+            .seconds
+            .map(|s| Instant::now() + Duration::from_secs(s)),
+        reached: false,
+    };
+    let mut established = false;
+    let mut lost_at: Option<Instant> = None;
+    let mut wait = RECONNECT_FIRST;
+    let outcome = loop {
+        let attempt = session(&mut options, &mut carried).await;
+        if std::mem::take(&mut carried.reached) {
+            established = true;
+            lost_at = None;
+            wait = RECONNECT_FIRST;
+        }
+        let error = match attempt {
+            Ok(()) => break Ok(()),
+            // Before any session got going, say what is wrong rather than
+            // keep a person waiting to hear it.
+            Err(e) if !established => break Err(e),
+            Err(e) if e.downcast_ref::<Refusal>().is_some() => break Err(e),
+            Err(e) => e,
+        };
+        let since = *lost_at.get_or_insert_with(Instant::now);
+        if since.elapsed() >= RECONNECT_FOR {
+            break Err(error.context(format!(
+                "could not get back to {} within {RECONNECT_FOR:?}",
+                options.target
+            )));
+        }
+        println!(
+            "lost {} ({error:#}); trying again in {wait:?}…",
+            options.target
+        );
+        tokio::select! {
+            () = tokio::time::sleep(wait) => {}
+            () = options.shared.stop.notified() => break Ok(()),
+            _ = tokio::signal::ctrl_c() => break Ok(()),
+        }
+        if carried.deadline.is_some_and(|d| Instant::now() >= d) {
+            break Ok(());
+        }
+        wait = (wait * 2).min(RECONNECT_MAX);
+    };
+    if let Some(mut out) = carried.recording.take() {
+        out.flush().context("flushing the recording")?;
+    }
+    outcome
+}
+
+/// One connection to the agent, from the introduction to its end.
+async fn session(options: &mut Options, carried: &mut Carried) -> Result<()> {
     let (endpoint, conn, grant) = match &options.target {
         Target::Direct {
             address,
@@ -232,7 +337,9 @@ pub async fn run(options: Options) -> Result<()> {
     let agent_caps = match recv_message::<Control>(&mut recv).await {
         Ok(Some(Control::Hello { version, caps })) if version == PROTOCOL_VERSION => caps,
         Ok(Some(Control::Hello { version, .. })) => {
-            bail!("agent speaks protocol {version}, this viewer {PROTOCOL_VERSION}")
+            return Err(refusal(format!(
+                "the agent speaks protocol {version}, this viewer {PROTOCOL_VERSION}"
+            )));
         }
         Ok(other) => bail!("expected Hello, got {other:?}"),
         Err(e) => return Err(explain(&conn, e.into())),
@@ -242,7 +349,9 @@ pub async fn run(options: Options) -> Result<()> {
         match grant {
             Some(grant) => {
                 if !required.takes_grants() {
-                    bail!("this device takes a password, not a grant from a server");
+                    return Err(refusal(
+                        "this device takes a password, not a grant from a server",
+                    ));
                 }
                 send_message(&mut send, &Control::Present { grant }).await?;
                 // Where a machine asks for both, the grant is only half of
@@ -256,25 +365,29 @@ pub async fn run(options: Options) -> Result<()> {
                         Some(password) => password,
                         None => ask_password().await?,
                     };
+                    // Kept for coming back after a loss, so nobody is asked
+                    // again for what they typed a minute ago.
+                    options.password = Some(typed.clone());
                     prove(&conn, &mut send, &mut recv, secret, &typed).await?;
                 }
             }
             None => {
                 let secret = required.secret().filter(|_| required.password_is_enough());
                 let Some(secret) = secret else {
-                    bail!(
+                    return Err(refusal(format!(
                         "this device needs a grant from its server{}; sign in to it first",
                         if required.secret().is_some() {
                             " as well as its password"
                         } else {
                             ""
                         }
-                    );
+                    )));
                 };
                 let typed = match options.password.clone() {
                     Some(password) => password,
                     None => ask_password().await?,
                 };
+                options.password = Some(typed.clone());
                 prove(&conn, &mut send, &mut recv, secret, &typed).await?;
             }
         }
@@ -287,12 +400,14 @@ pub async fn run(options: Options) -> Result<()> {
     match next.map_err(|e| explain(&conn, e.into()))? {
         Some(Control::MonitorList(monitors)) => {
             let Some(m) = monitors.iter().find(|m| m.id == options.monitor) else {
-                bail!(
+                return Err(refusal(format!(
                     "the agent has no monitor {}; it has {}",
                     options.monitor,
                     monitors.len()
-                );
+                )));
             };
+            // In: a loss from here on is worth coming back from.
+            carried.reached = true;
             let size = (u32::from(m.width), u32::from(m.height));
             options.shared.update(|s| {
                 s.monitor_size = Some(size);
@@ -311,7 +426,10 @@ pub async fn run(options: Options) -> Result<()> {
         other => bail!("expected MonitorList, got {other:?}"),
     }
     if !agent_caps.codecs.contains(&Codec::H264) {
-        bail!("agent offers no H.264 encoder ({:?})", agent_caps.codecs);
+        return Err(refusal(format!(
+            "the agent offers no H.264 encoder ({:?})",
+            agent_caps.codecs
+        )));
     }
 
     send_message(
@@ -335,30 +453,27 @@ pub async fn run(options: Options) -> Result<()> {
     } else {
         None
     };
-    tokio::spawn(accept_streams(conn.clone(), options.cursor, clipboard));
+    tokio::spawn(accept_streams(
+        conn.clone(),
+        options.cursor.clone(),
+        clipboard,
+    ));
 
-    if let Some(events) = options.input {
+    if let Some(events) = carried.input.clone() {
         let conn = conn.clone();
         tokio::spawn(async move {
-            if let Err(e) = send_input(&conn, events).await {
+            if let Err(e) = send_input(&conn, &events).await {
                 tracing::debug!(error = %e, "input stream ended");
             }
         });
     }
 
-    let mut recording = match &options.record {
-        Some(path) => Some(BufWriter::new(
-            File::create(path).with_context(|| format!("creating {}", path.display()))?,
-        )),
-        None => None,
-    };
-
-    let mut switch = options.switch;
+    let recording = &mut carried.recording;
     let mut reassembler = Reassembler::new();
     let mut loss = LossSimulator::new(options.simulate_loss);
     let mut stats = Stats::new();
     let started = Instant::now();
-    let deadline = options.seconds.map(|s| started + Duration::from_secs(s));
+    let deadline = carried.deadline;
     let mut keyframe_needed = false;
     let mut last_keyframe_request: Option<Instant> = None;
     let mut ticker = tokio::time::interval(TICK);
@@ -385,7 +500,7 @@ pub async fn run(options: Options) -> Result<()> {
             datagram = conn.read_datagram() => {
                 let datagram = match datagram {
                     Ok(datagram) => datagram,
-                    Err(e) => break Err(explain(&conn, e.into())),
+                    Err(e) => break ended(&conn, e.into()),
                 };
                 stats.datagrams += 1;
                 stats.bytes += datagram.len() as u64;
@@ -402,7 +517,7 @@ pub async fn run(options: Options) -> Result<()> {
                 };
                 let now_us = nearhand_capture::clock::now_us();
                 reassembler.push(chunk, now_us);
-                if !deliver(&mut reassembler, &mut stats, &mut recording, &options.frames)? {
+                if !deliver(&mut reassembler, &mut stats, recording, &options.frames)? {
                     break Ok(()); // The window closed.
                 }
                 // Straight away rather than on the next tick: every
@@ -423,7 +538,7 @@ pub async fn run(options: Options) -> Result<()> {
                     options.shared.update(|s| s.monitors = monitors);
                 }
                 Some(Ok(other)) => tracing::debug!(?other, "control message"),
-                Some(Err(e)) => break Err(explain(&conn, e.into())),
+                Some(Err(e)) => break ended(&conn, e.into()),
                 // The agent closed its side of the control stream.
                 None => break Ok(()),
             },
@@ -432,7 +547,7 @@ pub async fn run(options: Options) -> Result<()> {
                 let now_us = nearhand_capture::clock::now_us();
                 ask_for_repairs(&mut reassembler, now_us, &conn, &mut send).await?;
                 reassembler.expire(now_us, &repair_timing(conn.rtt()));
-                if !deliver(&mut reassembler, &mut stats, &mut recording, &options.frames)? {
+                if !deliver(&mut reassembler, &mut stats, recording, &options.frames)? {
                     break Ok(());
                 }
             }
@@ -465,7 +580,7 @@ pub async fn run(options: Options) -> Result<()> {
             _ = &mut ctrl_c => break Ok(()),
             _ = options.shared.stop.notified() => break Ok(()),
 
-            Some(monitor) = next_switch(&mut switch) => {
+            Some(monitor) = next_switch(&mut options.switch) => {
                 let known = options.shared.snapshot().monitors.iter().any(|m| m.id == monitor);
                 if known {
                     // The agent restarts capture and encoding on the new
@@ -500,9 +615,6 @@ pub async fn run(options: Options) -> Result<()> {
     let _ = send.finish();
     let _ = tokio::time::timeout(Duration::from_secs(1), conn.closed()).await;
     conn.close(close::NORMAL.into(), b"viewer leaving");
-    if let Some(mut out) = recording {
-        out.flush().context("flushing the recording")?;
-    }
     endpoint.wait_idle().await;
 
     stats.print_summary(started.elapsed(), &reassembler, options.record.as_deref());
@@ -590,10 +702,9 @@ async fn read_control(mut recv: RecvStream, tx: mpsc::Sender<nearhand_transport:
 /// lasts.
 async fn accept_streams(
     conn: Connection,
-    cursor: Option<Box<dyn Fn(Cursor) + Send + Sync>>,
+    cursor: Option<Arc<dyn Fn(Cursor) + Send + Sync>>,
     clipboard: Option<Arc<ClipboardSync>>,
 ) {
-    let cursor: Option<Arc<dyn Fn(Cursor) + Send + Sync>> = cursor.map(Arc::from);
     while let Ok(mut recv) = conn.accept_uni().await {
         match recv_message::<StreamKind>(&mut recv).await {
             Ok(Some(StreamKind::Cursor)) => {
@@ -721,8 +832,11 @@ async fn next_switch(switch: &mut Option<mpsc::UnboundedReceiver<u8>>) -> Option
 /// place, and a backlog of stale positions would only make it lag.
 async fn send_input(
     conn: &Connection,
-    mut events: mpsc::UnboundedReceiver<Input>,
+    events: &tokio::sync::Mutex<mpsc::UnboundedReceiver<Input>>,
 ) -> nearhand_transport::Result<()> {
+    // Held for this session only: the next one takes it over when this
+    // connection is gone, which is why the loop below also watches for that.
+    let mut events = events.lock().await;
     let mut send: SendStream = conn.open_uni().await?;
     // Ahead of every other stream: a key-up stuck behind a clipboard transfer
     // is a stuck key.
@@ -731,7 +845,12 @@ async fn send_input(
 
     let mut batch = Vec::new();
     let mut bytes = Vec::new();
-    while let Some(first) = events.recv().await {
+    loop {
+        let first = tokio::select! {
+            first = events.recv() => first,
+            _ = conn.closed() => None,
+        };
+        let Some(first) = first else { break };
         batch.push(first);
         while let Ok(next) = events.try_recv() {
             batch.push(next);
@@ -821,7 +940,8 @@ fn remember(id: DeviceId, conn: &Connection, trust_new_key: bool) -> Result<()> 
         }
         known::Continuity::Changed { known: before } if !trust_new_key => {
             conn.close(close::PROTOCOL.into(), b"another key than last time");
-            bail!(
+            // Final: coming back would only meet the same key again.
+            return Err(refusal(format!(
                 "{id} answered with another key than last time.\n\
                  \n\
                  was:  {before}\n\
@@ -833,7 +953,7 @@ fn remember(id: DeviceId, conn: &Connection, trust_new_key: bool) -> Result<()> 
                  standing between this viewer and the device. Check with \
                  whoever runs the device before going on; --trust-new-key \
                  takes the new key and remembers it instead."
-            );
+            )));
         }
         known::Continuity::Changed { known: before } => {
             println!("{id} has a new key: {before} → {fingerprint}");
@@ -846,17 +966,42 @@ fn remember(id: DeviceId, conn: &Connection, trust_new_key: bool) -> Result<()> 
     Ok(())
 }
 
+/// Why the connection is over, in words — and whether trying again could
+/// help. An agent that closed with a reason decided something, and that is
+/// a [`Refusal`], except for [`close::GOING_AWAY`], which says it may be
+/// back. A connection lost without a word may be back too.
 fn explain(conn: &Connection, error: anyhow::Error) -> anyhow::Error {
     match conn.close_reason() {
-        Some(ConnectionError::ApplicationClosed(close)) => {
-            let reason = String::from_utf8_lossy(&close.reason);
-            anyhow::anyhow!(
+        Some(ConnectionError::ApplicationClosed(closed)) => {
+            let reason = String::from_utf8_lossy(&closed.reason);
+            let text = format!(
                 "agent closed the connection: {reason} (code {})",
-                close.error_code
-            )
+                closed.error_code
+            );
+            if u64::from(closed.error_code) == u64::from(close::GOING_AWAY) {
+                anyhow::anyhow!(text)
+            } else {
+                refusal(text)
+            }
         }
         Some(other) => anyhow::anyhow!("connection lost: {other}"),
         None => error,
+    }
+}
+
+/// The end of a session's connection: a goodbye from either side is the
+/// session over, and anything else is for [`explain`] to name.
+fn ended(conn: &Connection, error: anyhow::Error) -> Result<()> {
+    match conn.close_reason() {
+        Some(ConnectionError::ApplicationClosed(closed))
+            if u64::from(closed.error_code) == u64::from(close::NORMAL) =>
+        {
+            let reason = String::from_utf8_lossy(&closed.reason);
+            println!("the agent ended the session: {reason}");
+            Ok(())
+        }
+        Some(ConnectionError::LocallyClosed) => Ok(()),
+        _ => Err(explain(conn, error)),
     }
 }
 
@@ -992,5 +1137,159 @@ impl LossSimulator {
         self.state ^= self.state >> 7;
         self.state ^= self.state << 17;
         (self.state % 100) < u64::from(self.percent)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nearhand_transport::{Identity, server_endpoint};
+    use std::sync::atomic::AtomicUsize;
+
+    /// How a stand-in agent ends each connection it takes, in turn.
+    #[derive(Clone, Copy)]
+    enum Ending {
+        /// As the service does when it moves the agent: it may be back.
+        GoingAway,
+        /// A decision: nothing to come back for.
+        Refused,
+        /// Goodbye.
+        Bye,
+        /// Going away before the viewer ever saw a picture.
+        GoingAwayEarly,
+    }
+
+    /// An agent that takes a viewer as far as the picture, then ends as
+    /// `endings` says, one per connection; how many connections it took.
+    fn stand_in(endings: Vec<Ending>) -> (SocketAddr, Fingerprint, Arc<AtomicUsize>) {
+        let identity = Identity::generate().expect("identity");
+        let fingerprint = identity.fingerprint();
+        let endpoint =
+            server_endpoint(([127, 0, 0, 1], 0).into(), &identity).expect("agent endpoint");
+        let address = endpoint.local_addr().expect("address");
+        let taken = Arc::new(AtomicUsize::new(0));
+        let count = taken.clone();
+        tokio::spawn(async move {
+            for ending in endings {
+                let Some(incoming) = endpoint.accept().await else {
+                    return;
+                };
+                let conn = incoming.await.expect("handshake");
+                count.fetch_add(1, Ordering::Relaxed);
+                let (mut send, mut recv) = conn.accept_bi().await.expect("control");
+                let _: Option<Control> = recv_message(&mut recv).await.expect("hello");
+                let caps = Caps {
+                    codecs: vec![Codec::H264],
+                    max_width: 1920,
+                    max_height: 1080,
+                    max_fps: 60,
+                };
+                send_message(
+                    &mut send,
+                    &Control::Hello {
+                        version: PROTOCOL_VERSION,
+                        caps,
+                    },
+                )
+                .await
+                .expect("hello");
+                if let Ending::GoingAwayEarly = ending {
+                    conn.close(close::GOING_AWAY.into(), b"agent stopping");
+                    continue;
+                }
+                let monitor = Monitor {
+                    id: 0,
+                    width: 1920,
+                    height: 1080,
+                    x: 0,
+                    y: 0,
+                    primary: true,
+                };
+                send_message(&mut send, &Control::MonitorList(vec![monitor]))
+                    .await
+                    .expect("monitors");
+                // The viewer asks for video: it is in.
+                let _: Option<Control> = recv_message(&mut recv).await.expect("start video");
+                let (code, reason): (u32, &[u8]) = match ending {
+                    Ending::GoingAway => (close::GOING_AWAY, b"agent stopping"),
+                    Ending::Refused => (close::ENDED_BY_HOST, b"ended at the host"),
+                    Ending::Bye | Ending::GoingAwayEarly => (close::NORMAL, b"bye"),
+                };
+                conn.close(code.into(), reason);
+            }
+            // Hold the endpoint a moment, so the last close reaches the viewer.
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        });
+        (address, fingerprint, taken)
+    }
+
+    fn options(address: SocketAddr, fingerprint: Fingerprint) -> Options {
+        Options {
+            target: Target::Direct {
+                address,
+                fingerprint,
+            },
+            password: None,
+            monitor: 0,
+            fps: 30,
+            // A guard: a test that should end by itself does, or fails here.
+            seconds: Some(30),
+            record: None,
+            simulate_loss: 0,
+            frames: None,
+            input: None,
+            cursor: None,
+            clipboard: false,
+            switch: None,
+            shared: Arc::new(Shared::default()),
+            trust_new_key: false,
+        }
+    }
+
+    /// The service moves an agent to the session someone signed in to: the
+    /// viewer comes back to the new one by itself.
+    #[tokio::test]
+    async fn a_viewer_comes_back_to_an_agent_that_went_away() {
+        let (address, fingerprint, taken) = stand_in(vec![Ending::GoingAway, Ending::Bye]);
+        let outcome =
+            tokio::time::timeout(Duration::from_secs(20), run(options(address, fingerprint)))
+                .await
+                .expect("the viewer finishes");
+        outcome.expect("a goodbye ends it cleanly");
+        assert_eq!(
+            taken.load(Ordering::Relaxed),
+            2,
+            "connected, lost, connected again"
+        );
+    }
+
+    /// What the agent or its person decided is final: no coming back.
+    #[tokio::test]
+    async fn a_viewer_does_not_come_back_to_a_refusal() {
+        let (address, fingerprint, taken) = stand_in(vec![Ending::Refused, Ending::Bye]);
+        let outcome =
+            tokio::time::timeout(Duration::from_secs(20), run(options(address, fingerprint)))
+                .await
+                .expect("the viewer finishes");
+        let error = outcome.expect_err("a refusal is an error");
+        assert!(
+            format!("{error:#}").contains("ended at the host"),
+            "{error:#}"
+        );
+        assert_eq!(taken.load(Ordering::Relaxed), 1, "it did not try again");
+    }
+
+    /// Nothing to come back from before a session got going: an agent
+    /// that goes away before the first picture is reported at once, though
+    /// the same words later in a session would bring the viewer back.
+    #[tokio::test]
+    async fn a_first_connection_that_fails_is_not_retried() {
+        let (address, fingerprint, taken) = stand_in(vec![Ending::GoingAwayEarly, Ending::Bye]);
+        let outcome =
+            tokio::time::timeout(Duration::from_secs(20), run(options(address, fingerprint)))
+                .await
+                .expect("the viewer finishes");
+        assert!(outcome.is_err(), "it never got in");
+        assert_eq!(taken.load(Ordering::Relaxed), 1, "it did not try again");
     }
 }
