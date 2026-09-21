@@ -78,7 +78,9 @@ how agents get to this version.
   the same pinned connection the viewer connects through. A new message in
   the server protocol, added without changing its version: a server older
   than the viewer drops the question, and the viewer says the server may be
-  older. `nearhand-viewer` on its own now prints its usage.
+  older. With a token, `nearhand-viewer connect` takes a device's name
+  from that list as well as its ID. `nearhand-viewer` on its own now
+  prints its usage.
 
 ### Changed
 

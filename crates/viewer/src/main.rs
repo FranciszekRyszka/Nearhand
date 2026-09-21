@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use nearhand_core::rendezvous::DeviceId;
+use nearhand_core::rendezvous::{DeviceId, Listed};
 use nearhand_transport::{Fingerprint, rendezvous};
 
 use crate::direct::Shared;
@@ -44,14 +44,15 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Connect to a device by its ID, through a server.
+    /// Connect to a device by its ID, or by its name, through a server.
     ///
     /// Opens a window showing the remote screen and sends it keyboard and
     /// mouse, with a latency overlay (Ctrl+Shift+F1 toggles it).
     /// Ctrl+Shift+F2 switches monitors; Ctrl+Alt+End sends Ctrl+Alt+Del.
     Connect {
-        /// The device's ID, as its agent shows it: `123 456 7890`.
-        id: DeviceId,
+        /// The device's ID, as its agent shows it: `123 456 7890`. With a
+        /// token, its name as `devices` lists it will do too.
+        device: String,
         /// The server's address, for example `203.0.113.10:443`.
         #[arg(long)]
         server: SocketAddr,
@@ -137,7 +138,7 @@ fn main() -> Result<()> {
 
     match cli.command {
         Command::Connect {
-            id,
+            device,
             server,
             server_fingerprint,
             password,
@@ -151,6 +152,19 @@ fn main() -> Result<()> {
                     .ok()
                     .filter(|t| !t.is_empty() && password.is_none())
             });
+            let id = match device.parse::<DeviceId>() {
+                Ok(id) => id,
+                Err(_) => {
+                    let Some(token) = &token else {
+                        bail!(
+                            "\"{device}\" is not a device ID (ten digits); a name needs --token, \
+                             or NEARHAND_TOKEN, to look it up"
+                        );
+                    };
+                    let (devices, more) = list(server, server_fingerprint, token)?;
+                    pick(&devices, more, &device)?
+                }
+            };
             let route = if relay_only {
                 rendezvous::Route::RelayOnly
             } else {
@@ -177,13 +191,7 @@ fn main() -> Result<()> {
             }) else {
                 bail!("listing needs an API token: --token, or NEARHAND_TOKEN in the environment");
             };
-            let runtime = tokio::runtime::Runtime::new().context("starting the runtime")?;
-            let (devices, more) = runtime.block_on(async {
-                let endpoint = nearhand_transport::client_endpoint(server)?;
-                rendezvous::devices(&endpoint, server, server_fingerprint, &token)
-                    .await
-                    .with_context(|| format!("asking {server} for your devices"))
-            })?;
+            let (devices, more) = list(server, server_fingerprint, &token)?;
             print!("{}", table(&devices, more));
             Ok(())
         }
@@ -201,14 +209,73 @@ fn main() -> Result<()> {
     }
 }
 
+/// Ask `server` which devices the user whose token this is may reach.
+fn list(
+    server: SocketAddr,
+    server_fingerprint: Fingerprint,
+    token: &str,
+) -> Result<(Vec<Listed>, u64)> {
+    let runtime = tokio::runtime::Runtime::new().context("starting the runtime")?;
+    runtime.block_on(async {
+        let endpoint = nearhand_transport::client_endpoint(server)?;
+        rendezvous::devices(&endpoint, server, server_fingerprint, token)
+            .await
+            .with_context(|| format!("asking {server} for your devices"))
+    })
+}
+
+/// The one device called `name`, ignoring case. Two with that name, or
+/// none, is an error that says which IDs to use instead.
+fn pick(devices: &[Listed], more: u64, name: &str) -> Result<DeviceId> {
+    let wanted = name.trim().to_lowercase();
+    let named: Vec<&Listed> = devices
+        .iter()
+        .filter(|d| d.name.to_lowercase() == wanted)
+        .collect();
+    match named.as_slice() {
+        [one] => Ok(one.id),
+        [] => {
+            let near: Vec<String> = devices
+                .iter()
+                .filter(|d| d.name.to_lowercase().contains(&wanted))
+                .take(5)
+                .map(|d| format!("{} ({})", d.name, d.id))
+                .collect();
+            let unlisted = if more > 0 {
+                format!("; {more} more were not listed, so give its ID")
+            } else {
+                String::new()
+            };
+            if near.is_empty() {
+                bail!(
+                    "no device called \"{name}\" among the {} you may reach{unlisted}",
+                    devices.len()
+                )
+            }
+            bail!(
+                "no device called \"{name}\"; did you mean {}{unlisted}",
+                near.join(", ")
+            )
+        }
+        several => {
+            let ids: Vec<String> = several.iter().map(|d| d.id.to_string()).collect();
+            bail!(
+                "{} devices are called \"{name}\"; give one's ID: {}",
+                several.len(),
+                ids.join(", ")
+            )
+        }
+    }
+}
+
 /// The answer to `devices`, for a person to read: online ones first, in the
 /// server's order within that.
-fn table(devices: &[nearhand_core::rendezvous::Listed], more: u64) -> String {
+fn table(devices: &[Listed], more: u64) -> String {
     use std::fmt::Write;
 
     if devices.is_empty() && more == 0 {
-        return "No devices: your user holds no grants on this server. An administrator                 gives them in the console, under Access.
-"
+        return "No devices: your user holds no grants on this server. An administrator \
+                gives them in the console, under Access.\n"
             .to_owned();
     }
     let mut ordered: Vec<_> = devices.iter().collect();
@@ -359,7 +426,7 @@ mod tests {
     use nearhand_core::grant::Role;
     use nearhand_core::rendezvous::{DeviceId, Listed};
 
-    use super::table;
+    use super::{pick, table};
 
     fn listed(id: &str, name: &str, online: bool) -> Listed {
         Listed {
@@ -390,7 +457,45 @@ mod tests {
     }
 
     #[test]
+    fn a_device_is_picked_by_its_name_whatever_the_case() {
+        let devices = [
+            listed("111 111 1111", "ARCHIVE", false),
+            listed("222 222 2222", "RECEPTION-PC", true),
+            listed("333 333 3333", "Reception-Laptop", true),
+        ];
+        assert_eq!(
+            pick(&devices, 0, "reception-pc").expect("found"),
+            "222 222 2222".parse::<DeviceId>().expect("id")
+        );
+        let missed = pick(&devices, 0, "reception").expect_err("no such name");
+        let missed = format!("{missed}");
+        assert!(missed.contains("RECEPTION-PC (222 222 2222)"), "{missed}");
+        assert!(missed.contains("Reception-Laptop"), "{missed}");
+        let unknown = format!("{}", pick(&devices, 4, "kitchen").expect_err("none"));
+        assert!(unknown.contains("among the 3"), "{unknown}");
+        assert!(unknown.contains("4 more"), "{unknown}");
+    }
+
+    #[test]
+    fn two_devices_with_one_name_are_not_guessed_between() {
+        let devices = [
+            listed("111 111 1111", "PC", true),
+            listed("222 222 2222", "pc", false),
+        ];
+        let error = format!("{}", pick(&devices, 0, "PC").expect_err("ambiguous"));
+        assert!(
+            error.contains("111 111 1111") && error.contains("222 222 2222"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn no_devices_says_why() {
-        assert!(table(&[], 0).contains("no grants"));
+        let said = table(&[], 0);
+        assert!(said.contains("no grants"), "{said}");
+        assert!(
+            !said.contains("  ") && said.lines().count() == 1,
+            "one tidy line: {said}"
+        );
     }
 }

@@ -293,9 +293,12 @@ nearhand-viewer devices --server desk.example.com:443 --server-fingerprint <fing
 # 123 456 7890  yes      control  RECEPTION-PC
 nearhand-viewer connect "123 456 7890" \
     --server desk.example.com:443 --server-fingerprint <fingerprint>
+nearhand-viewer connect reception-pc \
+    --server desk.example.com:443 --server-fingerprint <fingerprint>
 ```
 
-The viewer's list is the devices the user holds a grant for, which for an
+With a token, a device's name as the list shows it does instead of its ID,
+in any case; two devices of one name are not guessed between. The viewer's list is the devices the user holds a grant for, which for an
 administrator can be fewer than the console shows: administrators need a
 grant to connect, like anyone else. It needs a server of this version or
 later; an older one drops the question, and the viewer says so.
