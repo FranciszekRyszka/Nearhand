@@ -68,6 +68,10 @@ how agents get to this version.
 - `nearhand-server doctor` — the data folder, the key's fingerprint, the
   database, the certificate, both ports, and whether agents are told an
   address they could use. It changes nothing.
+- `nearhand-server health` — whether the server on this machine answers on
+  both ports: a QUIC handshake pinned to its own key, and the console's
+  `/api/v1/health`. The Docker image uses it as its `HEALTHCHECK`, since a
+  distroless image has no shell or `curl` to check with.
 - `nearhand-server backup <folder>` — the server key and a consistent copy
   of the database, taken while the server serves. The distroless image has
   no shell to run `sqlite3` in, and a plain copy of a database in WAL mode

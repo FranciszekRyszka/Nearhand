@@ -1,7 +1,7 @@
 #!/bin/sh
 # Build the server's image and check it works: it starts, prints what agents
 # pin and how to make the first administrator, serves the console and the web
-# viewer over HTTPS, keeps its data in the volume, and stops cleanly when
+# viewer over HTTPS, says it is healthy, keeps its data in the volume, and stops cleanly when
 # asked. CI runs this.
 set -eu
 root="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -32,6 +32,10 @@ until curl -skf -o /dev/null "https://127.0.0.1:$port/"; do
     fi
     sleep 1
 done
+
+# It says it is healthy, on both ports, as its health check will.
+docker exec "$name" /usr/local/bin/nearhand-server --config /etc/nearhand/nearhand.toml health     || { docker logs "$name"; echo "FAIL: the server says it is not healthy" >&2; exit 1; }
+[ "$(docker inspect -f '{{if .Config.Healthcheck}}yes{{end}}' "$name")" = yes ]     || { echo "FAIL: the image has no health check" >&2; exit 1; }
 
 # The web viewer was built into it, not left out.
 curl -skf -o /dev/null "https://127.0.0.1:$port/pkg/nearhand_web_bg.wasm" \

@@ -40,5 +40,9 @@ VOLUME /data
 # TCP: web console and REST API. UDP: agents, viewers, the relay and
 # WebTransport — it must reach the container directly, not through a proxy.
 EXPOSE 443/tcp 443/udp
+# No shell or curl in here to check with: the server checks itself, over
+# loopback — a QUIC handshake pinned to its own key, and the console's
+# /api/v1/health.
+HEALTHCHECK --interval=30s --timeout=15s --start-period=20s --retries=3     CMD ["/usr/local/bin/nearhand-server", "--config", "/etc/nearhand/nearhand.toml", "health"]
 ENTRYPOINT ["/usr/local/bin/nearhand-server", "--config", "/etc/nearhand/nearhand.toml"]
 CMD ["serve"]

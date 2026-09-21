@@ -15,6 +15,7 @@ mod db;
 mod devices;
 mod doctor;
 mod grants;
+mod health;
 mod housekeeping;
 mod https;
 mod metrics;
@@ -89,6 +90,9 @@ enum Command {
     },
     /// Print a new one-time link for creating the first administrator.
     AdminLink,
+    /// Whether the server running on this machine answers, on both ports:
+    /// exit status 0 if so. For a container's health check.
+    Health,
 }
 
 fn main() -> Result<()> {
@@ -119,6 +123,7 @@ fn main() -> Result<()> {
             Ok(())
         }),
         Command::Doctor => runtime.block_on(doctor::run(config, &cli.config)),
+        Command::Health => runtime.block_on(health::run(config)),
         Command::Backup { to } => runtime.block_on(backup::run(config, to)),
         Command::AdminLink => runtime.block_on(async {
             prepare_data_dir(&config)?;

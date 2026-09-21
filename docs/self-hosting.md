@@ -166,6 +166,12 @@ certificate, mount its files and set `NEARHAND_HTTP_TLS=files` with
 commented out). `docker compose exec nearhand nearhand-server admin-link`
 makes a new setup link.
 
+The image has a health check: `nearhand-server health`, which makes a QUIC
+handshake with the server's own UDP port, pinned to its key, and asks the
+TCP side for `/api/v1/health`, both over loopback. `docker ps` shows the
+result; outside Docker, the same command suits a service monitor, and exits
+non-zero when either side does not answer.
+
 Both 443/TCP and **443/UDP** must be published, and UDP must reach the
 container as it is: agents' QUIC, the relay and the web viewer's
 WebTransport all use it. On Linux, Docker keeps the addresses of the agents
