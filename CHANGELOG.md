@@ -73,6 +73,11 @@ how agents get to this version.
   no shell to run `sqlite3` in, and a plain copy of a database in WAL mode
   can be short of the most recent writes.
 - [docs/troubleshooting.md](docs/troubleshooting.md).
+- `GET /api/v1/metrics`, in Prometheus' text format, for an
+  administrator's API token: agents online, devices enrolled,
+  introductions and refusals by reason, relay tunnels open and bytes
+  relayed, ceilings reached, and agent packages sent. Counts only; no
+  device, user or address appears on it.
 - `nearhand-viewer devices` — the devices your user holds a grant for on a
   server, with their IDs, whether each is online and your role on it, over
   the same pinned connection the viewer connects through. A new message in

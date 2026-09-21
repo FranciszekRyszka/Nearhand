@@ -105,6 +105,7 @@ pub fn router(state: Arc<AppState>) -> Router {
     let console = crate::console::router(&state.server.address);
     Router::new()
         .route("/api/v1/health", get(health))
+        .route("/api/v1/metrics", get(metrics))
         .route("/api/v1/setup", post(setup))
         .route("/api/v1/login", post(login))
         .route("/api/v1/logout", post(logout))
@@ -329,6 +330,21 @@ fn session_cookie(token: &str, max_age: i64) -> HeaderValue {
 
 async fn health() -> Json<serde_json::Value> {
     Json(json!({ "ok": true, "version": env!("CARGO_PKG_VERSION") }))
+}
+
+/// Prometheus' page: for an administrator only, which to Prometheus means
+/// an administrator's API token as its bearer token.
+async fn metrics(State(state): State<Arc<AppState>>, _: Admin) -> ApiResult<Response> {
+    let mut snapshot = state.registry.metrics();
+    snapshot.devices_enrolled = state.devices.devices().await?.len();
+    Ok((
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        crate::metrics::render(&snapshot),
+    )
+        .into_response())
 }
 
 #[derive(Deserialize)]
@@ -1594,6 +1610,64 @@ mod tests {
         let answer = api.call(Method::GET, "/api/v1/health", &[], None).await;
         assert_eq!(answer.status, StatusCode::OK);
         assert_eq!(answer.body["ok"], true);
+    }
+
+    #[tokio::test]
+    async fn metrics_are_for_administrators() {
+        let api = api().await;
+        let nobody = api.call(Method::GET, "/api/v1/metrics", &[], None).await;
+        assert_eq!(nobody.status, StatusCode::UNAUTHORIZED);
+
+        let cookie = api.admin_cookie().await;
+        let bob = api
+            .accounts
+            .create_user("bob", "bobs long password", false)
+            .await
+            .expect("bob");
+        let (_, bobs) = api
+            .accounts
+            .new_api_token(&bob, "prometheus", None)
+            .await
+            .expect("token");
+        let refused = api
+            .call(
+                Method::GET,
+                "/api/v1/metrics",
+                &[("authorization", &format!("Bearer {bobs}"))],
+                None,
+            )
+            .await;
+        assert_eq!(refused.status, StatusCode::FORBIDDEN);
+
+        let request = Request::builder()
+            .uri("/api/v1/metrics")
+            .header(HOST, "desk.example.com")
+            .header("cookie", &cookie)
+            .body(Body::empty())
+            .expect("request");
+        let response = api.app.clone().oneshot(request).await.expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            response.headers()["content-type"]
+                .to_str()
+                .expect("type")
+                .starts_with("text/plain; version=0.0.4")
+        );
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        let text = String::from_utf8(bytes.to_vec()).expect("text");
+        assert!(
+            text.lines().any(|l| l == "nearhand_agents_online 0"),
+            "{text}"
+        );
+        assert!(
+            text.lines().any(|l| l == "nearhand_devices_enrolled 0"),
+            "{text}"
+        );
     }
 
     #[tokio::test]

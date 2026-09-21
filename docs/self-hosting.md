@@ -384,6 +384,39 @@ nothing and changes nothing, so it is safe to run during a session.
 [Troubleshooting](troubleshooting.md) covers the rest, including the
 browser viewer, grants and clocks, and updates that do not arrive.
 
+## Monitoring
+
+`GET /api/v1/metrics` is in Prometheus' text format, for administrators
+only: give Prometheus an administrator's API token (the console's
+**Account** page, or `POST /api/v1/me/tokens`) as its bearer token.
+
+```yaml
+scrape_configs:
+  - job_name: nearhand
+    scheme: https
+    authorization:
+      credentials_file: /etc/prometheus/nearhand-token
+    static_configs:
+      - targets: ["desk.example.com:443"]
+    metrics_path: /api/v1/metrics
+    # tls_config: { insecure_skip_verify: true }   # self-signed certificate
+```
+
+| Metric | |
+| --- | --- |
+| `nearhand_agents_online` | agents registered now, managed or not |
+| `nearhand_devices_enrolled` | devices in the server's list |
+| `nearhand_introductions_total` | viewers introduced to a device |
+| `nearhand_introductions_refused_total{reason}` | and refused: `offline`, `not_allowed`, `too_many_attempts`, … |
+| `nearhand_relay_tunnels_open` | viewers' tunnels open now; a direct session closes its own at once |
+| `nearhand_relayed_bytes_total` | bytes the relay carried, both ways |
+| `nearhand_relay_ceilings_reached_total` | sessions let go at `relay.max_gb` |
+| `nearhand_update_downloads_active`, `_total` | agent packages being sent, and sent |
+| `nearhand_build_info{version}`, `nearhand_uptime_seconds` | |
+
+Counters start again from zero when the server does. Nothing on the page
+names a device, a user or an address.
+
 ## Backup
 
 ```bash

@@ -52,6 +52,7 @@ use crate::accounts::Accounts;
 use crate::audit::{Audit, Event};
 use crate::devices::Devices;
 use crate::grants::Grants;
+use crate::metrics::Stats;
 use crate::releases::Releases;
 
 /// How long a client has to say what it wants.
@@ -94,15 +95,18 @@ struct Ceiling {
     carried: Arc<AtomicU64>,
     said: Arc<AtomicBool>,
     session: u64,
+    /// The server's totals, which every relayed byte adds to.
+    stats: Arc<Stats>,
 }
 
 impl Ceiling {
-    fn new(limit: u64, session: u64) -> Self {
+    fn new(limit: u64, session: u64, stats: Arc<Stats>) -> Self {
         Self {
             limit,
             carried: Arc::new(AtomicU64::new(0)),
             said: Arc::new(AtomicBool::new(false)),
             session,
+            stats,
         }
     }
 
@@ -114,9 +118,11 @@ impl Ceiling {
             .fetch_add(bytes as u64, Ordering::Relaxed)
             .saturating_add(bytes as u64);
         if self.limit == 0 || carried <= self.limit {
+            self.stats.relayed(bytes);
             return true;
         }
         if !self.said.swap(true, Ordering::Relaxed) {
+            self.stats.capped();
             tracing::warn!(
                 session = self.session,
                 carried_mb = carried / (1024 * 1024),
@@ -143,6 +149,8 @@ pub struct Registry {
     downloads: Downloads,
     /// Bytes one relayed session may carry; 0 lifts the ceiling.
     ceiling: u64,
+    /// What it has done, for the metrics page.
+    stats: Arc<Stats>,
 }
 
 /// Room for [`DOWNLOADS`] packages being sent at once.
@@ -409,14 +417,7 @@ async fn introduce(
         send_message(send, &message).await?;
     }
     let _ = send.finish();
-    let ceiling = introduction.ceiling;
-    relay(
-        Arc::new(conn.clone()),
-        &introduction.agent,
-        introduction.session,
-        ceiling,
-    )
-    .await;
+    introduction.relay(Arc::new(conn.clone())).await;
     Ok(())
 }
 
@@ -428,6 +429,7 @@ pub(crate) struct Introduction {
     grant: Option<(String, SignedGrant)>,
     /// What this session may carry, from the server's configuration.
     ceiling: u64,
+    stats: Arc<Stats>,
 }
 
 impl Introduction {
@@ -449,7 +451,9 @@ impl Introduction {
 
     /// Relay between `viewer` and the agent until the viewer goes.
     pub(crate) async fn relay(self, viewer: Arc<dyn Carrier>) {
-        relay(viewer, &self.agent, self.session, self.ceiling).await;
+        let _open = self.stats.tunnel();
+        let ceiling = Ceiling::new(self.ceiling, self.session, self.stats.clone());
+        relay(viewer, &self.agent, self.session, ceiling).await;
     }
 }
 
@@ -457,6 +461,21 @@ impl Introduction {
 /// token this is if there is one: find the agent, ask it to open its way
 /// to `addresses`, and wait for it to answer.
 pub(crate) async fn arrange(
+    registry: &Registry,
+    observed: SocketAddr,
+    id: DeviceId,
+    addresses: Vec<SocketAddr>,
+    token: Option<String>,
+) -> std::result::Result<Introduction, Refusal> {
+    let arranged = arrange_counted(registry, observed, id, addresses, token).await;
+    match &arranged {
+        Ok(_) => registry.stats.introduced(),
+        Err(refusal) => registry.stats.refused(*refusal),
+    }
+    arranged
+}
+
+async fn arrange_counted(
     registry: &Registry,
     observed: SocketAddr,
     id: DeviceId,
@@ -500,15 +519,15 @@ pub(crate) async fn arrange(
         session,
         grant,
         ceiling: registry.ceiling,
+        stats: registry.stats.clone(),
     })
 }
 
 /// Forward the viewer's datagrams to the agent, and the agent's for this
 /// session back, until the viewer closes its connection: at once when it
 /// connected directly, at the end of the session when it did not.
-async fn relay(viewer: Arc<dyn Carrier>, agent: &Agent, session: u64, limit: u64) {
+async fn relay(viewer: Arc<dyn Carrier>, agent: &Agent, session: u64, ceiling: Ceiling) {
     let to_viewer = Arc::new(AtomicU64::new(0));
-    let ceiling = Ceiling::new(limit, session);
     lock(&agent.relays).insert(
         session,
         Relay {
@@ -806,6 +825,7 @@ async fn update(
         bytes = sent,
         "sent a release"
     );
+    registry.stats.package_sent();
     goodbye(conn, send).await;
     Ok(())
 }
@@ -843,17 +863,24 @@ impl Registry {
         }
     }
 
-    /// And that offers agents the releases in `releases`.
     /// What one relayed session may carry, in bytes (`config::Relay`).
     pub fn with_ceiling(self, ceiling: u64) -> Self {
         Self { ceiling, ..self }
     }
 
+    /// And that offers agents the releases in `releases`.
     pub fn with_releases(self, releases: Arc<Releases>) -> Self {
         Self {
             releases: Some(releases),
             ..self
         }
+    }
+
+    /// What the registry has counted, and what it holds now.
+    pub fn metrics(&self) -> crate::metrics::Snapshot {
+        let online = lock(&self.agents).len();
+        let sending = DOWNLOADS - self.downloads.0.available_permits();
+        self.stats.snapshot(online, sending)
     }
 
     /// Where the device with this key is connected from, if it is.
@@ -1680,29 +1707,36 @@ mod tests {
         let reached = world.reach(Place::Internet).await.expect("reached");
         assert_eq!(path_of(reached.remote), Path::Relayed);
         assert_eq!(world.relayed_sessions(), 1);
+        let during = world.registry.metrics();
+        assert_eq!(during.introduced, 1);
+        assert_eq!(during.tunnels, 1);
+        assert!(
+            during.relayed_bytes > 0,
+            "the handshake went through the relay"
+        );
 
         reached.conn.close(0u32.into(), b"done");
         tokio::time::timeout(Duration::from_secs(10), async {
-            while world.relayed_sessions() > 0 {
+            while world.relayed_sessions() > 0 || world.registry.metrics().tunnels > 0 {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
         })
         .await
-        .expect("the server lets the session go");
+        .expect("the server lets the session go, and counts it gone");
     }
 
     /// Counting is the whole of it: up to the ceiling, through; past it,
     /// not.
     #[test]
     fn a_ceiling_lets_through_what_is_under_it() {
-        let ceiling = Ceiling::new(10, 1);
+        let ceiling = Ceiling::new(10, 1, Arc::default());
         assert!(ceiling.allows(4));
         assert!(ceiling.allows(6), "ten is not over ten");
         assert!(!ceiling.allows(1));
         // It stays reached.
         assert!(!ceiling.allows(0));
 
-        let none = Ceiling::new(0, 2);
+        let none = Ceiling::new(0, 2, Arc::default());
         assert!(none.allows(usize::MAX));
         assert!(none.allows(usize::MAX), "0 lifts it");
     }

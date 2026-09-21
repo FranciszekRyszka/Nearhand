@@ -17,6 +17,7 @@ mod doctor;
 mod grants;
 mod housekeeping;
 mod https;
+mod metrics;
 #[cfg(test)]
 mod netsim;
 mod releases;
