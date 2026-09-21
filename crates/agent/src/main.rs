@@ -16,6 +16,7 @@ mod grants;
 mod host;
 mod indicator;
 mod input;
+mod logfile;
 mod machine;
 mod password;
 mod pipeline;
@@ -409,7 +410,7 @@ fn init_tracing(verbose: u8, log: Option<&Path>) {
     use tracing_subscriber::layer::SubscriberExt as _;
     use tracing_subscriber::util::SubscriberInitExt as _;
     let registry = tracing_subscriber::registry().with(filter);
-    match log.map(open_log) {
+    match log.map(|path| logfile::Rotating::open(path, LOG_LIMIT)) {
         Some(Ok(file)) => registry
             .with(
                 tracing_subscriber::fmt::layer()
@@ -434,20 +435,5 @@ fn init_tracing(verbose: u8, log: Option<&Path>) {
     }));
 }
 
-/// Past this, a log starts over rather than grow without end.
+/// Past this, a log moves aside to `.1` and a new one starts.
 const LOG_LIMIT: u64 = 10 * 1024 * 1024;
-
-fn open_log(path: &Path) -> Result<std::fs::File> {
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    let long = std::fs::metadata(path).is_ok_and(|m| m.len() > LOG_LIMIT);
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .append(!long)
-        .truncate(long)
-        .open(path)
-        .with_context(|| format!("opening {}", path.display()))?;
-    Ok(file)
-}

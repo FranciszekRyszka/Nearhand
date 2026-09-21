@@ -101,6 +101,11 @@ how agents get to this version.
   time, and audit entries older than `audit.keep_days` — a year by
   default, 0 to keep them for ever. Nothing pruned them before, on a
   server meant to run for years on one small machine.
+- The agent's logs turn over while it runs: past 10 MB a log becomes
+  `<name>.1`, replacing the one before, and a new one starts. Before, the
+  size was checked only when the agent started, so one that ran for months
+  kept growing, and a restart past the limit wiped the log that led up to
+  it.
 - Settings from the environment may be numbers and true/false, not only
   text: `NEARHAND_AUDIT_KEEP_DAYS=30` works as the file's `keep_days = 30`
   does.

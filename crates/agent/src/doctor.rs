@@ -290,11 +290,17 @@ fn updates(config: &machine::Config, dir: &Path) -> Finding {
 
 /// The end of a log, which is where the reason usually is.
 fn show_log(path: &Path, whose: &str) {
-    let Ok(text) = std::fs::read_to_string(path) else {
+    let current = std::fs::read_to_string(path).ok();
+    let previous = std::fs::read_to_string(crate::logfile::Rotating::previous(path)).ok();
+    if current.is_none() && previous.is_none() {
         println!("{whose}: no log at {}", path.display());
         return;
-    };
-    let lines: Vec<&str> = text.lines().collect();
+    }
+    let lines = last_lines(
+        previous.as_deref().unwrap_or_default(),
+        current.as_deref().unwrap_or_default(),
+        LOG_LINES,
+    );
     if lines.is_empty() {
         println!("{whose}: {} is empty", path.display());
         return;
@@ -303,18 +309,57 @@ fn show_log(path: &Path, whose: &str) {
     let _ = writeln!(
         out,
         "{whose}, last {} lines of {}:",
-        LOG_LINES.min(lines.len()),
+        lines.len(),
         path.display()
     );
-    for line in lines.iter().skip(lines.len().saturating_sub(LOG_LINES)) {
+    for line in lines {
         let _ = writeln!(out, "  {line}");
     }
     print!("{out}");
 }
 
+/// The last `n` lines of a log, reaching back into the one before it when
+/// the current one has only just started.
+fn last_lines<'a>(previous: &'a str, current: &'a str, n: usize) -> Vec<&'a str> {
+    let mut lines: Vec<&str> = previous.lines().chain(current.lines()).collect();
+    lines.drain(..lines.len().saturating_sub(n));
+    lines
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_log_just_turned_over_is_shown_with_what_came_before() {
+        assert_eq!(
+            last_lines(
+                "a
+b
+c
+", "d
+e
+", 3
+            ),
+            ["c", "d", "e"]
+        );
+        assert_eq!(
+            last_lines(
+                "", "d
+e
+", 3
+            ),
+            ["d", "e"]
+        );
+        assert_eq!(
+            last_lines(
+                "a
+", "", 3
+            ),
+            ["a"]
+        );
+        assert!(last_lines("", "", 3).is_empty());
+    }
 
     fn config(managed: bool, password: bool, both: bool) -> machine::Config {
         machine::Config {

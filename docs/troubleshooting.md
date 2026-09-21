@@ -31,6 +31,12 @@ Its files are in `%ProgramData%\Nearhand`, readable by administrators only:
 | `logs\update.log` | the last installer `msiexec` ran |
 | `updates\` | packages downloaded to update with |
 
+Each log keeps to 10 MB: past that it becomes `agent.log.1` (or
+`service.log.1`), replacing the one before, and a new one starts — so
+what led up to a problem is still there after the log turns over.
+`doctor` reaches back into the `.1` file when the current one has only just
+begun.
+
 ## A viewer cannot find the device
 
 The viewer says the device is not online, or the server refuses.
