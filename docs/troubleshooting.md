@@ -102,7 +102,8 @@ other files (`%LOCALAPPDATA%\Nearhand` on Windows).
   session up where the new agent is. The browser asks the server for a new
   grant each time, since a grant is good once. A viewer that was refused, or
   told goodbye, does not come back; nor does one that never got as far as a
-  picture, which says what went wrong instead.
+  picture, which says what went wrong instead. The native viewer's window
+  says which across the top of the picture.
 - **The picture freezes but the mouse still works.** That is capture, not
   the connection: the log says why. Send the last few hundred lines of
   `agent.log` — it names the display adapter and what it did.

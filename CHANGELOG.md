@@ -60,7 +60,9 @@ how agents get to this version.
   someone signing out or in, or the service restarting — it says it is going away
   (close code 8) rather than goodbye, and the native and browser viewers
   reconnect by themselves for up to two minutes. A refusal, a goodbye, or a
-  failure before the first picture is final, as before.
+  failure before the first picture is final, as before. The native viewer's
+  window says so across the top while it tries, and why once it stops,
+  instead of freezing on the last picture without a word.
 - `nearhand-agent doctor` — the configuration, the device key, the service,
   the server's name and key, whether UDP gets out, and the end of the logs.
 - `nearhand-server doctor` — the data folder, the key's fingerprint, the

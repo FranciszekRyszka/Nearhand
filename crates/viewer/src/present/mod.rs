@@ -312,6 +312,7 @@ impl App {
             if overlay_visible {
                 overlay::show(ui.ctx(), video_size, &summary, &net);
             }
+            overlay::banner(ui.ctx(), &net.link);
         });
         gpu.egui_state
             .handle_platform_output(&gpu.window, output.platform_output);

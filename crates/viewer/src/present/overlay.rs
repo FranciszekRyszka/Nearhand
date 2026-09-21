@@ -17,7 +17,7 @@
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
-use crate::direct::NetSnapshot;
+use crate::direct::{Link, NetSnapshot};
 
 use super::decode::FrameReady;
 
@@ -113,6 +113,51 @@ fn percentile(values: &[f64], q: f64) -> Option<f64> {
     Some(sorted[((sorted.len() - 1) as f64 * q).round() as usize])
 }
 
+/// What to say across the top of the picture, and in what colour: nothing
+/// while it is live, amber while the viewer is trying to get it back, and
+/// red once it is over. Shown whether the statistics panel is or not — a
+/// picture that stopped moving without a word looks like a hung window.
+pub fn banner_text(link: &Link) -> Option<(String, egui::Color32)> {
+    match link {
+        Link::Live => None,
+        Link::ComingBack(what) => Some((capitalise(what), egui::Color32::from_rgb(150, 100, 0))),
+        Link::Over(why) => Some((
+            format!("{} — close the window to leave", capitalise(why)),
+            egui::Color32::from_rgb(140, 30, 30),
+        )),
+    }
+}
+
+fn capitalise(text: &str) -> String {
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
+}
+
+/// Draw [`banner_text`], centred at the top, if there is anything to say.
+pub fn banner(ctx: &egui::Context, link: &Link) {
+    let Some((text, colour)) = banner_text(link) else {
+        return;
+    };
+    egui::Area::new(egui::Id::new("nearhand-link"))
+        .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 12.0))
+        .show(ctx, |ui| {
+            egui::Frame::new()
+                .fill(colour)
+                .corner_radius(6.0)
+                .inner_margin(egui::Margin::symmetric(14, 8))
+                .show(ui, |ui| {
+                    ui.label(
+                        egui::RichText::new(text)
+                            .strong()
+                            .color(egui::Color32::WHITE),
+                    );
+                });
+        });
+}
+
 /// Draw the overlay: a small translucent panel in the top-left corner.
 pub fn show(ctx: &egui::Context, video: (u32, u32), summary: &Summary, net: &NetSnapshot) {
     let ms = |v: Option<f64>| v.map_or_else(|| "…".to_owned(), |v| format!("{v:.1} ms"));
@@ -202,6 +247,18 @@ pub fn show(ctx: &egui::Context, video: (u32, u32), summary: &Summary, net: &Net
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_live_picture_needs_no_banner_and_the_others_say_why() {
+        assert_eq!(banner_text(&Link::Live), None);
+        let (coming, amber) =
+            banner_text(&Link::ComingBack("lost the device (timed out)".into())).expect("said");
+        assert!(coming.starts_with("Lost the device"), "{coming}");
+        let (over, red) = banner_text(&Link::Over("the session ended".into())).expect("said");
+        assert!(over.starts_with("The session ended"), "{over}");
+        assert!(over.contains("close the window"), "{over}");
+        assert_ne!(amber, red, "trying and over look different");
+    }
 
     fn ready(capture: u64, received: u64, decoded: u64) -> FrameReady {
         FrameReady {

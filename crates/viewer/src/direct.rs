@@ -71,6 +71,23 @@ pub struct NetSnapshot {
     /// The host's monitors, and which one is being watched.
     pub monitors: Vec<Monitor>,
     pub watching: u8,
+    /// Whether the picture is live, for the window to say when it is not.
+    pub link: Link,
+}
+
+/// Where the connection to the agent stands, as the window shows it. A
+/// picture that has stopped moving is only honest with a word beside it.
+// Read only by the window, which exists only on Windows so far (macOS: M4).
+#[cfg_attr(not(windows), allow(dead_code))]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub enum Link {
+    /// Connecting, or connected: nothing to say.
+    #[default]
+    Live,
+    /// Lost, and trying again; why, and what next.
+    ComingBack(String),
+    /// Over, and why: the window stays up, the picture does not move again.
+    Over(String),
 }
 
 /// State shared between the network task and the presenting side.
@@ -243,16 +260,26 @@ pub async fn run(mut options: Options) -> Result<()> {
             "lost {} ({error:#}); trying again in {wait:?}…",
             options.target
         );
+        let what = format!("lost the device ({error:#}) — trying again");
+        options.shared.update(|s| s.link = Link::ComingBack(what));
         tokio::select! {
             () = tokio::time::sleep(wait) => {}
             () = options.shared.stop.notified() => break Ok(()),
-            _ = tokio::signal::ctrl_c() => break Ok(()),
+            // Only a Ctrl+C: a listener that fails to register is no
+            // reason to stop.
+            Ok(()) = tokio::signal::ctrl_c() => break Ok(()),
         }
         if carried.deadline.is_some_and(|d| Instant::now() >= d) {
             break Ok(());
         }
         wait = (wait * 2).min(RECONNECT_MAX);
     };
+    // The window outlives this: it says why the picture stopped.
+    let over = match &outcome {
+        Ok(()) => "the session ended".to_owned(),
+        Err(e) => format!("{e:#}"),
+    };
+    options.shared.update(|s| s.link = Link::Over(over));
     if let Some(mut out) = carried.recording.take() {
         out.flush().context("flushing the recording")?;
     }
@@ -308,6 +335,28 @@ async fn session(options: &mut Options, carried: &mut Carried) -> Result<()> {
             (endpoint, conn, grant)
         }
     };
+    // Whatever call notices that the connection is over — a read, a write,
+    // a handshake step — the connection's own close reason says what it
+    // means. The session's own end is judged where it happens; an error
+    // that left early through `?` is judged here, once, before anything on
+    // this side has closed the connection and clouded its reason.
+    let judged_by = conn.clone();
+    match talk(options, carried, endpoint, conn, grant).await {
+        Ok(outcome) => outcome,
+        Err(early) => ended(&judged_by, early),
+    }
+}
+
+/// Everything after connecting: the handshake, then the session. `Ok` holds
+/// the session's own end, judged where it happened; `Err` is an error that
+/// left early, for the caller to judge.
+async fn talk(
+    options: &mut Options,
+    carried: &mut Carried,
+    endpoint: quinn::Endpoint,
+    conn: Connection,
+    grant: Option<nearhand_core::grant::SignedGrant>,
+) -> Result<Result<()>> {
     if let Some(Ok(claims)) = grant.as_ref().map(|g| g.claims()) {
         println!("granted: {} as {}", claims.role, claims.user);
     }
@@ -408,6 +457,7 @@ async fn session(options: &mut Options, carried: &mut Carried) -> Result<()> {
             };
             // In: a loss from here on is worth coming back from.
             carried.reached = true;
+            options.shared.update(|s| s.link = Link::Live);
             let size = (u32::from(m.width), u32::from(m.height));
             options.shared.update(|s| {
                 s.monitor_size = Some(size);
@@ -577,7 +627,10 @@ async fn session(options: &mut Options, carried: &mut Carried) -> Result<()> {
                 }
             }
 
-            _ = &mut ctrl_c => break Ok(()),
+            // A Ctrl+C, and only that: an error from the listener — its
+            // runtime's signal driver gone — would otherwise read as one and
+            // end the session as if on purpose.
+            Ok(()) = &mut ctrl_c => break Ok(()),
             _ = options.shared.stop.notified() => break Ok(()),
 
             Some(monitor) = next_switch(&mut options.switch) => {
@@ -618,7 +671,7 @@ async fn session(options: &mut Options, carried: &mut Carried) -> Result<()> {
     endpoint.wait_idle().await;
 
     stats.print_summary(started.elapsed(), &reassembler, options.record.as_deref());
-    outcome
+    Ok(outcome)
 }
 
 async fn sleep_until(at: Option<tokio::time::Instant>) {
@@ -971,6 +1024,9 @@ fn remember(id: DeviceId, conn: &Connection, trust_new_key: bool) -> Result<()> 
 /// a [`Refusal`], except for [`close::GOING_AWAY`], which says it may be
 /// back. A connection lost without a word may be back too.
 fn explain(conn: &Connection, error: anyhow::Error) -> anyhow::Error {
+    if error.downcast_ref::<Refusal>().is_some() {
+        return error;
+    }
     match conn.close_reason() {
         Some(ConnectionError::ApplicationClosed(closed)) => {
             let reason = String::from_utf8_lossy(&closed.reason);
@@ -984,6 +1040,9 @@ fn explain(conn: &Connection, error: anyhow::Error) -> anyhow::Error {
                 refusal(text)
             }
         }
+        // This side closed it — a protocol violation seen here, say —
+        // and that was a decision too.
+        Some(ConnectionError::LocallyClosed) => refusal(format!("{error:#}")),
         Some(other) => anyhow::anyhow!("connection lost: {other}"),
         None => error,
     }
@@ -992,6 +1051,9 @@ fn explain(conn: &Connection, error: anyhow::Error) -> anyhow::Error {
 /// The end of a session's connection: a goodbye from either side is the
 /// session over, and anything else is for [`explain`] to name.
 fn ended(conn: &Connection, error: anyhow::Error) -> Result<()> {
+    if error.downcast_ref::<Refusal>().is_some() {
+        return Err(error);
+    }
     match conn.close_reason() {
         Some(ConnectionError::ApplicationClosed(closed))
             if u64::from(closed.error_code) == u64::from(close::NORMAL) =>
@@ -1000,7 +1062,6 @@ fn ended(conn: &Connection, error: anyhow::Error) -> Result<()> {
             println!("the agent ended the session: {reason}");
             Ok(())
         }
-        Some(ConnectionError::LocallyClosed) => Ok(()),
         _ => Err(explain(conn, error)),
     }
 }
@@ -1223,6 +1284,68 @@ mod tests {
         (address, fingerprint, taken)
     }
 
+    /// Both ends of a QUIC connection on loopback: the agent's, the viewer's,
+    /// and the endpoints that keep them up.
+    async fn pair() -> (Connection, Connection, [quinn::Endpoint; 2]) {
+        let identity = Identity::generate().expect("identity");
+        let agent = server_endpoint(([127, 0, 0, 1], 0).into(), &identity).expect("agent endpoint");
+        let address = agent.local_addr().expect("address");
+        let viewer = client_endpoint(address).expect("viewer endpoint");
+        let (agent_side, viewer_side) = tokio::join!(
+            async {
+                agent
+                    .accept()
+                    .await
+                    .expect("incoming")
+                    .await
+                    .expect("handshake")
+            },
+            async {
+                connect(&viewer, address, identity.fingerprint())
+                    .await
+                    .expect("connect")
+            },
+        );
+        (agent_side, viewer_side, [agent, viewer])
+    }
+
+    /// The bug the first version had: a refusal noticed by a write rather
+    /// than a read came up as a bare "connection lost", and was tried
+    /// again — so a person who ended the session at the host saw the
+    /// viewer come straight back. The close reason decides, whichever call
+    /// saw it.
+    #[tokio::test]
+    async fn a_close_is_judged_by_its_reason_whichever_call_saw_it() {
+        for (code, may_return) in [
+            (close::GOING_AWAY, true),
+            (close::ENDED_BY_HOST, false),
+            (close::AUTH_FAILED, false),
+            (close::DECLINED, false),
+        ] {
+            let (agent_side, viewer_side, _endpoints) = pair().await;
+            agent_side.close(code.into(), b"closing");
+            viewer_side.closed().await;
+            let noticed = anyhow::anyhow!("writing a stream: connection lost");
+            let judged = explain(&viewer_side, noticed);
+            assert_eq!(
+                judged.downcast_ref::<Refusal>().is_none(),
+                may_return,
+                "code {code}: {judged:#}"
+            );
+        }
+        // A goodbye is the end of the session, not a failure of it.
+        let (agent_side, viewer_side, _endpoints) = pair().await;
+        agent_side.close(close::NORMAL.into(), b"bye");
+        viewer_side.closed().await;
+        assert!(ended(&viewer_side, anyhow::anyhow!("reading a datagram")).is_ok());
+        // And a refusal already decided stays one, whatever happens after.
+        let (_agent_side, viewer_side, _endpoints) = pair().await;
+        viewer_side.close(close::PROTOCOL.into(), b"another key than last time");
+        let kept = ended(&viewer_side, refusal("another key than last time"));
+        let error = kept.expect_err("still an error");
+        assert!(error.downcast_ref::<Refusal>().is_some(), "{error:#}");
+    }
+
     fn options(address: SocketAddr, fingerprint: Fingerprint) -> Options {
         Options {
             target: Target::Direct {
@@ -1251,11 +1374,17 @@ mod tests {
     #[tokio::test]
     async fn a_viewer_comes_back_to_an_agent_that_went_away() {
         let (address, fingerprint, taken) = stand_in(vec![Ending::GoingAway, Ending::Bye]);
-        let outcome =
-            tokio::time::timeout(Duration::from_secs(20), run(options(address, fingerprint)))
-                .await
-                .expect("the viewer finishes");
+        let options = options(address, fingerprint);
+        let shared = options.shared.clone();
+        let outcome = tokio::time::timeout(Duration::from_secs(20), run(options))
+            .await
+            .expect("the viewer finishes");
         outcome.expect("a goodbye ends it cleanly");
+        // What the window says once the goodbye came.
+        assert_eq!(
+            shared.snapshot().link,
+            Link::Over("the session ended".into())
+        );
         assert_eq!(
             taken.load(Ordering::Relaxed),
             2,
@@ -1267,11 +1396,17 @@ mod tests {
     #[tokio::test]
     async fn a_viewer_does_not_come_back_to_a_refusal() {
         let (address, fingerprint, taken) = stand_in(vec![Ending::Refused, Ending::Bye]);
-        let outcome =
-            tokio::time::timeout(Duration::from_secs(20), run(options(address, fingerprint)))
-                .await
-                .expect("the viewer finishes");
+        let options = options(address, fingerprint);
+        let shared = options.shared.clone();
+        let outcome = tokio::time::timeout(Duration::from_secs(20), run(options))
+            .await
+            .expect("the viewer finishes");
         let error = outcome.expect_err("a refusal is an error");
+        // The window says why, rather than freezing on the last picture.
+        let Link::Over(why) = shared.snapshot().link else {
+            panic!("the window is not told it is over");
+        };
+        assert!(why.contains("ended at the host"), "{why}");
         assert!(
             format!("{error:#}").contains("ended at the host"),
             "{error:#}"
