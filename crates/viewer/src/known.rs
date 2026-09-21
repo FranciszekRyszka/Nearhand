@@ -65,6 +65,41 @@ impl Known {
         }
     }
 
+    /// The store for this user, for changing by hand: unlike [`load`],
+    /// a file that cannot be read is an error here, since writing it back
+    /// would lose what it holds.
+    ///
+    /// [`load`]: Self::load
+    pub fn open() -> Result<Self> {
+        let path = path().context("no home folder to keep the known devices in")?;
+        Self::read(&path)
+    }
+
+    /// Where the store is kept, if anywhere.
+    pub fn location(&self) -> Option<&Path> {
+        self.path.as_deref()
+    }
+
+    /// Every device remembered, by ID.
+    pub fn devices(&self) -> impl Iterator<Item = (DeviceId, Fingerprint)> + '_ {
+        self.devices.iter().filter_map(|(id, fingerprint)| {
+            format!("{id:010}")
+                .parse::<DeviceId>()
+                .ok()
+                .map(|id| (id, *fingerprint))
+        })
+    }
+
+    /// Forget the key this device had, so the next connection to it takes
+    /// whatever key it answers with. The key it had, if it was known.
+    pub fn forget(&mut self, id: DeviceId) -> Result<Option<Fingerprint>> {
+        let forgotten = self.devices.remove(&id.value());
+        if forgotten.is_some() {
+            self.save()?;
+        }
+        Ok(forgotten)
+    }
+
     fn read(path: &Path) -> Result<Self> {
         let text = match std::fs::read_to_string(path) {
             Ok(text) => text,
@@ -91,6 +126,10 @@ impl Known {
         if self.devices.insert(id.value(), fingerprint) == Some(fingerprint) {
             return Ok(());
         }
+        self.save()
+    }
+
+    fn save(&self) -> Result<()> {
         let Some(path) = self.path.clone() else {
             return Ok(());
         };
@@ -110,7 +149,8 @@ impl Known {
         let mut out = String::from(
             "# Device keys this viewer has seen. A device's ID is made from its\n\
              # key, so the same ID with another key is another device.\n\
-             # Written by nearhand-viewer; delete a line to forget a device.\n",
+             # Written by nearhand-viewer; `nearhand-viewer forget <id>`\n\
+             # forgets a device, as deleting its line does.\n",
         );
         for (id, fingerprint) in &self.devices {
             out.push_str(&format!("{id:010} {fingerprint}\n"));
@@ -195,6 +235,32 @@ mod tests {
         // Ten digits, leading zeros and all, as a device shows its ID.
         assert!(text.contains("\n0000000042 "), "{text}");
         assert_eq!(parse(&text), known.devices);
+    }
+
+    #[test]
+    fn a_forgotten_device_is_new_again_and_the_file_says_so() {
+        let dir = std::env::temp_dir().join(format!("nearhand-known-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let file = dir.join("known-devices");
+        let mut known = Known {
+            path: Some(file.clone()),
+            devices: BTreeMap::new(),
+        };
+        known.remember(id(1), fingerprint(7)).expect("remember");
+        known.remember(id(2), fingerprint(8)).expect("remember");
+
+        assert_eq!(known.forget(id(1)).expect("forget"), Some(fingerprint(7)));
+        assert_eq!(known.check(id(1), fingerprint(9)), Continuity::First);
+        assert_eq!(
+            known.forget(id(1)).expect("again"),
+            None,
+            "nothing left to forget"
+        );
+
+        let read = Known::read(&file).expect("read back");
+        let listed: Vec<(DeviceId, Fingerprint)> = read.devices().collect();
+        assert_eq!(listed, [(id(2), fingerprint(8))]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -95,6 +95,16 @@ enum Command {
         #[arg(long)]
         token: Option<String>,
     },
+    /// List the devices this viewer remembers the key of, and where it
+    /// keeps them.
+    Known,
+    /// Forget a device's key, so the next connection takes whatever key it
+    /// answers with. For when you know why it changed; `connect
+    /// --trust-new-key` does the same while connecting.
+    Forget {
+        /// The device's ID: `123 456 7890`.
+        id: DeviceId,
+    },
     /// Connect straight to an agent's `listen` address, no server.
     Direct {
         /// Agent address, for example `192.168.1.20:4433`.
@@ -193,6 +203,31 @@ fn main() -> Result<()> {
             };
             let (devices, more) = list(server, server_fingerprint, &token)?;
             print!("{}", table(&devices, more));
+            Ok(())
+        }
+        Command::Known => {
+            let known = known::Known::open()?;
+            let devices: Vec<_> = known.devices().collect();
+            if devices.is_empty() {
+                println!("No devices remembered yet.");
+            }
+            for (id, fingerprint) in devices {
+                println!("{id}  {fingerprint}");
+            }
+            if let Some(path) = known.location() {
+                println!("(kept in {})", path.display());
+            }
+            Ok(())
+        }
+        Command::Forget { id } => {
+            let mut known = known::Known::open()?;
+            match known.forget(id)? {
+                Some(fingerprint) => println!(
+                    "Forgot {id}, which had the key {fingerprint}. The next connection \
+                     takes the key it answers with, and remembers that."
+                ),
+                None => println!("{id} was not remembered; there is nothing to forget."),
+            }
             Ok(())
         }
         Command::Direct {

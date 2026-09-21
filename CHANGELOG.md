@@ -50,6 +50,8 @@ how agents get to this version.
   with another key stops before it starts. The native viewer needs
   `--trust-new-key` to go on; the browser asks. A reinstall does not trip
   it — a machine that loses its key gets a new ID with it.
+  `nearhand-viewer known` lists what a viewer remembers, and
+  `nearhand-viewer forget <id>` drops one device's key.
 - **Fuzzing.** Five `cargo-fuzz` targets over everything that decodes bytes
   from elsewhere, weekly and on demand in CI, alongside the hostile-input
   test that runs on every build.

@@ -91,8 +91,9 @@ introduced another machine, or someone is in the middle.
 Check with whoever runs the device — its ID and fingerprint are in
 `nearhand-agent status` and `doctor`. If it really did change, the native
 viewer takes `--trust-new-key` once, and the browser asks. To forget a
-device instead, delete its line from `known-devices` beside the viewer's
-other files (`%LOCALAPPDATA%\Nearhand` on Windows).
+device instead, `nearhand-viewer forget <id>`; `nearhand-viewer known` lists
+what the viewer remembers, and where (`%LOCALAPPDATA%\Nearhand\known-devices`
+on Windows).
 
 ## The picture stops, or the session drops
 
