@@ -283,12 +283,22 @@ api /grants -H 'content-type: application/json' \
 ```
 
 Users see the devices they may reach, with their role, at `GET /devices`,
-and connect with an API token of their own instead of a password:
+or from the viewer, and connect with an API token of their own instead of a
+password:
 
 ```bash
-NEARHAND_TOKEN=nht_... nearhand-viewer connect "123 456 7890" \
+export NEARHAND_TOKEN=nht_...
+nearhand-viewer devices --server desk.example.com:443 --server-fingerprint <fingerprint>
+# ID            ONLINE   ROLE     NAME
+# 123 456 7890  yes      control  RECEPTION-PC
+nearhand-viewer connect "123 456 7890" \
     --server desk.example.com:443 --server-fingerprint <fingerprint>
 ```
+
+The viewer's list is the devices the user holds a grant for, which for an
+administrator can be fewer than the console shows: administrators need a
+grant to connect, like anyone else. It needs a server of this version or
+later; an older one drops the question, and the viewer says so.
 
 The server hands the viewer a grant for that device, signed with its key and
 good for five minutes; the agent checks it against the server key it pinned

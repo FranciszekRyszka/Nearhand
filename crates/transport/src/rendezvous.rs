@@ -37,7 +37,7 @@ use nearhand_core::ALPN;
 use nearhand_core::grant::SignedGrant;
 use nearhand_core::proto::close;
 use nearhand_core::release::{SignedRelease, Version};
-use nearhand_core::rendezvous::{DeviceId, Enrollment, FromServer, ToServer};
+use nearhand_core::rendezvous::{DeviceId, Enrollment, FromServer, Listed, ToServer};
 use quinn::{Connection, Endpoint};
 
 use crate::relay::{self, is_relayed, relayed_address};
@@ -336,6 +336,37 @@ pub async fn find_granted(
     match grant {
         Some(grant) => Ok((conn, grant)),
         None => Err(Error::Unexpected("the server sent no grant".into())),
+    }
+}
+
+/// The devices the user whose API token `token` is may reach, as the server
+/// at `server` knows them, and how many more there were than it lists.
+pub async fn devices(
+    endpoint: &Endpoint,
+    server: SocketAddr,
+    server_fingerprint: Fingerprint,
+    token: &str,
+) -> Result<(Vec<Listed>, u64)> {
+    let conn = connect_server(endpoint, server, server_fingerprint, None).await?;
+    let (mut send, mut recv) = conn.open_bi().await?;
+    send_message(
+        &mut send,
+        &ToServer::Devices {
+            token: token.to_owned(),
+        },
+    )
+    .await?;
+    let answer = recv_message::<FromServer>(&mut recv).await;
+    conn.close(close::NORMAL.into(), b"done");
+    match answer {
+        Ok(Some(FromServer::Devices { devices, more })) => Ok((devices, more)),
+        Ok(Some(FromServer::Refused(refusal))) => Err(Error::Refused(refusal)),
+        Ok(Some(other)) => Err(Error::Unexpected(format!("{other:?}"))),
+        // A server from before listing drops the connection at the
+        // message it does not know.
+        Ok(None) | Err(_) => Err(Error::Unexpected(
+            "the server did not answer; it may be older than this viewer".into(),
+        )),
     }
 }
 

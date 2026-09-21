@@ -81,6 +81,13 @@ agent            server             viewer
   `Granted(signed grant)` before `Peer` if the user has a grant for the
   device, and `Refused(NotSignedIn)` or `Refused(NotAllowed)` if not —
   saying nothing about whether the device is online.
+* The same viewer can ask what it may reach, on a connection of its own:
+  `Devices { token }` ──▶, answered by `Devices { devices, more }` — each
+  device the user holds a grant for, with its ID, name, whether it is
+  online and the user's role, at most 1000 of them and names cut to 120
+  bytes, `more` counting the rest — or `Refused(NotSignedIn)`. It counts
+  against the same 10 a minute as an introduction. A server older than the
+  viewer does not know the message and drops the connection.
 * A browser opens a WebTransport session to `https://<server>:<QUIC
   port>/nearhand` — the server tells the QUIC side's ALPNs apart, `h3` for
   browsers — sends `Connect { id, addresses: [] }` on its first stream, and

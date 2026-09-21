@@ -73,6 +73,12 @@ how agents get to this version.
   no shell to run `sqlite3` in, and a plain copy of a database in WAL mode
   can be short of the most recent writes.
 - [docs/troubleshooting.md](docs/troubleshooting.md).
+- `nearhand-viewer devices` — the devices your user holds a grant for on a
+  server, with their IDs, whether each is online and your role on it, over
+  the same pinned connection the viewer connects through. A new message in
+  the server protocol, added without changing its version: a server older
+  than the viewer drops the question, and the viewer says the server may be
+  older. `nearhand-viewer` on its own now prints its usage.
 
 ### Changed
 

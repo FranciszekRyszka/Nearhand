@@ -26,14 +26,20 @@ use crate::direct::Shared;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Parser, Debug)]
-#[command(name = "nearhand-viewer", version, about, long_about = None)]
+#[command(
+    name = "nearhand-viewer",
+    version,
+    about,
+    long_about = None,
+    arg_required_else_help = true
+)]
 struct Cli {
     /// Verbosity: -v for debug, -vv for trace.
     #[arg(short, long, action = clap::ArgAction::Count, global = true)]
     verbose: u8,
 
     #[command(subcommand)]
-    command: Option<Command>,
+    command: Command,
 }
 
 #[derive(Subcommand, Debug)]
@@ -73,6 +79,20 @@ enum Command {
         trust_new_key: bool,
         #[command(flatten)]
         watch: Watch,
+    },
+    /// List the devices you may connect to through a server: those your
+    /// user holds a grant for, and whether each is online.
+    Devices {
+        /// The server's address, for example `203.0.113.10:443`.
+        #[arg(long)]
+        server: SocketAddr,
+        /// The fingerprint the server printed when it started.
+        #[arg(long)]
+        server_fingerprint: Fingerprint,
+        /// An API token of yours (`nht_…`). `NEARHAND_TOKEN` in the
+        /// environment works too, and stays out of the shell's history.
+        #[arg(long)]
+        token: Option<String>,
     },
     /// Connect straight to an agent's `listen` address, no server.
     Direct {
@@ -116,7 +136,7 @@ fn main() -> Result<()> {
     init_tracing(cli.verbose);
 
     match cli.command {
-        Some(Command::Connect {
+        Command::Connect {
             id,
             server,
             server_fingerprint,
@@ -125,7 +145,7 @@ fn main() -> Result<()> {
             relay_only,
             trust_new_key,
             watch,
-        }) => {
+        } => {
             let token = token.or_else(|| {
                 std::env::var("NEARHAND_TOKEN")
                     .ok()
@@ -145,20 +165,73 @@ fn main() -> Result<()> {
             };
             watch_target(target, password, watch, trust_new_key)
         }
-        Some(Command::Direct {
+        Command::Devices {
+            server,
+            server_fingerprint,
+            token,
+        } => {
+            let Some(token) = token.or_else(|| {
+                std::env::var("NEARHAND_TOKEN")
+                    .ok()
+                    .filter(|t| !t.is_empty())
+            }) else {
+                bail!("listing needs an API token: --token, or NEARHAND_TOKEN in the environment");
+            };
+            let runtime = tokio::runtime::Runtime::new().context("starting the runtime")?;
+            let (devices, more) = runtime.block_on(async {
+                let endpoint = nearhand_transport::client_endpoint(server)?;
+                rendezvous::devices(&endpoint, server, server_fingerprint, &token)
+                    .await
+                    .with_context(|| format!("asking {server} for your devices"))
+            })?;
+            print!("{}", table(&devices, more));
+            Ok(())
+        }
+        Command::Direct {
             address,
             fingerprint,
             watch,
-        }) => {
+        } => {
             let target = direct::Target::Direct {
                 address,
                 fingerprint,
             };
             watch_target(target, None, watch, false)
         }
-        // No subcommand opens the address book, which needs a server. [M2]
-        None => bail!("not implemented: scheduled for M2, see the roadmap in README.md"),
     }
+}
+
+/// The answer to `devices`, for a person to read: online ones first, in the
+/// server's order within that.
+fn table(devices: &[nearhand_core::rendezvous::Listed], more: u64) -> String {
+    use std::fmt::Write;
+
+    if devices.is_empty() && more == 0 {
+        return "No devices: your user holds no grants on this server. An administrator                 gives them in the console, under Access.
+"
+            .to_owned();
+    }
+    let mut ordered: Vec<_> = devices.iter().collect();
+    ordered.sort_by_key(|d| !d.online);
+    let mut out = format!(
+        "{:<14}{:<9}{:<9}NAME
+",
+        "ID", "ONLINE", "ROLE"
+    );
+    for d in ordered {
+        let online = if d.online { "yes" } else { "no" };
+        let _ = writeln!(
+            out,
+            "{:<14}{online:<9}{:<9}{}",
+            d.id.to_string(),
+            d.role.as_str(),
+            d.name
+        );
+    }
+    if more > 0 {
+        let _ = writeln!(out, "… and {more} more the server did not list");
+    }
+    out
 }
 
 fn watch_target(
@@ -279,4 +352,45 @@ fn init_tracing(verbose: u8) {
         _ => tracing::Level::TRACE,
     };
     tracing_subscriber::fmt().with_max_level(level).init();
+}
+
+#[cfg(test)]
+mod tests {
+    use nearhand_core::grant::Role;
+    use nearhand_core::rendezvous::{DeviceId, Listed};
+
+    use super::table;
+
+    fn listed(id: &str, name: &str, online: bool) -> Listed {
+        Listed {
+            id: id.parse::<DeviceId>().expect("id"),
+            name: name.into(),
+            online,
+            role: Role::Control,
+        }
+    }
+
+    #[test]
+    fn devices_are_listed_online_first_with_what_was_left_out() {
+        let out = table(
+            &[
+                listed("111 111 1111", "ARCHIVE", false),
+                listed("222 222 2222", "RECEPTION-PC", true),
+            ],
+            3,
+        );
+        let lines: Vec<&str> = out.lines().collect();
+        assert!(lines[0].starts_with("ID"), "{out}");
+        assert!(
+            lines[1].starts_with("222 222 2222  yes      control  RECEPTION-PC"),
+            "{out}"
+        );
+        assert!(lines[2].starts_with("111 111 1111  no"), "{out}");
+        assert!(lines[3].contains("3 more"), "{out}");
+    }
+
+    #[test]
+    fn no_devices_says_why() {
+        assert!(table(&[], 0).contains("no grants"));
+    }
 }

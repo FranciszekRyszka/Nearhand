@@ -21,6 +21,11 @@
 //! server's key to present to the agent (`grants`). Without a grant, the
 //! viewer is told nothing — not even whether the device is online.
 //!
+//! The same token also lists what its user may reach (`Devices`): the
+//! devices the user holds a grant for, and whether each is online. Like an
+//! introduction, a listing counts against the address's attempts, so it is
+//! no faster a way to guess tokens.
+//!
 //! An enrolled device also outranks a stranger for its ID. Ten digits are
 //! easily matched on purpose, so someone could register a key with a managed
 //! device's ID first, to keep the device from being found; the device, when
@@ -35,7 +40,9 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use nearhand_core::grant::SignedGrant;
 use nearhand_core::release::Version;
-use nearhand_core::rendezvous::{DeviceId, Enrollment, FromServer, Refusal, ToServer};
+use nearhand_core::rendezvous::{
+    DeviceId, Enrollment, FromServer, Listed, MAX_LISTED, Refusal, ToServer, listed_name,
+};
 use nearhand_transport::relay::{Carrier, tag, untag};
 use nearhand_transport::{Fingerprint, Identity, peer_fingerprint, recv_message, send_message};
 use quinn::{Connection, Endpoint, SendStream};
@@ -235,6 +242,7 @@ async fn handle(conn: Connection, registry: &Registry) -> Result<()> {
             token,
         }) => introduce(&conn, &mut send, registry, id, addresses, Some(token)).await,
         Some(ToServer::Enroll(enrollment)) => enroll(&conn, &mut send, registry, enrollment).await,
+        Some(ToServer::Devices { token }) => list(&conn, &mut send, registry, &token).await,
         Some(ToServer::Update {
             product,
             platform,
@@ -611,6 +619,74 @@ async fn authorize(
     Ok((agent, (user.name, signed)))
 }
 
+/// Tell a viewer with an account which devices its user may reach.
+async fn list(
+    conn: &Connection,
+    send: &mut SendStream,
+    registry: &Registry,
+    token: &str,
+) -> Result<()> {
+    match reachable(registry, token, conn.remote_address().ip()).await {
+        Ok(answer) => {
+            send_message(send, &answer).await?;
+            goodbye(conn, send).await;
+            Ok(())
+        }
+        Err(refusal) => refuse(conn, send, refusal).await,
+    }
+}
+
+/// The devices the user whose token this is holds a grant for — exactly
+/// those [`authorize`] would introduce them to — by name.
+async fn reachable(
+    registry: &Registry,
+    token: &str,
+    from: IpAddr,
+) -> std::result::Result<FromServer, Refusal> {
+    if !registry.attempt(from) {
+        return Err(Refusal::TooManyAttempts);
+    }
+    let (Some(access), Some(devices)) = (&registry.access, &registry.devices) else {
+        return Err(Refusal::NotAllowed);
+    };
+    let user = match access.accounts.api_user(token).await {
+        Ok(Some(user)) => user,
+        Ok(None) => return Err(Refusal::NotSignedIn),
+        Err(e) => {
+            tracing::error!(error = %e, "checking an API token");
+            return Err(Refusal::NotSignedIn);
+        }
+    };
+    let failed = |e: crate::accounts::Refused| {
+        tracing::error!(error = %e, "listing a user's devices");
+        Refusal::NotAllowed
+    };
+    let reachable = access.grants.reachable(user.id).await.map_err(failed)?;
+    let names: HashMap<i64, String> = devices
+        .devices()
+        .await
+        .map_err(failed)?
+        .into_iter()
+        .map(|d| (d.id, d.name))
+        .collect();
+    let mut listed: Vec<Listed> = reachable
+        .into_iter()
+        .map(|r| Listed {
+            id: r.fingerprint.device_id(),
+            name: listed_name(names.get(&r.id).map_or("", String::as_str)),
+            online: registry.online(&r.fingerprint).is_some(),
+            role: r.role,
+        })
+        .collect();
+    listed.sort_by(|a, b| a.name.cmp(&b.name).then(a.id.cmp(&b.id)));
+    let more = listed.len().saturating_sub(MAX_LISTED) as u64;
+    listed.truncate(MAX_LISTED);
+    Ok(FromServer::Devices {
+        devices: listed,
+        more,
+    })
+}
+
 /// An agent with a token joins the managed devices.
 async fn enroll(
     conn: &Connection,
@@ -933,7 +1009,7 @@ mod tests {
         use crate::grants::Grants;
         use nearhand_core::grant::Role;
         use nearhand_core::rendezvous::Enrollment;
-        use nearhand_transport::rendezvous::{enroll, find_granted};
+        use nearhand_transport::rendezvous::{devices as listed, enroll, find_granted};
         use nearhand_transport::{Error, client_endpoint, rendezvous_endpoint, server_endpoint};
 
         let pool = crate::db::in_memory().await;
@@ -1055,6 +1131,28 @@ mod tests {
             refused(find_granted(&viewer, server_addr, fp, id, Route::Best, "nht_guess").await),
             Some(Refusal::NotSignedIn)
         );
+
+        // Listing shows the same: bob's one device, and nothing to ada.
+        let (bobs, more) = listed(&viewer, server_addr, fp, &bob_token)
+            .await
+            .expect("bob lists");
+        assert_eq!(more, 0);
+        assert_eq!(bobs.len(), 1);
+        assert_eq!(bobs[0].id, id);
+        assert_eq!(bobs[0].name, "PC");
+        assert!(bobs[0].online);
+        assert_eq!(bobs[0].role, Role::Control);
+        let (adas, _) = listed(&viewer, server_addr, fp, &ada_token)
+            .await
+            .expect("ada lists");
+        assert!(
+            adas.is_empty(),
+            "administrators list only what they may reach"
+        );
+        assert!(matches!(
+            listed(&viewer, server_addr, fp, "nht_guess").await,
+            Err(Error::Refused(Refusal::NotSignedIn))
+        ));
         let actions: Vec<(Option<String>, String)> = audit
             .entries(None, 10)
             .await

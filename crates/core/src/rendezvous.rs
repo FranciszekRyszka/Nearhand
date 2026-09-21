@@ -30,6 +30,11 @@
 //! built into it signed the release and the package is the one signed
 //! (`crate::release`).
 //!
+//! A viewer with an account can also ask what it may reach, on a connection
+//! of its own: `Devices` ──▶ with an API token, and ◀── `Devices` with the
+//! devices its user has a grant for — the ones `ConnectAs` would introduce
+//! it to — and whether each is online.
+//!
 //! The server vouches for which key belongs to an ID, and nothing else: it
 //! never sees a session's contents or its password. Everything after `Peer`
 //! runs between viewer and agent on the peer protocol, [`crate::ALPN`].
@@ -40,7 +45,7 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
-use crate::grant::SignedGrant;
+use crate::grant::{Role, SignedGrant};
 use crate::release::{SignedRelease, Version};
 
 /// Application-layer protocol name for connections to the server.
@@ -156,6 +161,22 @@ pub enum ToServer {
     /// drop the connection, so a server is upgraded before its agents —
     /// which is the order anyway, since agents take their updates from it.
     Running { os: String, version: String },
+    /// First message from a viewer with an account: which devices the user
+    /// whose API token this is may reach. A server older than the viewer
+    /// does not know it, and drops the connection.
+    Devices { token: String },
+}
+
+/// One device in the answer to [`ToServer::Devices`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Listed {
+    pub id: DeviceId,
+    /// What the server's console calls it, cut to [`MAX_LISTED_NAME`] bytes.
+    pub name: String,
+    /// Registered with the server now, so a connection could be arranged.
+    pub online: bool,
+    /// The most the user's grants allow on it.
+    pub role: Role,
 }
 
 /// What an agent sends to enroll.
@@ -201,6 +222,26 @@ pub enum FromServer {
     Granted(SignedGrant),
     /// To an agent that sent `Update`: the release to update to, or none.
     Offered(Option<SignedRelease>),
+    /// To a viewer that sent `Devices`: what its user may reach, and how
+    /// many more there were than [`MAX_LISTED`].
+    Devices {
+        devices: Vec<Listed>,
+        more: u64,
+    },
+}
+
+/// Devices listed in one answer, at most, and the bytes of each one's name:
+/// together, well inside a message's size cap.
+pub const MAX_LISTED: usize = 1000;
+pub const MAX_LISTED_NAME: usize = 120;
+
+/// `name` cut to at most [`MAX_LISTED_NAME`] bytes, on a character boundary.
+pub fn listed_name(name: &str) -> String {
+    let mut end = name.len().min(MAX_LISTED_NAME);
+    while !name.is_char_boundary(end) {
+        end -= 1;
+    }
+    name[..end].to_owned()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -326,5 +367,47 @@ mod tests {
             server_certificate: vec![5; 10],
         }));
         roundtrip(&FromServer::Refused(Refusal::NotAllowed));
+        roundtrip(&ToServer::Devices {
+            token: "nht_00ff".into(),
+        });
+        roundtrip(&FromServer::Devices {
+            devices: vec![Listed {
+                id: DeviceId(1_234_567_890),
+                name: "RECEPTION-PC".into(),
+                online: true,
+                role: Role::Control,
+            }],
+            more: 0,
+        });
+    }
+
+    #[test]
+    fn a_full_list_fits_in_one_message() {
+        let long = Listed {
+            id: DeviceId(9_999_999_999),
+            name: listed_name(&"\u{e9}".repeat(500)),
+            online: true,
+            role: Role::Full,
+        };
+        let answer = FromServer::Devices {
+            devices: vec![long; MAX_LISTED],
+            more: u64::MAX,
+        };
+        let bytes = crate::wire::encode(&answer).expect("encodes");
+        assert!(
+            bytes.len() <= crate::wire::MAX_MESSAGE_LEN,
+            "{}",
+            bytes.len()
+        );
+    }
+
+    #[test]
+    fn listed_names_are_cut_between_characters() {
+        assert_eq!(listed_name("RECEPTION-PC"), "RECEPTION-PC");
+        // Two-byte characters: 120 bytes is exactly 60 of them.
+        assert_eq!(listed_name(&"\u{e9}".repeat(100)).chars().count(), 60);
+        // A three-byte one straddling the limit is left out whole.
+        let name = format!("{}\u{20ac}", "a".repeat(119));
+        assert_eq!(listed_name(&name), "a".repeat(119));
     }
 }
