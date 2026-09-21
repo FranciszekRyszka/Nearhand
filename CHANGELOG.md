@@ -65,6 +65,12 @@ how agents get to this version.
   failure before the first picture is final, as before. The native viewer's
   window says so across the top while it tries, and why once it stops,
   instead of freezing on the last picture without a word.
+- **Type the clipboard.** Ctrl+Shift+F3 in the native viewer, and a *Type
+  clipboard* button in the browser, type this computer's clipboard on the
+  device as keystrokes — for the sign-in screen, a UAC prompt, or a console
+  that takes no paste, where clipboard sync cannot reach. Line breaks and
+  tabs go as Enter and Tab; up to 4096 characters at a time. Nothing
+  changes on the agent.
 - `nearhand-agent doctor` — the configuration, the device key, the service,
   the server's name and key, whether UDP gets out, and the end of the logs.
 - `nearhand-server doctor` — the data folder, the key's fingerprint, the

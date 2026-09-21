@@ -15,6 +15,7 @@ pub mod held;
 pub mod proto;
 pub mod release;
 pub mod rendezvous;
+pub mod typing;
 pub mod video;
 pub mod wire;
 

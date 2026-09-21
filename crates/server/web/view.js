@@ -355,6 +355,7 @@ function run(link, viewer, granted, password) {
     // The agent ignores a watcher's keyboard and mouse; say so.
     $("device").textContent += " (watching only)";
     $("cad").hidden = true;
+    $("type").hidden = true;
   }
   attachInput(viewer, pump, clipboard);
   pump();
@@ -423,6 +424,31 @@ function attachInput(viewer, pump, clipboard) {
   $("cad").onclick = () => {
     send(() => viewer.secure_attention());
     canvas.focus();
+  };
+  // Says what happened on the button itself for a moment: the status line
+  // is for the session, and would stay over the picture.
+  const typed = (label) => {
+    $("type").textContent = label;
+    setTimeout(() => ($("type").textContent = "Type clipboard"), 2500);
+  };
+  $("type").onclick = async () => {
+    let text;
+    try {
+      text = await navigator.clipboard.readText();
+    } catch (e) {
+      console.warn("clipboard:", e);
+      typed("Clipboard not readable");
+      return;
+    } finally {
+      canvas.focus();
+    }
+    if (!text) {
+      typed("Clipboard is empty");
+      return;
+    }
+    let cut = false;
+    send(() => { cut = viewer.type_text(text); });
+    typed(cut ? "Typed the first part" : "Typed");
   };
   $("full").onclick = async () => {
     const main = document.querySelector("main");

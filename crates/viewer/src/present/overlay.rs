@@ -235,7 +235,8 @@ pub fn show(ctx: &egui::Context, video: (u32, u32), summary: &Summary, net: &Net
                     );
                     ui.label(
                         egui::RichText::new(
-                            "Ctrl+Shift+F1 hides this panel · excludes display scan-out",
+                            "Ctrl+Shift+F1 hides this panel · F3 types the clipboard · \
+                             excludes display scan-out",
                         )
                         .small()
                         .color(egui::Color32::from_gray(150)),

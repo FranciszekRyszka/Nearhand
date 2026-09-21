@@ -10,9 +10,10 @@
 //! event; the pixels never move — see [`interop`]. Keyboard and mouse go the
 //! other way, through [`input`] to the network task.
 //!
-//! Every key goes to the agent except two local shortcuts: Ctrl+Shift+F1
-//! toggles the latency overlay, and Ctrl+Shift+F2 watches the host's next
-//! monitor.
+//! Every key goes to the agent except three local shortcuts: Ctrl+Shift+F1
+//! toggles the latency overlay, Ctrl+Shift+F2 watches the host's next
+//! monitor, and Ctrl+Shift+F3 types this machine's clipboard on the host,
+//! for where pasting cannot reach — the sign-in screen, a UAC prompt.
 //!
 //! Frames are drawn as soon as they arrive rather than on a vsync tick, and
 //! the swap chain is asked for mailbox or immediate presentation with a
@@ -471,6 +472,27 @@ impl App {
         gpu.window.set_cursor_visible(self.cursor_visible);
     }
 
+    /// Type what is on this machine's clipboard on the host.
+    fn type_clipboard(&mut self) {
+        let text = nearhand_clipboard::open().and_then(|mut clipboard| clipboard.text());
+        match text {
+            Ok(Some(text)) if !text.is_empty() => {
+                let characters = text.chars().count();
+                if self.input.type_text(&text) {
+                    tracing::warn!(
+                        characters,
+                        typed = nearhand_core::typing::MAX_TYPED,
+                        "clipboard typed only in part; paste longer text instead"
+                    );
+                } else {
+                    tracing::info!(characters, "typed the clipboard");
+                }
+            }
+            Ok(_) => tracing::info!("the clipboard holds no text to type"),
+            Err(e) => tracing::warn!(error = %e, "cannot read the clipboard"),
+        }
+    }
+
     fn fail(&mut self, event_loop: &ActiveEventLoop, error: anyhow::Error) {
         self.error = Some(format!("{error:#}"));
         event_loop.exit();
@@ -538,6 +560,18 @@ impl ApplicationHandler<UserEvent> for App {
                         let _ = gpu.switch.send(next);
                     }
                 }
+            }
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        physical_key: PhysicalKey::Code(KeyCode::F3),
+                        state: ElementState::Pressed,
+                        repeat: false,
+                        ..
+                    },
+                ..
+            } if self.modifiers == ModifiersState::CONTROL | ModifiersState::SHIFT => {
+                self.type_clipboard();
             }
             // Ctrl+Alt+End stands in for Ctrl+Alt+Del, which this machine
             // keeps for itself, as in Remote Desktop.

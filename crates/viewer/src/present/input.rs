@@ -53,20 +53,37 @@ impl Forwarder {
         if !focused {
             // Whatever is held now gets released into another window, so the
             // agent would never hear of it.
-            let (keys, buttons) = self.held.take();
-            for scancode in keys {
-                self.send(Input::Key {
-                    scancode,
-                    down: false,
-                });
-            }
-            for button in buttons {
-                self.send(Input::MouseButton {
-                    button,
-                    down: false,
-                });
-            }
+            self.release_held();
         }
+    }
+
+    fn release_held(&mut self) {
+        let (keys, buttons) = self.held.take();
+        for scancode in keys {
+            self.send(Input::Key {
+                scancode,
+                down: false,
+            });
+        }
+        for button in buttons {
+            self.send(Input::MouseButton {
+                button,
+                down: false,
+            });
+        }
+    }
+
+    /// Type `text` on the host, as keystrokes. Whatever is held is let go
+    /// of first — the shortcut that asked for this holds Ctrl and Shift, and
+    /// held on the host they would turn letters into shortcuts. Whether the
+    /// text was cut short.
+    pub fn type_text(&mut self, text: &str) -> bool {
+        self.release_held();
+        let (keystrokes, cut) = nearhand_core::typing::keystrokes(text);
+        for keystroke in keystrokes {
+            self.send(keystroke);
+        }
+        cut
     }
 
     /// Move the remote pointer to where the local one is over the video.

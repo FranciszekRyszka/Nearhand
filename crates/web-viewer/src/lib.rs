@@ -245,6 +245,18 @@ impl Viewer {
         }
     }
 
+    /// Type `text` on the device as keystrokes, for where pasting cannot
+    /// reach; whatever is held is let go of first. Whether it was cut short
+    /// at [`nearhand_core::typing::MAX_TYPED`] characters.
+    pub fn type_text(&mut self, text: String) -> bool {
+        self.session.release_all();
+        let (keystrokes, cut) = nearhand_core::typing::keystrokes(&text);
+        for keystroke in keystrokes {
+            self.session.input(keystroke);
+        }
+        cut
+    }
+
     /// Ctrl+Alt+Del on the device, which no key press can make.
     pub fn secure_attention(&mut self) {
         self.session.input(Input::SecureAttention);
